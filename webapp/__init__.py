@@ -1,5 +1,6 @@
-from pathlib import Path
+import os
 import threading
+from pathlib import Path
 from typing import Any, Mapping
 
 from flask import Flask, jsonify, send_from_directory
@@ -51,11 +52,12 @@ def _default_task_runner(_context):
 def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
     default_static_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
-    data_dir = Path("data").resolve()
+    configured_data_dir = os.environ.get("CHAOXING_DATA_DIR")
+    data_dir = Path(configured_data_dir or "data").expanduser().resolve()
     app.config.from_mapping(
         DATA_DIR=data_dir,
         DATABASE_PATH=data_dir / "chaoxing-web.sqlite3",
-        RUNNING_IN_DOCKER=False,
+        RUNNING_IN_DOCKER=os.environ.get("CHAOXING_RUNNING_IN_DOCKER", False),
         STATIC_DIR=default_static_dir,
     )
     if test_config:

@@ -50,17 +50,43 @@ npm install
 npm run dev          # 默认 http://localhost:3000
 ```
 
-**Docker**
-```bash
-docker build -t chaoxing .
+**Docker（本地 Web 部署）**
 
-# 使用默认模板
-docker run -it chaoxing
-
-# 挂载自定义配置
-docker run -it -v /本地路径/config.ini:/config/config.ini chaoxing
+```text
+Web UI:            http://127.0.0.1:5001
+Container Web:     0.0.0.0:5000
+Host answer API:   http://localhost:8849/v1
+Container target:  http://host.docker.internal:8849/v1
+Persistent data:   named volume chaoxing-data at /app/data
 ```
-- 首次运行会将 `config_template.ini` 复制到 `/config/config.ini`，可自行覆盖挂载。
+
+The Web UI keeps the answer-service base URL visible and saved as
+`http://localhost:8849/v1`. When the app makes an outbound request from the
+container, it translates only that loopback destination to
+`http://host.docker.internal:8849/v1`; the user's configured value is never
+rewritten in the UI or persisted settings.
+
+Start and inspect the deployment with:
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl -fsS http://127.0.0.1:5001/api/health
+docker compose logs -f web
+docker compose stop web
+docker run --rm -v chaoxing-fanya_chaoxing-data:/source -v "$PWD":/backup alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
+```
+
+Enter the answer API key once in Settings using the password-style Replace API
+Key field, then save the connection through the Web UI. The key is encrypted
+in the local `chaoxing-data` volume and is not placed in `.env`, source files,
+the Dockerfile, the Compose file, the image build context, or image layers.
+`.env.example` contains only non-secret overrides. The volume preserves
+accounts, preferences, and answer-connection state across container restarts.
+
+To stop the Web service without removing its data, run `docker compose stop web`.
+To back up the named volume, use the `docker run` command above; it writes
+`chaoxing-data-backup.tgz` in the current directory.
 
 **便携打包**
 ```bash
@@ -86,7 +112,7 @@ python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|conti
   - 外部大模型（推荐）：
     ```bash
     export CHAOXING_VISION_OCR_PROVIDER=openai
-    export CHAOXING_VISION_OCR_KEY=sk-your-api-key
+    export CHAOXING_VISION_OCR_KEY=<your-vision-key>
     export CHAOXING_VISION_OCR_MODEL=gpt-4o
     # 可选：CHAOXING_VISION_OCR_ENDPOINT, CHAOXING_VISION_OCR_PROMPT
     ```

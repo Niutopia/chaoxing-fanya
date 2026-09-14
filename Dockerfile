@@ -1,17 +1,33 @@
-FROM python:3.13-slim
+FROM node:20-bookworm-slim AS web-builder
+
+WORKDIR /build/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
+FROM python:3.13-slim AS runtime
 
 WORKDIR /app
 
-COPY . /app
+ENV PYTHONUNBUFFERED=1 \
+    CHAOXING_DATA_DIR=/app/data \
+    CHAOXING_RUNNING_IN_DOCKER=1
 
-RUN pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 创建配置文件目录并提供默认配置
-RUN mkdir -p /config && \
-    cp config.ini.example /config/config.ini
+# Keep the non-secret configuration template available to CLI users without
+# copying a host config or any credentials into the image.
+COPY config.ini.example ./config.ini.example
+COPY . ./
+COPY --from=web-builder /build/web/dist ./web/dist
 
-# 定义卷，用户可以挂载自己的配置文件
-VOLUME /config
+RUN mkdir -p /app/data
 
-# 使用配置文件启动应用
-ENTRYPOINT ["python3", "main.py", "-c", "/config/config.ini"]
+VOLUME ["/app/data"]
+EXPOSE 5000
+
+CMD ["gunicorn", "--workers", "1", "--threads", "8", "--bind", "0.0.0.0:5000", "app:app"]

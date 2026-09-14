@@ -170,3 +170,5 @@ web/.vite/
 !web/src/lib/
 !web/src/lib/utils.js
 .worktrees/
+data/
+.superpowers/
