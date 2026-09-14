@@ -34,6 +34,16 @@ from api.live_process import LiveProcessor, StudyCancelled
 from api.cookies import load_cookie_file, save_cookie_file
 from api.vision_ocr import vision_ocr_context
 
+
+class EngineResponseError(ValueError):
+    """Raised when an engine response is not one of the known wire shapes."""
+
+    code = "engine_response_invalid"
+
+    def __init__(self, response_name: str):
+        super().__init__(f"Invalid {response_name} response")
+
+
 class ChapterResult(enum.Enum):
     SUCCESS=0,
     ERROR=1,
@@ -75,6 +85,10 @@ def _notify_callback(
     except StudyCancelled:
         raise
     except Exception as exc:
+        # A malformed engine payload is a task failure, not optional
+        # monitoring metadata.  Let the owning task boundary observe it.
+        if getattr(exc, "code", None) == "engine_response_invalid":
+            raise
         # Monitoring is best effort.  The task runner itself owns the public
         # error boundary, so callback diagnostics stay in debug logs.
         logger.debug("callback {} failed: {}", name, exc)
@@ -84,75 +98,103 @@ def _normalise_points(value: Any) -> list[dict[str, Any]]:
     """Return chapter points from the decoder or a wrapped integration value."""
 
     if isinstance(value, Mapping):
-        if "points" in value:
-            return _normalise_points(value["points"])
-        if "data" in value:
-            return _normalise_points(value["data"])
-        if "items" in value:
-            return _normalise_points(value["items"])
-        return []
-    if isinstance(value, (list, tuple)):
-        if (
-            isinstance(value, tuple)
-            and len(value) == 2
-            and isinstance(value[0], (Mapping, list, tuple))
+        for key in ("points", "data", "items"):
+            if key in value:
+                return _normalise_points(value[key])
+        raise EngineResponseError("course points")
+    if isinstance(value, list):
+        if not value:
+            return []
+        if not all(isinstance(item, Mapping) for item in value):
+            raise EngineResponseError("course points")
+        return [dict(item) for item in value]
+    if isinstance(value, tuple):
+        if not value:
+            return []
+        # The decoder's compatibility form is ``(points, metadata)``.  A
+        # tuple containing point mappings is also accepted as a plain list.
+        first = value[0]
+        if len(value) == 2 and isinstance(first, (list, tuple)):
+            return _normalise_points(first)
+        if len(value) == 2 and isinstance(first, Mapping) and any(
+            key in first for key in ("points", "data", "items")
         ):
-            return _normalise_points(value[0])
-        return [dict(item) for item in value if isinstance(item, Mapping)]
-    return []
+            return _normalise_points(first)
+        if all(isinstance(item, Mapping) for item in value):
+            return [dict(item) for item in value]
+        raise EngineResponseError("course points")
+    raise EngineResponseError("course points")
 
 
 def _normalise_jobs(value: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return jobs and metadata from tuple, list, or wrapped API responses."""
 
-    jobs_value: Any = []
-    info_value: Any = {}
-    if isinstance(value, tuple):
-        if value:
-            jobs_value = value[0]
-        if len(value) > 1:
-            info_value = value[1]
-    elif isinstance(value, Mapping):
-        info_value = value.get("job_info", value.get("jobInfo", {}))
-        # A top-level notOpen flag is metadata even when no separate info map
-        # was supplied by the integration.
-        if not isinstance(info_value, Mapping):
-            info_value = {}
-        if "notOpen" in value:
-            info_value = {**info_value, "notOpen": value["notOpen"]}
-        jobs_value = value.get("jobs", value.get("job_list", value.get("items")))
-        if jobs_value is None and "data" in value:
-            nested = value["data"]
-            if isinstance(nested, Mapping):
-                jobs_value = nested.get(
-                    "jobs", nested.get("job_list", nested.get("items", []))
-                )
-                nested_info = nested.get("job_info", nested.get("jobInfo", {}))
-                if isinstance(nested_info, Mapping):
-                    info_value = {**nested_info, **info_value}
-                if "notOpen" in nested:
-                    info_value = {**info_value, "notOpen": nested["notOpen"]}
-            else:
-                jobs_value = nested
-    else:
-        jobs_value = value
+    if isinstance(value, list):
+        if not value:
+            return [], {}
+        if not all(isinstance(item, Mapping) for item in value):
+            raise EngineResponseError("job list")
+        return [dict(item) for item in value], {}
 
-    if isinstance(jobs_value, Mapping):
-        nested_jobs, nested_info = _normalise_jobs(jobs_value)
-        jobs = nested_jobs
-        if isinstance(nested_info, Mapping):
-            info_value = {
-                **nested_info,
-                **(dict(info_value) if isinstance(info_value, Mapping) else {}),
-            }
-    else:
-        jobs = (
-            [dict(item) for item in jobs_value if isinstance(item, Mapping)]
-            if isinstance(jobs_value, (list, tuple))
-            else []
-        )
-    info = dict(info_value) if isinstance(info_value, Mapping) else {}
-    return jobs, info
+    if isinstance(value, tuple):
+        if not value:
+            return [], {}
+        if len(value) == 1:
+            return _normalise_jobs(value[0])
+        # The engine's native shape is ``(jobs, info)``.  The second item is
+        # metadata, while a tuple of job mappings remains a plain job list.
+        if len(value) == 2 and isinstance(value[1], Mapping) and (
+            isinstance(value[0], (list, tuple))
+            or (
+                isinstance(value[0], Mapping)
+                and any(
+                    key in value[0]
+                    for key in (
+                        "jobs",
+                        "job_list",
+                        "items",
+                        "data",
+                        "job_info",
+                        "jobInfo",
+                        "notOpen",
+                        "not_open",
+                    )
+                )
+            )
+        ):
+            jobs, nested_info = _normalise_jobs(value[0])
+            return jobs, {**nested_info, **dict(value[1])}
+        if all(isinstance(item, Mapping) for item in value):
+            return [dict(item) for item in value], {}
+        raise EngineResponseError("job list")
+
+    if isinstance(value, Mapping):
+        info: dict[str, Any] = {}
+        for info_key in ("job_info", "jobInfo"):
+            if info_key in value:
+                if not isinstance(value[info_key], Mapping):
+                    raise EngineResponseError("job list")
+                info.update(dict(value[info_key]))
+        if "notOpen" in value:
+            info["notOpen"] = value["notOpen"]
+        if "not_open" in value:
+            info["notOpen"] = value["not_open"]
+
+        for jobs_key in ("jobs", "job_list", "items"):
+            if jobs_key in value:
+                jobs, nested_info = _normalise_jobs(value[jobs_key])
+                return jobs, {**nested_info, **info}
+        if "data" in value:
+            jobs, nested_info = _normalise_jobs(value["data"])
+            return jobs, {**nested_info, **info}
+
+        # A metadata-only response is a valid empty chapter response (for
+        # example ``{"notOpen": true}`); any other mapping is malformed.
+        if value and set(value).issubset({"job_info", "jobInfo", "notOpen", "not_open"}):
+            return [], info
+        raise EngineResponseError("job list")
+
+    raise EngineResponseError("job list")
 
 
 def _normalise_courses(value: Any) -> list[dict[str, Any]]:

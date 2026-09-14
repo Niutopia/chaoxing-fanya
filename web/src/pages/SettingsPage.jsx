@@ -290,6 +290,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const originalNotificationRef = useRef({})
   const originalOcrRef = useRef({})
   const requestId = useRef(0)
+  const testGeneration = useRef(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [connectionError, setConnectionError] = useState('')
@@ -313,11 +314,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
 
   const loadSettings = useCallback(async () => {
     const currentRequest = ++requestId.current
+    testGeneration.current += 1
     setLoading(true)
     setLoadError('')
     setConnectionError('')
     setRuntimeError('')
     setAccountError('')
+    setTestState('idle')
+    setTestMessage('')
     setAccountPrefsReady(!selectedAccountId)
 
     const requests = [getAnswerConnection(), getRuntimeSettings()]
@@ -400,14 +404,19 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     [accounts, selectedAccountId],
   )
 
+  const invalidateConnectionTest = () => {
+    testGeneration.current += 1
+    setTestState('idle')
+    setTestMessage('')
+  }
+
   const updateConnection = (field) => (event) => {
     const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value
     setConnection((current) => ({ ...current, [field]: value }))
     setConnectionError('')
     setRuntimeError('')
     setSuccess('')
-    setTestState('idle')
-    setTestMessage('')
+    invalidateConnectionTest()
   }
 
   const updateRuntime = (field) => (event) => {
@@ -430,11 +439,13 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setTestMessage('')
       return
     }
+    const generation = ++testGeneration.current
     setTestState('testing')
     setTestMessage('')
     setConnectionError('')
     try {
       const result = unwrap(await testAnswerConnection(answerPayload(connection, apiKey)), ['result']) || {}
+      if (generation !== testGeneration.current) return
       if (result.ok === true && result.model_found !== false) {
         setTestState('success')
         setTestMessage('连接成功，模型可用')
@@ -443,6 +454,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setTestState('error')
       setTestMessage(errorMessage(result, '连接失败'))
     } catch (error) {
+      if (generation !== testGeneration.current) return
       setTestState('error')
       setTestMessage(errorMessage(error, '连接失败'))
     }
@@ -455,6 +467,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setSuccess('')
       return
     }
+    invalidateConnectionTest()
     setSavingConnection(true)
     setConnectionError('')
     setSuccess('')
@@ -462,12 +475,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       const saved = await saveAnswerConnection(answerPayload(connection, apiKey))
       if (saved) setConnection((current) => ({ ...current, ...normalizeConnection(saved) }))
       setApiKey('')
-      setTestState('idle')
-      setTestMessage('')
       setSuccess('连接设置已保存')
     } catch (error) {
-      setTestState('idle')
-      setTestMessage('')
       setConnectionError(errorMessage(error, '连接设置保存失败，请重试'))
     } finally {
       setSavingConnection(false)
@@ -476,6 +485,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
 
   const handleClearKey = async () => {
     if (!confirmingClear || clearingKey) return
+    invalidateConnectionTest()
     setClearingKey(true)
     setConnectionError('')
     try {
@@ -487,8 +497,6 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         api_key_mask: null,
       }))
       setApiKey('')
-      setTestState('idle')
-      setTestMessage('')
       setConfirmingClear(false)
       setSuccess('API Key 已清除')
     } catch (error) {
@@ -499,6 +507,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }
 
   const handleSaveSettings = async () => {
+    setAccountError('')
     const validationError = validateRuntime(runtime, connection)
     if (validationError) {
       setRuntimeError(validationError)
@@ -511,7 +520,13 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setSuccess('')
       return
     }
+    if (selectedAccountId && !accountPrefsReady) {
+      setSuccess('')
+      setAccountError('账户通知与 OCR 设置尚未成功加载，未保存任何设置。请重试加载。')
+      return
+    }
 
+    invalidateConnectionTest()
     setSavingSettings(true)
     setRuntimeError('')
     setConnectionError('')
@@ -534,8 +549,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         originalOcrRef.current = safeConfig(accountPayload.ocr_config)
         setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
         setOcr((current) => ({ ...current, api_key: '' }))
-      } else if (selectedAccountId) {
-        setAccountError('账户通知与 OCR 设置尚未成功加载，未保存账户偏好。请重试加载。')
+        setAccountError('')
       }
       setApiKey('')
       setSuccess('设置已保存')
@@ -585,6 +599,13 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
             {testMessage ? (
               <Alert variant={testState === 'success' ? 'success' : 'danger'} aria-live="polite">{testMessage}</Alert>
             ) : null}
+            <p className="text-xs text-label-secondary" role="status" aria-live="polite" data-testid="connection-test-status">
+              {testState === 'testing'
+                ? '正在测试当前连接…'
+                : testState === 'success'
+                  ? '当前连接已通过测试。'
+                  : '尚未测试当前连接，请重新测试。'}
+            </p>
 
             <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
               <input
@@ -614,8 +635,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                   setApiKey(event.target.value)
                   setConnectionError('')
                   setSuccess('')
-                  setTestState('idle')
-                  setTestMessage('')
+                  invalidateConnectionTest()
                 }}
                 autoComplete="new-password"
                 spellCheck="false"

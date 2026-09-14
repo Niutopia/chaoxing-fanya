@@ -93,16 +93,28 @@ def _task_state() -> bool | None:
         snapshots = list_tasks()
     except Exception:
         return None
-    def is_active(snapshot: Any) -> bool:
-        state = (
-            snapshot.get("state")
-            if isinstance(snapshot, Mapping)
-            else getattr(snapshot, "state", None)
-        )
-        return state in {"running", "stopping"}
-
     try:
-        return any(is_active(snapshot) for snapshot in snapshots)
+        # ``list_tasks`` is a process-local contract, not an arbitrary
+        # iterable.  Refuse mappings/strings and malformed entries so a
+        # failed state read can never be mistaken for an idle manager.
+        if not isinstance(snapshots, (list, tuple)):
+            return None
+        valid_states = {"running", "stopping", "completed", "failed", "stopped"}
+        active = False
+        for snapshot in snapshots:
+            if isinstance(snapshot, Mapping):
+                if "state" not in snapshot:
+                    return None
+                state = snapshot["state"]
+            else:
+                try:
+                    state = getattr(snapshot, "state")
+                except Exception:
+                    return None
+            if not isinstance(state, str) or state not in valid_states:
+                return None
+            active = active or state in {"running", "stopping"}
+        return active
     except Exception:
         return None
 

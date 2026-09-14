@@ -199,9 +199,10 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
         try {
           const verified = await verifyAccount(safeSaved.id)
           const safeVerified = publicAccount(verified)
-          const nextProfile = safeVerified?.id
-            ? { ...safeSaved, ...safeVerified }
-            : safeSaved
+          if (safeVerified?.verification_status !== 'valid') {
+            throw new Error('账户验证失败，请重试')
+          }
+          const nextProfile = { ...safeSaved, ...safeVerified }
           setCreatedProfile(nextProfile)
           notifySaved(nextProfile, { persisted: true, verified: true })
           setSuccess('账户验证成功')
@@ -239,9 +240,10 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     try {
       const verified = await verifyAccount(activeAccount.id)
       const safeVerified = publicAccount(verified)
-      const nextProfile = safeVerified?.id
-        ? { ...activeAccount, ...safeVerified }
-        : activeAccount
+      if (safeVerified?.verification_status !== 'valid') {
+        throw new Error('账户验证失败，请重试')
+      }
+      const nextProfile = { ...activeAccount, ...safeVerified }
       if (!account) setCreatedProfile(nextProfile)
       notifySaved(nextProfile, { persisted: true, verified: true })
       setSuccess('账户验证成功')

@@ -211,3 +211,52 @@ test('saving an unverified account after a failed verify never reports it as ver
     expect.objectContaining({ persisted: true, verified: false }),
   )
 })
+
+test('a malformed verification response keeps a newly saved account unverified', async () => {
+  const user = userEvent.setup()
+  const onSaved = vi.fn()
+  createAccount.mockResolvedValue({ id: 'a', name: '张三', username: '13800000000' })
+  verifyAccount.mockResolvedValue({ id: 'a', verification_status: 'unverified' })
+
+  render(
+    <AccountDialog
+      open
+      onOpenChange={() => {}}
+      onSaved={onSaved}
+    />,
+  )
+
+  await user.type(screen.getByLabelText('账户名称'), '张三')
+  await user.type(screen.getByLabelText('手机号'), '13800000000')
+  await user.type(screen.getByLabelText('密码'), 'known-password')
+  await user.click(screen.getByRole('button', { name: '验证并保存' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户验证失败，请重试')
+  expect(screen.queryByText('账户验证成功')).not.toBeInTheDocument()
+  expect(onSaved).toHaveBeenCalledTimes(1)
+  expect(onSaved).toHaveBeenLastCalledWith(
+    expect.objectContaining({ id: 'a' }),
+    expect.objectContaining({ persisted: true, verified: false }),
+  )
+})
+
+test('an invalid verification response cannot mark an existing account verified', async () => {
+  const user = userEvent.setup()
+  const onSaved = vi.fn()
+  verifyAccount.mockResolvedValue(null)
+
+  render(
+    <AccountDialog
+      open
+      account={{ id: 'a', name: '张三', username: '13800000000', has_secret: true }}
+      onOpenChange={() => {}}
+      onSaved={onSaved}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '验证账户' }))
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户验证失败，请重试')
+  expect(screen.queryByText('账户验证成功')).not.toBeInTheDocument()
+  expect(onSaved).not.toHaveBeenCalled()
+})

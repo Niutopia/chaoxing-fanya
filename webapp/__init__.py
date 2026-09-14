@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from flask import Flask, jsonify, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 from .account_service import AccountService
 from .answer_connection import AnswerConnectionService
@@ -187,13 +188,19 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
 
     @app.errorhandler(Exception)
-    def internal_error(_error):
+    def internal_error(error):
         """Keep unexpected API failures in the stable JSON envelope.
 
         Flask still logs the traceback server-side.  The response intentionally
         omits exception text because injected clients and storage adapters can
         include credentials or request bodies in it.
         """
+
+        if isinstance(error, HTTPException):
+            # Flask uses HTTPException for routing semantics (405) and for
+            # deliberate client errors (400).  Preserve those statuses and
+            # headers; only an actual unexpected exception is an internal 500.
+            return error
 
         return jsonify(
             status=False,

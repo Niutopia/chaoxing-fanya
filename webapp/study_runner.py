@@ -484,15 +484,17 @@ class ChaoxingStudyRunner:
         ) -> None:
             if context.cancel_event.is_set():
                 raise StudyCancelled()
-            if isinstance(points, Mapping):
-                points = points.get("points", [])
-            if not isinstance(points, (list, tuple)):
-                points = []
+            # Reuse the engine boundary's strict decoder.  A callback payload
+            # that is malformed must fail the task just like the direct
+            # ``main.process_course`` response, rather than producing an
+            # empty tree and a false completion.
+            import main
+
+            points = main._normalise_points(points)
             with tree_lock:
                 ensure_course_node(course)
                 for point in points:
-                    if isinstance(point, Mapping):
-                        ensure_chapter_node(course, point)
+                    ensure_chapter_node(course, point)
             report_counts()
             report_tree()
 
@@ -570,11 +572,15 @@ class ChaoxingStudyRunner:
         ) -> None:
             if context.cancel_event.is_set():
                 raise StudyCancelled()
-            if not isinstance(jobs, (list, tuple)):
-                jobs = []
+            import main
+
+            if job_info is None:
+                jobs, normalized_info = main._normalise_jobs(jobs)
+            else:
+                jobs, normalized_info = main._normalise_jobs((jobs, job_info))
             with tree_lock:
                 chapter = ensure_chapter_node(course, point)
-                if isinstance(job_info, Mapping) and job_info.get("notOpen"):
+                if normalized_info.get("notOpen"):
                     chapter["status"] = "not_open"
                 current_by_id = {
                     str(job.get("id", job.get("jobid", job.get("jobId", "")))): job
@@ -757,7 +763,10 @@ class ChaoxingStudyRunner:
         except StudyCancelled:
             raise
         except BaseException as exc:
-            raise StudyRunError(self._safe_error(context, exc)) from None
+            code = getattr(exc, "code", None)
+            if not isinstance(code, str) or not code:
+                code = "study_run_error"
+            raise StudyRunError(self._safe_error(context, exc), code=code) from None
 
         try:
             with vision_ocr_context(preferences.ocr_config):
@@ -889,7 +898,10 @@ class ChaoxingStudyRunner:
             # redaction boundary.
             raise StudyRunError(self._safe_error(context, exc), code=exc.code) from None
         except BaseException as exc:
-            raise StudyRunError(self._safe_error(context, exc)) from None
+            code = getattr(exc, "code", None)
+            if not isinstance(code, str) or not code:
+                code = "study_run_error"
+            raise StudyRunError(self._safe_error(context, exc), code=code) from None
 
 
 __all__ = [

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, expect, vi } from 'vitest'
@@ -158,6 +158,46 @@ test('keeps connection readiness idle after clearing a saved key', async () => {
   expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
 })
 
+test('shows an explicit retest-needed status when the current connection is untested', async () => {
+  renderPage()
+
+  expect(await screen.findByText(/尚未测试当前连接/)).toBeInTheDocument()
+})
+
+test('does not let an in-flight test restore success after the draft changes', async () => {
+  const user = userEvent.setup()
+  let resolveProbe
+  testAnswerConnection.mockImplementation(
+    () => new Promise((resolve) => { resolveProbe = resolve }),
+  )
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '测试连接' }))
+  await user.clear(screen.getByLabelText('模型'))
+  await user.type(screen.getByLabelText('模型'), 'new-model')
+  resolveProbe({ ok: true, model_found: true })
+
+  await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
+  expect(screen.getByText(/尚未测试当前连接/)).toBeInTheDocument()
+})
+
+test('invalidates an in-flight test when the connection is saved', async () => {
+  const user = userEvent.setup()
+  let resolveProbe
+  testAnswerConnection.mockImplementation(
+    () => new Promise((resolve) => { resolveProbe = resolve }),
+  )
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '测试连接' }))
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+  expect(await screen.findByText('连接设置已保存')).toBeInTheDocument()
+  resolveProbe({ ok: true, model_found: true })
+
+  await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
+  expect(screen.getByText(/尚未测试当前连接/)).toBeInTheDocument()
+})
+
 test('isolates account preference load failure and refuses to overwrite unknown values', async () => {
   const user = userEvent.setup()
   getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
@@ -186,6 +226,46 @@ test('treats a malformed preference response as a load failure', async () => {
   expect(await screen.findByRole('alert')).toHaveTextContent('账户通知与 OCR 设置加载失败')
   expect(screen.getByLabelText('启用通知')).toBeDisabled()
   expect(screen.getByLabelText('启用 OCR')).toBeDisabled()
+})
+
+test('does not partially save global settings when account preferences failed to load', async () => {
+  const user = userEvent.setup()
+  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+
+  expect(saveRuntimeSettings).not.toHaveBeenCalled()
+  expect(saveAnswerConnection).not.toHaveBeenCalled()
+  expect(savePreferences).not.toHaveBeenCalled()
+  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
+})
+
+test('clears an account preference error after a successful retry', async () => {
+  const user = userEvent.setup()
+  savePreferences
+    .mockRejectedValueOnce(new ApiError('账户偏好保存失败', 503, 'preferences_unavailable'))
+    .mockResolvedValueOnce({})
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  await screen.findByText('账号 A')
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好保存失败')
+
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+  expect(await screen.findByText('设置已保存')).toBeInTheDocument()
+  expect(screen.queryByText('账户偏好保存失败')).not.toBeInTheDocument()
 })
 
 test('does not render notification or OCR secrets and uses endpoint for OCR drafts', async () => {

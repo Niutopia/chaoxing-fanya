@@ -159,6 +159,27 @@ class SQLiteStore:
                         "UPDATE accounts SET auth_mode = 'password' "
                         "WHERE auth_mode IS NULL OR auth_mode NOT IN ('password', 'cookies')"
                     )
+                if added_auth_mode:
+                    # Legacy volumes had no mode marker, so rows containing
+                    # both secrets are ambiguous.  The migration chooses the
+                    # password source when one exists and removes the
+                    # incompatible cookie material transactionally; this is a
+                    # credential change and therefore invalidates verification.
+                    now = _utc_now()
+                    connection.execute(
+                        "UPDATE accounts SET cookies_token = NULL, "
+                        "verification_status = 'unverified', last_verified_at = NULL, "
+                        "updated_at = ? WHERE auth_mode = 'password' "
+                        "AND cookies_token IS NOT NULL",
+                        (now,),
+                    )
+                    connection.execute(
+                        "UPDATE accounts SET password_token = NULL, "
+                        "verification_status = 'unverified', last_verified_at = NULL, "
+                        "updated_at = ? WHERE auth_mode = 'cookies' "
+                        "AND password_token IS NOT NULL",
+                        (now,),
+                    )
 
     @staticmethod
     def _profile_from_row(row: sqlite3.Row) -> AccountProfile:
@@ -439,8 +460,20 @@ class SQLiteStore:
                 credential_changed = True
             if cookies_supplied and normalized_cookies != current_cookies:
                 credential_changed = True
-            if auth_mode is not None and selected_mode != current_mode:
-                credential_changed = True
+            if auth_mode is not None:
+                if selected_mode != current_mode:
+                    credential_changed = True
+                # Explicitly reaffirming a mode is still a material cleanup
+                # when a legacy row carries the incompatible second secret.
+                # Clearing that token must invalidate any old verification.
+                if (
+                    selected_mode == "password"
+                    and existing["cookies_token"] is not None
+                ) or (
+                    selected_mode == "cookies"
+                    and existing["password_token"] is not None
+                ):
+                    credential_changed = True
 
             if auth_mode is not None:
                 # Selecting a source and clearing its incompatible secret are

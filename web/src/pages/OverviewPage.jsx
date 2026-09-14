@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { MoreHorizontal, Plus, Trash2, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { deleteAccount, listAccounts, setAccountEnabled, verifyAccount } from '../api/accounts'
 import { listTasks } from '../api/tasks'
 import AccountDialog from '../components/accounts/AccountDialog'
@@ -24,6 +25,10 @@ const ACTIVE_TASK_STATES = new Set(['running', 'stopping'])
 
 function accountIdOf(value) {
   return value?.account_id ?? value?.accountId
+}
+
+function taskIdOf(value) {
+  return value?.id ?? value?.task_id ?? value?.taskId
 }
 
 function taskTimestamp(task) {
@@ -113,33 +118,62 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   const enabled = accountField(account, 'enabled') !== false
   const triggerRef = useRef(null)
   const itemRefs = useRef([])
-  const restoreFocusRef = useRef(true)
+  const restoreFocusRef = useRef(false)
+  const hasOpenedRef = useRef(false)
+  const mountedRef = useRef(true)
+
+  useEffect(() => () => {
+    mountedRef.current = false
+  }, [])
 
   useEffect(() => {
     if (open) {
+      hasOpenedRef.current = true
       restoreFocusRef.current = true
-      itemRefs.current[0]?.focus()
-    } else if (restoreFocusRef.current) {
-      triggerRef.current?.focus()
+      const focusTimer = window.setTimeout(() => {
+        if (mountedRef.current && itemRefs.current[0]) itemRefs.current[0].focus()
+      }, 0)
+      return () => window.clearTimeout(focusTimer)
     }
+    if (hasOpenedRef.current && restoreFocusRef.current && mountedRef.current) {
+      triggerRef.current?.focus()
+      const focusTimer = window.setTimeout(() => {
+        if (mountedRef.current) triggerRef.current?.focus()
+      }, 0)
+      return () => window.clearTimeout(focusTimer)
+    }
+    return undefined
   }, [open])
 
   useEffect(() => {
     if (!open) return undefined
     const handleOutsidePointer = (event) => {
-      if (!event.target.closest?.(`[data-account-menu="${account.id}"]`)) onToggle()
+      if (!event.target.closest?.(`[data-account-menu="${account.id}"]`)) {
+        closeMenu(true)
+      }
     }
     document.addEventListener('pointerdown', handleOutsidePointer)
     return () => document.removeEventListener('pointerdown', handleOutsidePointer)
   }, [account.id, onToggle, open])
+
+  const closeMenu = (restoreFocus) => {
+    restoreFocusRef.current = restoreFocus
+    if (restoreFocus && mountedRef.current) triggerRef.current?.focus()
+    onToggle()
+  }
 
   const handleMenuKeyDown = (event) => {
     const items = itemRefs.current.filter(Boolean)
     const currentIndex = items.indexOf(document.activeElement)
     if (event.key === 'Escape') {
       event.preventDefault()
-      restoreFocusRef.current = true
-      onToggle()
+      closeMenu(true)
+      return
+    }
+    if (event.key === 'Tab') {
+      // Let the browser move focus naturally; closing the menu must not trap
+      // keyboard users inside a transient action list.
+      closeMenu(false)
       return
     }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || items.length === 0) return
@@ -152,15 +186,28 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
     items[nextIndex]?.focus()
   }
 
-  const runAction = (action) => {
-    restoreFocusRef.current = false
+  const handleMenuBlur = (event) => {
+    const nextTarget = event.relatedTarget
+    if (!nextTarget?.closest?.(`[data-account-menu="${account.id}"]`)) {
+      // A focusout with a concrete next target (for example Tab) should let
+      // focus continue naturally; a pointer dismissal with no next target
+      // can safely restore the menu trigger.
+      const restoreFocus = nextTarget == null && restoreFocusRef.current
+      restoreFocusRef.current = restoreFocus
+      if (mountedRef.current && restoreFocus) triggerRef.current?.focus()
+      onToggle()
+    }
+  }
+
+  const runAction = (action, { restoreFocus = false } = {}) => {
+    closeMenu(restoreFocus)
     action()
   }
 
   const menuItems = [
     { label: '编辑账户', action: onEdit },
-    { label: '重新验证', action: onVerify },
-    { label: enabled ? '停用账户' : '启用账户', action: onToggleEnabled },
+    { label: '重新验证', action: onVerify, restoreFocus: true },
+    { label: enabled ? '停用账户' : '启用账户', action: onToggleEnabled, restoreFocus: true },
     { label: '删除账户', action: onDelete, danger: true },
   ]
 
@@ -182,6 +229,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
           role="menu"
           aria-label={`${account.name}账户操作`}
           onKeyDown={handleMenuKeyDown}
+          onBlur={handleMenuBlur}
           className="absolute right-0 top-10 z-20 min-w-40 rounded-md border border-separator bg-surface p-1"
         >
           {menuItems.map((item, index) => (
@@ -195,7 +243,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
                 'touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
                 item.danger ? 'text-danger hover:bg-danger/[0.06] focus-visible:ring-danger' : 'text-label-primary',
               )}
-              onClick={() => runAction(item.action)}
+              onClick={() => runAction(item.action, { restoreFocus: item.restoreFocus })}
             >
               {item.danger ? <Trash2 aria-hidden="true" size={15} strokeWidth={1.8} /> : null}
               {item.label}
@@ -224,6 +272,7 @@ function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit
     unverified: '未验证',
   }[verificationStatus] ?? ''
   const username = accountField(account, 'username')
+  const taskId = taskIdOf(task)
 
   return (
     <div
@@ -276,27 +325,27 @@ function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit
 
       <div role="cell" className="flex justify-end">
         <div className="flex items-center gap-2">
-          {enabled && task?.id && ACTIVE_TASK_STATES.has(task?.state) ? (
-            <a
-              href={`/tasks/${encodeURIComponent(task.id)}`}
+          {enabled && taskId != null && ACTIVE_TASK_STATES.has(task?.state) ? (
+            <Link
+              to={`/tasks/${encodeURIComponent(String(taskId))}`}
               className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               查看任务
-            </a>
-          ) : enabled && task?.id && ['failed', 'stopped', 'completed'].includes(task?.state) ? (
-            <a
-              href={`/tasks/${encodeURIComponent(task.id)}`}
+            </Link>
+          ) : enabled && taskId != null && ['failed', 'stopped', 'completed'].includes(task?.state) ? (
+            <Link
+              to={`/tasks/${encodeURIComponent(String(taskId))}`}
               className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               {task?.state === 'failed' ? '查看错误' : '查看结果'}
-            </a>
+            </Link>
           ) : enabled ? (
-            <a
-              href={`/accounts/${encodeURIComponent(account.id)}/launch`}
+            <Link
+              to={`/accounts/${encodeURIComponent(account.id)}/launch`}
               className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               配置并开始
-            </a>
+            </Link>
           ) : null}
           <AccountActionsMenu
             account={account}
@@ -494,15 +543,18 @@ function OverviewPage({
     setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     try {
       const verified = await verifyAccount(account.id)
-      if (verified?.id) {
-        setAccounts((current) => {
-          const next = current.map((item) => (
-            String(item.id) === String(verified.id) ? mergedAccount(item, verified) : item
-          ))
-          onAccountsChange?.(next)
-          return next
-        })
+      const safeVerified = publicAccount(verified)
+      if (safeVerified?.verification_status !== 'valid') {
+        throw new Error('账户验证失败，请重试')
       }
+      setAccounts((current) => {
+        const targetId = safeVerified.id ?? account.id
+        const next = current.map((item) => (
+          String(item.id) === String(targetId) ? mergedAccount(item, safeVerified) : item
+        ))
+        onAccountsChange?.(next)
+        return next
+      })
       setActionMessage('账户验证成功')
       setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
@@ -694,5 +746,5 @@ function OverviewPage({
   )
 }
 
-export { AccountRow, AccountActionsMenu, maskUsername, taskForAccount }
+export { AccountRow, AccountActionsMenu, maskUsername, taskForAccount, taskIdOf }
 export default OverviewPage
