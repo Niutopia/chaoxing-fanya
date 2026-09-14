@@ -69,7 +69,7 @@ def _error(message: str, code: str, status_code: int):
     return jsonify(status=False, msg=message, code=code), status_code
 
 
-def _tasks_in_use() -> bool:
+def _task_state() -> bool | None:
     """Return whether any process-local task can observe shared settings.
 
     Settings are global to the process and are captured by a task at startup.
@@ -80,16 +80,19 @@ def _tasks_in_use() -> bool:
     """
 
     services = _services()
-    manager = services.get("task_manager")
+    manager = services.get("task_manager") or current_app.extensions.get("task_manager")
     if manager is None:
-        return False
-    list_tasks = getattr(manager, "list_tasks", None)
+        return None
+    try:
+        list_tasks = getattr(manager, "list_tasks", None)
+    except Exception:
+        return None
     if not callable(list_tasks):
-        return False
+        return None
     try:
         snapshots = list_tasks()
     except Exception:
-        return False
+        return None
     def is_active(snapshot: Any) -> bool:
         state = (
             snapshot.get("state")
@@ -98,11 +101,28 @@ def _tasks_in_use() -> bool:
         )
         return state in {"running", "stopping"}
 
-    return any(is_active(snapshot) for snapshot in snapshots)
+    try:
+        return any(is_active(snapshot) for snapshot in snapshots)
+    except Exception:
+        return None
+
+
+def _tasks_in_use() -> bool:
+    """Compatibility boolean for callers that do not need failure detail."""
+
+    return _task_state() is True
 
 
 def _settings_in_use_error():
     return _error("Settings are in use by an active task", "settings_in_use", 409)
+
+
+def _settings_state_unavailable_error():
+    return _error(
+        "Task state is unavailable; settings were not changed",
+        "settings_state_unavailable",
+        503,
+    )
 
 
 def _settings_boundary():
@@ -262,7 +282,10 @@ def get_answer_connection():
 
 @settings.put("/answer-connection")
 def put_answer_connection():
-    if _tasks_in_use():
+    task_state = _task_state()
+    if task_state is None:
+        return _settings_state_unavailable_error()
+    if task_state:
         return _settings_in_use_error()
     payload = _json_mapping()
     if payload is None:
@@ -274,7 +297,10 @@ def put_answer_connection():
     try:
         values = _answer_payload(payload)
         with _settings_boundary():
-            if _tasks_in_use():
+            task_state = _task_state()
+            if task_state is None:
+                return _settings_state_unavailable_error()
+            if task_state:
                 return _settings_in_use_error()
             connection = _services()["store"].save_answer_connection(**values)
             invalidate_answer_test()
@@ -294,7 +320,10 @@ def put_answer_connection():
 @settings.delete("/answer-connection/key")
 def delete_answer_key():
     with _settings_boundary():
-        if _tasks_in_use():
+        task_state = _task_state()
+        if task_state is None:
+            return _settings_state_unavailable_error()
+        if task_state:
             return _settings_in_use_error()
         connection = _services()["store"].clear_answer_key()
         invalidate_answer_test()
@@ -391,14 +420,20 @@ def get_runtime_settings():
 
 @settings.put("/runtime")
 def put_runtime_settings():
-    if _tasks_in_use():
+    task_state = _task_state()
+    if task_state is None:
+        return _settings_state_unavailable_error()
+    if task_state:
         return _settings_in_use_error()
     payload = _json_mapping()
     if payload is None or set(payload) - _RUNTIME_FIELDS:
         return _error("Invalid runtime settings", "invalid_runtime", 400)
     try:
         with _settings_boundary():
-            if _tasks_in_use():
+            task_state = _task_state()
+            if task_state is None:
+                return _settings_state_unavailable_error()
+            if task_state:
                 return _settings_in_use_error()
             runtime = _services()["store"].save_runtime_settings(**dict(payload))
             manager = _services().get("task_manager")

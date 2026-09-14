@@ -175,3 +175,39 @@ test('create once then verify failure transitions to safe revalidation without r
   expect(createAccount).toHaveBeenCalledTimes(1)
   expect(verifyAccount).toHaveBeenCalledTimes(2)
 })
+
+test('saving an unverified account after a failed verify never reports it as verified', async () => {
+  const user = userEvent.setup()
+  const onSaved = vi.fn()
+  updateAccount.mockResolvedValue({
+    id: 'a',
+    name: '新名称',
+    username: '13800000000',
+    verification_status: 'unverified',
+  })
+
+  render(
+    <AccountDialog
+      open
+      account={{
+        id: 'a',
+        name: '张三',
+        username: '13800000000',
+        has_secret: true,
+        verification_status: 'unverified',
+      }}
+      onOpenChange={() => {}}
+      onSaved={onSaved}
+    />
+  )
+
+  await user.clear(screen.getByLabelText('账户名称'))
+  await user.type(screen.getByLabelText('账户名称'), '新名称')
+  await user.click(screen.getByRole('button', { name: '保存账户' }))
+
+  expect(await screen.findByText('账户已保存')).toBeInTheDocument()
+  expect(onSaved).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 'a' }),
+    expect.objectContaining({ persisted: true, verified: false }),
+  )
+})

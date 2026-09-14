@@ -103,6 +103,7 @@ def _account_auth(value: AccountAuth | Mapping[str, Any]) -> AccountAuth:
             username=value.username,
             password=value.password,
             cookies=_copy(value.cookies),
+            auth_mode=value.auth_mode,
         )
     if isinstance(value, Mapping):
         return AccountAuth(**_copy(dict(value)))
@@ -690,6 +691,10 @@ class TaskManager:
             finished_at=time.time(),
             stats=_copy(record.snapshot.stats),
         )
+        # A cancellation or worker error can bypass the normal job-done
+        # callback.  Never leave a terminal task advertising phantom active
+        # jobs to the monitor.
+        record.details = replace(record.details, active_jobs={})
         if self.active_by_account.get(record.snapshot.account_id) == record.snapshot.id:
             self.active_by_account.pop(record.snapshot.account_id, None)
         if not record.slot_released:
@@ -702,10 +707,11 @@ class TaskManager:
 
         with self._lock:
             record = self._lookup(task_id)
-            if record.snapshot.state in {"running", "stopping"}:
-                if record.snapshot.state == "running":
-                    record.snapshot = replace(record.snapshot, state="stopping")
-                record.context.cancel_event.set()
+            if record.snapshot.state not in {"running", "stopping"}:
+                raise TaskNotRunning(str(task_id))
+            if record.snapshot.state == "running":
+                record.snapshot = replace(record.snapshot, state="stopping")
+            record.context.cancel_event.set()
             return self._snapshot_copy(record.snapshot)
 
     def wait(self, task_id: str, timeout: float | None = None) -> bool:

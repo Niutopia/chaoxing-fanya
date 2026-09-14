@@ -3,6 +3,7 @@ import { cn } from '../../lib/utils'
 
 const STATE_LABELS = {
   idle: '空闲',
+  disabled: '已停用',
   running: '运行中',
   stopping: '停止中',
   completed: '已完成',
@@ -15,6 +16,7 @@ const STATE_LABELS = {
 
 const STATE_COLORS = {
   idle: 'bg-label-tertiary',
+  disabled: 'bg-label-tertiary',
   running: 'bg-accent-blue',
   stopping: 'bg-warning',
   completed: 'bg-success',

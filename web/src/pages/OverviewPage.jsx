@@ -12,6 +12,7 @@ import { cn } from '../lib/utils'
 
 const TASK_LABELS = {
   idle: '空闲',
+  disabled: '已停用',
   running: '运行中',
   stopping: '正在停止',
   failed: '失败',
@@ -82,6 +83,7 @@ const PUBLIC_ACCOUNT_FIELDS = [
   'has_cookies',
   'verification_status',
   'last_verified_at',
+  'auth_mode',
 ]
 
 const PUBLIC_ACCOUNT_ALIASES = {
@@ -89,6 +91,7 @@ const PUBLIC_ACCOUNT_ALIASES = {
   has_cookies: 'hasCookies',
   verification_status: 'verificationStatus',
   last_verified_at: 'lastVerifiedAt',
+  auth_mode: 'authMode',
 }
 
 function publicAccount(value) {
@@ -108,10 +111,63 @@ function mergedAccount(previous, next) {
 
 function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
+  const triggerRef = useRef(null)
+  const itemRefs = useRef([])
+  const restoreFocusRef = useRef(true)
+
+  useEffect(() => {
+    if (open) {
+      restoreFocusRef.current = true
+      itemRefs.current[0]?.focus()
+    } else if (restoreFocusRef.current) {
+      triggerRef.current?.focus()
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return undefined
+    const handleOutsidePointer = (event) => {
+      if (!event.target.closest?.(`[data-account-menu="${account.id}"]`)) onToggle()
+    }
+    document.addEventListener('pointerdown', handleOutsidePointer)
+    return () => document.removeEventListener('pointerdown', handleOutsidePointer)
+  }, [account.id, onToggle, open])
+
+  const handleMenuKeyDown = (event) => {
+    const items = itemRefs.current.filter(Boolean)
+    const currentIndex = items.indexOf(document.activeElement)
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      restoreFocusRef.current = true
+      onToggle()
+      return
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || items.length === 0) return
+    event.preventDefault()
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? items.length - 1
+        : (currentIndex + (event.key === 'ArrowUp' ? -1 : 1) + items.length) % items.length
+    items[nextIndex]?.focus()
+  }
+
+  const runAction = (action) => {
+    restoreFocusRef.current = false
+    action()
+  }
+
+  const menuItems = [
+    { label: '编辑账户', action: onEdit },
+    { label: '重新验证', action: onVerify },
+    { label: enabled ? '停用账户' : '启用账户', action: onToggleEnabled },
+    { label: '删除账户', action: onDelete, danger: true },
+  ]
 
   return (
-    <div className="relative shrink-0">
+    <div className="relative shrink-0" data-account-menu={account.id}>
       <button
+        ref={triggerRef}
         type="button"
         className="touch-target touch-target-compact inline-flex size-9 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         aria-label={`${account.name}的更多操作`}
@@ -125,48 +181,33 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
         <div
           role="menu"
           aria-label={`${account.name}账户操作`}
+          onKeyDown={handleMenuKeyDown}
           className="absolute right-0 top-10 z-20 min-w-40 rounded-md border border-separator bg-surface p-1"
         >
-          <button
-            type="button"
-            role="menuitem"
-            className="touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm text-label-primary hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            onClick={onEdit}
-          >
-            编辑账户
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className="touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm text-label-primary hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            onClick={onVerify}
-          >
-            重新验证
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className="touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm text-label-primary hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            onClick={onToggleEnabled}
-          >
-            {enabled ? '停用账户' : '启用账户'}
-          </button>
-          <button
-            type="button"
-            role="menuitem"
-            className="touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm text-danger hover:bg-danger/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger"
-            onClick={onDelete}
-          >
-            <Trash2 aria-hidden="true" size={15} strokeWidth={1.8} />
-            删除账户
-          </button>
+          {menuItems.map((item, index) => (
+            <button
+              key={item.label}
+              ref={(element) => { itemRefs.current[index] = element }}
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              className={cn(
+                'touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
+                item.danger ? 'text-danger hover:bg-danger/[0.06] focus-visible:ring-danger' : 'text-label-primary',
+              )}
+              onClick={() => runAction(item.action)}
+            >
+              {item.danger ? <Trash2 aria-hidden="true" size={15} strokeWidth={1.8} /> : null}
+              {item.label}
+            </button>
+          ))}
         </div>
       ) : null}
     </div>
   )
 }
 
-function AccountRow({ account, task, menuOpen, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
+function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
   const state = enabled ? task?.state ?? 'idle' : 'disabled'
   const label = enabled ? taskStateLabel(state) : '已停用'
@@ -196,7 +237,7 @@ function AccountRow({ account, task, menuOpen, onMenuToggle, onEdit, onVerify, o
       <div role="cell" className="min-w-0">
         <div className="flex min-w-0 items-center gap-2">
           <StatusDot
-            status={enabled ? state : 'idle'}
+            status={state}
             label={`${account.name}：${label}`}
           />
           <span className="min-w-0 truncate font-medium text-label-primary">{account.name}</span>
@@ -234,16 +275,45 @@ function AccountRow({ account, task, menuOpen, onMenuToggle, onEdit, onVerify, o
       </div>
 
       <div role="cell" className="flex justify-end">
-        <AccountActionsMenu
-          account={account}
-          open={menuOpen}
-          onToggle={onMenuToggle}
-          onEdit={onEdit}
-          onVerify={onVerify}
-          onToggleEnabled={onToggleEnabled}
-          onDelete={onDelete}
-        />
+        <div className="flex items-center gap-2">
+          {enabled && task?.id && ACTIVE_TASK_STATES.has(task?.state) ? (
+            <a
+              href={`/tasks/${encodeURIComponent(task.id)}`}
+              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            >
+              查看任务
+            </a>
+          ) : enabled && task?.id && ['failed', 'stopped', 'completed'].includes(task?.state) ? (
+            <a
+              href={`/tasks/${encodeURIComponent(task.id)}`}
+              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            >
+              {task?.state === 'failed' ? '查看错误' : '查看结果'}
+            </a>
+          ) : enabled ? (
+            <a
+              href={`/accounts/${encodeURIComponent(account.id)}/launch`}
+              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            >
+              配置并开始
+            </a>
+          ) : null}
+          <AccountActionsMenu
+            account={account}
+            open={menuOpen}
+            onToggle={onMenuToggle}
+            onEdit={onEdit}
+            onVerify={onVerify}
+            onToggleEnabled={onToggleEnabled}
+            onDelete={onDelete}
+          />
+        </div>
       </div>
+      {actionError ? (
+        <div className="md:col-span-4">
+          <Alert variant="danger" aria-live="polite">{actionError}</Alert>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -322,6 +392,7 @@ function OverviewPage({
   const [confirmError, setConfirmError] = useState('')
   const [pendingAccountId, setPendingAccountId] = useState(null)
   const [actionMessage, setActionMessage] = useState('')
+  const [actionErrors, setActionErrors] = useState({})
   const emptyActionRef = useRef(null)
   const requestIdRef = useRef(0)
   const controlledData = suppliedAccounts !== undefined
@@ -379,6 +450,7 @@ function OverviewPage({
     setMenuAccountId(null)
     setEditingAccount(null)
     setActionMessage('')
+    setActionErrors({})
     setDialogOpen(true)
   }
 
@@ -386,6 +458,7 @@ function OverviewPage({
     setMenuAccountId(null)
     setEditingAccount(account)
     setActionMessage('')
+    setActionErrors({})
     setDialogOpen(true)
   }
 
@@ -407,12 +480,18 @@ function OverviewPage({
     })
     reportAccountSaved?.(safeSaved)
     setActionMessage('账户已更新')
+    setActionErrors((current) => {
+      const next = { ...current }
+      delete next[String(safeSaved.id)]
+      return next
+    })
   }
 
   const handleVerify = async (account) => {
     setMenuAccountId(null)
     setPendingAccountId(account.id)
     setActionMessage('')
+    setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     try {
       const verified = await verifyAccount(account.id)
       if (verified?.id) {
@@ -425,8 +504,12 @@ function OverviewPage({
         })
       }
       setActionMessage('账户验证成功')
+      setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
-      setActionMessage(requestMessage(requestError, '账户验证失败，请重试'))
+      setActionErrors((current) => ({
+        ...current,
+        [String(account.id)]: requestMessage(requestError, '账户验证失败，请重试'),
+      }))
     } finally {
       setPendingAccountId(null)
     }
@@ -436,6 +519,7 @@ function OverviewPage({
     setMenuAccountId(null)
     setPendingAccountId(account.id)
     setActionMessage('')
+    setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     const nextEnabled = accountField(account, 'enabled') === false
     try {
       const updated = await setAccountEnabled(account.id, nextEnabled)
@@ -449,8 +533,12 @@ function OverviewPage({
         return next
       })
       setActionMessage(nextEnabled ? '账户已启用' : '账户已停用')
+      setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
-      setActionMessage(requestMessage(requestError, '账户状态更新失败，请重试'))
+      setActionErrors((current) => ({
+        ...current,
+        [String(account.id)]: requestMessage(requestError, '账户状态更新失败，请重试'),
+      }))
     } finally {
       setPendingAccountId(null)
     }
@@ -567,6 +655,7 @@ function OverviewPage({
                 key={account.id}
                 account={account}
                 task={taskForAccount(visibleTasks, account.id)}
+                actionError={actionErrors[String(account.id)]}
                 menuOpen={String(menuAccountId) === String(account.id)}
                 onMenuToggle={() => setMenuAccountId((current) => (
                   String(current) === String(account.id) ? null : account.id

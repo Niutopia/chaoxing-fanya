@@ -35,16 +35,24 @@ function safeMessage(value) {
 /** A selectable, cursor-fed log stream that respects a user's scroll position. */
 function TaskLog({ items = [], className }) {
   const logRef = useRef(null)
-  const previousHeightRef = useRef(0)
+  const nearBottomRef = useRef(true)
+
+  const updateNearBottom = () => {
+    const node = logRef.current
+    if (!node) return
+    nearBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight <= 32
+  }
 
   useLayoutEffect(() => {
     const node = logRef.current
     if (!node) return
-    const wasNearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 32
-    if (wasNearBottom && previousHeightRef.current > 0) {
+    // Capture the user's position before the DOM grows.  A single appended
+    // row can exceed the threshold by itself, so calculating “near bottom”
+    // only after rendering would incorrectly stop following the stream.
+    if (nearBottomRef.current) {
       node.scrollTop = node.scrollHeight
     }
-    previousHeightRef.current = node.scrollHeight
+    updateNearBottom()
   }, [items.length])
 
   return (
@@ -53,6 +61,7 @@ function TaskLog({ items = [], className }) {
       role="list"
       aria-label="任务日志"
       tabIndex={0}
+      onScroll={updateNearBottom}
       className={cn(
         'max-h-72 overflow-auto border-y border-separator bg-black/[0.018] font-mono text-xs leading-5 outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
         className,

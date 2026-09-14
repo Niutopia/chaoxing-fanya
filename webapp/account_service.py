@@ -111,7 +111,16 @@ class AccountService:
         return self._client_with_auth(account_id)[1]
 
     @staticmethod
-    def _use_cookies(client: Any) -> bool:
+    def _use_cookies(client: Any, auth: AccountAuth | None = None) -> bool:
+        # The selected account mode is authoritative.  Password accounts may
+        # have refreshed session cookies after a request, but those cookies
+        # must not silently switch a later verification to cookie login.
+        if auth is not None:
+            auth_mode = getattr(auth, "auth_mode", None)
+            if auth_mode == "password":
+                return False
+            if auth_mode == "cookies":
+                return True
         session = getattr(client, "session", None)
         cookies = getattr(session, "cookies", None)
         return bool(cookies)
@@ -140,7 +149,7 @@ class AccountService:
 
     def _login(self, account_id: str, client: Any, auth: AccountAuth):
         try:
-            result = client.login(login_with_cookies=self._use_cookies(client))
+            result = client.login(login_with_cookies=self._use_cookies(client, auth))
         except AccountValidationError as exc:
             self._record_verification(account_id, valid=False)
             message = self._safe_message(
@@ -233,3 +242,28 @@ class AccountService:
 
         with self._cache_lock:
             self._course_cache.pop(str(account_id), None)
+
+    def validate_course_ids(
+        self, account_id: str, course_ids: list[str]
+    ) -> bool | None:
+        """Validate explicit IDs against a previously fetched catalog.
+
+        ``None`` means that no cache is available and the task runner must
+        validate against the live catalog inside its account-owned session.
+        Returning a tri-state result keeps task admission free of an extra
+        network request while still allowing the HTTP route to reject a
+        demonstrably stale/unknown selection immediately.
+        """
+
+        account_id = str(account_id)
+        with self._cache_lock:
+            cached = self._course_cache.get(account_id)
+            if cached is None:
+                return None
+            available = {
+                str(course.get("courseId", course.get("id")))
+                for course in cached
+                if isinstance(course, Mapping)
+                and course.get("courseId", course.get("id")) is not None
+            }
+        return all(str(course_id) in available for course_id in course_ids)

@@ -30,7 +30,8 @@ function formForAccount(account) {
     ...EMPTY_FORM,
     name: String(account.name ?? ''),
     username: String(account.username ?? ''),
-    authMode: hasCookies && !hasSecret ? 'cookies' : 'password',
+    authMode: accountValue(account, 'auth_mode', 'authMode')
+      || (hasCookies && !hasSecret ? 'cookies' : 'password'),
   }
 }
 
@@ -48,6 +49,7 @@ const PUBLIC_ACCOUNT_FIELDS = [
   'has_cookies',
   'verification_status',
   'last_verified_at',
+  'auth_mode',
 ]
 
 const PUBLIC_ACCOUNT_ALIASES = {
@@ -55,6 +57,7 @@ const PUBLIC_ACCOUNT_ALIASES = {
   has_cookies: 'hasCookies',
   verification_status: 'verificationStatus',
   last_verified_at: 'lastVerifiedAt',
+  auth_mode: 'authMode',
 }
 
 function publicAccount(value) {
@@ -135,6 +138,11 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
       name: form.name.trim(),
       username: form.username.trim(),
     }
+    // Older injected profiles do not advertise auth_mode; preserve their
+    // request shape while real store profiles carry the explicit selection.
+    if (activeAccount && accountValue(activeAccount, 'auth_mode', 'authMode')) {
+      values.auth_mode = form.authMode
+    }
     // An empty replacement must be omitted. The account API treats an
     // omitted password/cookies field as "keep the stored encrypted secret".
     // Only the active mode may contribute a credential field.
@@ -176,7 +184,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     let persistedProfile = null
     try {
       const saved = await savedAccount()
-      const safeSaved = notifySaved(saved, { persisted: true, verified: isEditing })
+      const safeSaved = notifySaved(saved, { persisted: true, verified: false })
       persistedProfile = safeSaved
       if (!safeSaved?.id) {
         clearSecrets()

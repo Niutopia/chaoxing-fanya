@@ -58,6 +58,118 @@ def raise_if_cancelled(config: Mapping[str, Any] | None) -> None:
         raise StudyCancelled()
 
 
+def _notify_callback(
+    config: Mapping[str, Any] | None,
+    name: str,
+    *args: Any,
+) -> None:
+    """Invoke an optional monitoring callback without changing CLI behavior."""
+
+    if not config:
+        return
+    callback = config.get(name)
+    if not callable(callback):
+        return
+    try:
+        callback(*args)
+    except StudyCancelled:
+        raise
+    except Exception as exc:
+        # Monitoring is best effort.  The task runner itself owns the public
+        # error boundary, so callback diagnostics stay in debug logs.
+        logger.debug("callback {} failed: {}", name, exc)
+
+
+def _normalise_points(value: Any) -> list[dict[str, Any]]:
+    """Return chapter points from the decoder or a wrapped integration value."""
+
+    if isinstance(value, Mapping):
+        if "points" in value:
+            return _normalise_points(value["points"])
+        if "data" in value:
+            return _normalise_points(value["data"])
+        if "items" in value:
+            return _normalise_points(value["items"])
+        return []
+    if isinstance(value, (list, tuple)):
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], (Mapping, list, tuple))
+        ):
+            return _normalise_points(value[0])
+        return [dict(item) for item in value if isinstance(item, Mapping)]
+    return []
+
+
+def _normalise_jobs(value: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return jobs and metadata from tuple, list, or wrapped API responses."""
+
+    jobs_value: Any = []
+    info_value: Any = {}
+    if isinstance(value, tuple):
+        if value:
+            jobs_value = value[0]
+        if len(value) > 1:
+            info_value = value[1]
+    elif isinstance(value, Mapping):
+        info_value = value.get("job_info", value.get("jobInfo", {}))
+        # A top-level notOpen flag is metadata even when no separate info map
+        # was supplied by the integration.
+        if not isinstance(info_value, Mapping):
+            info_value = {}
+        if "notOpen" in value:
+            info_value = {**info_value, "notOpen": value["notOpen"]}
+        jobs_value = value.get("jobs", value.get("job_list", value.get("items")))
+        if jobs_value is None and "data" in value:
+            nested = value["data"]
+            if isinstance(nested, Mapping):
+                jobs_value = nested.get(
+                    "jobs", nested.get("job_list", nested.get("items", []))
+                )
+                nested_info = nested.get("job_info", nested.get("jobInfo", {}))
+                if isinstance(nested_info, Mapping):
+                    info_value = {**nested_info, **info_value}
+                if "notOpen" in nested:
+                    info_value = {**info_value, "notOpen": nested["notOpen"]}
+            else:
+                jobs_value = nested
+    else:
+        jobs_value = value
+
+    if isinstance(jobs_value, Mapping):
+        nested_jobs, nested_info = _normalise_jobs(jobs_value)
+        jobs = nested_jobs
+        if isinstance(nested_info, Mapping):
+            info_value = {
+                **nested_info,
+                **(dict(info_value) if isinstance(info_value, Mapping) else {}),
+            }
+    else:
+        jobs = (
+            [dict(item) for item in jobs_value if isinstance(item, Mapping)]
+            if isinstance(jobs_value, (list, tuple))
+            else []
+        )
+    info = dict(info_value) if isinstance(info_value, Mapping) else {}
+    return jobs, info
+
+
+def _normalise_courses(value: Any) -> list[dict[str, Any]]:
+    """Return course dictionaries from list and common response wrappers."""
+
+    if isinstance(value, Mapping):
+        for key in ("courses", "course_list", "items"):
+            if key in value:
+                return _normalise_courses(value[key])
+        if "data" in value:
+            return _normalise_courses(value["data"])
+        return []
+    if isinstance(value, (list, tuple)):
+        return [dict(item) for item in value if isinstance(item, Mapping)]
+    return []
+
+
 def run_with_task_context(
     task_id: str,
     target,
@@ -659,7 +771,7 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     则回调通知外部（如 Web 端）更新进度统计。
     """
     raise_if_cancelled(config)
-    logger.info(f'当前章节: {point["title"]}')
+    logger.info(f'当前章节: {point.get("title", point.get("name", ""))}')
 
     # 通知外部当前章节开始（用于前端显示当前正在学习的章节）
     if config is not None:
@@ -672,9 +784,10 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             except Exception as e:
                 logger.debug(f"调用 chapter_start_callback 时出错: {e}")
     raise_if_cancelled(config)
-    if point["has_finished"]:
-        logger.info(f'章节：{point["title"]} 已完成所有任务点')
-        # 已经在超星端标记为完成的章节，这里直接视为成功，但不再重复回调
+    if point.get("has_finished", False):
+        logger.info(f'章节：{point.get("title", point.get("name", ""))} 已完成所有任务点')
+        # 已经在超星端标记为完成的章节，这里直接视为成功并同步监控器。
+        _notify_callback(config, "chapter_done_callback", course, point)
         return ChapterResult.SUCCESS
     
     # 随机等待，避免请求过快
@@ -682,13 +795,14 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     raise_if_cancelled(config)
     
     # 获取当前章节的所有任务点
-    job_info = None
-    jobs, job_info = chaoxing.get_job_list(course, point)
+    jobs, job_info = _normalise_jobs(chaoxing.get_job_list(course, point))
     raise_if_cancelled(config)
     job_info = job_info or {}
+    _notify_callback(config, "job_list_callback", course, point, jobs, job_info)
 
     # 发现未开放章节, 根据配置处理
     if job_info.get("notOpen", False):
+        _notify_callback(config, "chapter_status_callback", course, point, "not_open")
         return ChapterResult.NOT_OPEN
 
     # 已经默认处理空任务，此处不需要判断
@@ -702,17 +816,26 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         def process_one_job(job):
             # Each executor worker starts with a fresh context, so both task
             # logging and task-local OCR settings must be re-entered here.
-            return _run_worker_with_context(
-                config,
-                process_job,
-                chaoxing,
-                course,
-                job,
-                job_info,
-                speed,
-                progress_callback=video_progress_callback,
-                config=config,
-            )
+            _notify_callback(config, "job_start_callback", course, point, job)
+            try:
+                result = _run_worker_with_context(
+                    config,
+                    process_job,
+                    chaoxing,
+                    course,
+                    job,
+                    job_info,
+                    speed,
+                    progress_callback=video_progress_callback,
+                    config=config,
+                )
+            except StudyCancelled:
+                raise
+            except BaseException:
+                _notify_callback(config, "job_done_callback", course, point, job, "failed")
+                raise
+            _notify_callback(config, "job_done_callback", course, point, job, result)
+            return result
 
         for result in executor.map(process_one_job, jobs):
             raise_if_cancelled(config)
@@ -720,6 +843,7 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     
     for result in job_results:
         if result.is_failure():
+            _notify_callback(config, "chapter_status_callback", course, point, "failed")
             return ChapterResult.ERROR
 
     # 所有任务点均成功，通知外部本章节已完成（用于前端进度统计）
@@ -747,6 +871,13 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         course["courseId"], course["clazzId"], course["cpi"]
     )
     raise_if_cancelled(config)
+    points = _normalise_points(point_list)
+    _notify_callback(
+        config,
+        "course_points_callback",
+        course,
+        points,
+    )
 
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
 
@@ -757,13 +888,17 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     try:
         tasks=[]
 
-        for i, point in enumerate(point_list["points"]):
+        for i, point in enumerate(points):
             raise_if_cancelled(config)
             task = ChapterTask(point=point, index=i)
             tasks.append(task)
         p = JobProcessor(chaoxing, course, tasks, config)
         p.run()
         raise_if_cancelled(config)
+        if p.failed_tasks:
+            _notify_callback(config, "course_failed_callback", course)
+        else:
+            _notify_callback(config, "course_done_callback", course)
     finally:
         tqdm.format_sizeof = _old_format_sizeof
 
@@ -853,7 +988,7 @@ def main():
             raise LoginError(_login_state["msg"])
         
         # 获取所有的课程列表
-        all_course = chaoxing.get_course_list()
+        all_course = _normalise_courses(chaoxing.get_course_list())
         
         # 过滤要学习的课程
         course_task = filter_courses(all_course, common_config.get("course_list"))

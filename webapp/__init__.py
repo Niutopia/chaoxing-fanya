@@ -1,5 +1,6 @@
 import os
 import threading
+import weakref
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -12,7 +13,7 @@ from .routes.accounts import NoopTaskGuard, accounts
 from .routes.settings import settings
 from .routes.tasks import tasks
 from .store import SQLiteStore
-from .task_logging import install_task_log_sink
+from .task_logging import install_task_log_sink, unregister_task_log_sink
 from .task_manager import TaskManager
 from .study_runner import ChaoxingStudyRunner
 
@@ -164,6 +165,15 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app.extensions["services"]["_answer_connection_service_default"] = (
         answer_connection_service
     )
+    # A process-global Loguru sink must outlive individual Flask app
+    # contexts, but it should not retain managers from discarded app
+    # instances forever.  The finalizer is weakly attached to this app and
+    # unregisters exactly its manager; another live app keeps the sink alive.
+    app.extensions["task_log_sink_finalizer"] = weakref.finalize(
+        app,
+        unregister_task_log_sink,
+        task_manager,
+    )
     app.register_blueprint(accounts)
     app.register_blueprint(settings)
     app.register_blueprint(tasks)
@@ -175,6 +185,21 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
+
+    @app.errorhandler(Exception)
+    def internal_error(_error):
+        """Keep unexpected API failures in the stable JSON envelope.
+
+        Flask still logs the traceback server-side.  The response intentionally
+        omits exception text because injected clients and storage adapters can
+        include credentials or request bodies in it.
+        """
+
+        return jsonify(
+            status=False,
+            msg="Internal server error",
+            code="internal_error",
+        ), 500
 
     # Keep unknown API methods/paths in the JSON API namespace.  Without an
     # all-methods guard, the GET-only SPA fallback would turn an unknown

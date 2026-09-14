@@ -24,6 +24,7 @@ from ..task_manager import (
     TaskCapacityReached,
     TaskManager,
     TaskNotFound,
+    TaskNotRunning,
 )
 
 
@@ -378,6 +379,24 @@ def start_task(account_id: str):
             except (KeyError, TypeError, ValueError):
                 return _error("Invalid preferences", "invalid_preferences", 400)
 
+        # If this account already has a successful catalog fetch, reject an
+        # explicitly stale ID at admission.  A cache miss is intentionally
+        # deferred to ChaoxingStudyRunner, which validates the live catalog
+        # in the account-owned session without adding another network call to
+        # this short HTTP boundary.
+        validator = getattr(_services().get("account_service"), "validate_course_ids", None)
+        if callable(validator):
+            try:
+                valid_selection = validator(str(account_id), selected_courses)
+            except Exception:
+                valid_selection = None
+            if valid_selection is False:
+                return _error(
+                    "Selected course IDs are invalid",
+                    "course_selection_invalid",
+                    400,
+                )
+
         auth = store.get_account_auth(str(account_id))
         if isinstance(auth, Mapping):
             try:
@@ -496,15 +515,14 @@ def get_task_logs(task_id: str):
 def cancel_task(task_id: str):
     manager = _manager()
     try:
-        before = manager.get_snapshot(str(task_id))
-    except TaskNotFound:
-        return _error("Task not found", "task_not_found", 404)
-    if before.state not in {"running", "stopping"}:
-        return _error("Task is not running", "task_not_running", 409)
-    try:
         snapshot = manager.cancel(str(task_id))
     except TaskNotFound:
         return _error("Task not found", "task_not_found", 404)
+    except TaskNotRunning:
+        # ``cancel`` owns the state check under the manager lock.  A terminal
+        # transition can win between a caller's request and that check; keep
+        # the race a stable conflict rather than leaking a 500.
+        return _error("Task is not running", "task_not_running", 409)
     return jsonify(status=True, data=_snapshot_data(snapshot))
 
 

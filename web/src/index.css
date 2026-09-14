@@ -4,7 +4,7 @@
 
 @layer base {
   :root {
-    --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", sans-serif;
+    --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif;
     --canvas: #f5f5f7;
     --surface: #ffffff;
     --surface-muted: #ececef;

@@ -133,6 +133,61 @@ test('clears the draft key after a successful connection save', async () => {
   expect(key).toHaveValue('')
 })
 
+test('invalidates a successful connection test when any draft value changes', async () => {
+  const user = userEvent.setup()
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '测试连接' }))
+  expect(await screen.findByText('连接成功，模型可用')).toBeInTheDocument()
+
+  await user.clear(screen.getByLabelText('模型'))
+  await user.type(screen.getByLabelText('模型'), 'another-model')
+
+  expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
+})
+
+test('keeps connection readiness idle after clearing a saved key', async () => {
+  const user = userEvent.setup()
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '测试连接' }))
+  expect(await screen.findByText('连接成功，模型可用')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+
+  expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
+})
+
+test('isolates account preference load failure and refuses to overwrite unknown values', async () => {
+  const user = userEvent.setup()
+  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
+  expect(screen.getByLabelText('启用通知')).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+  expect(savePreferences).not.toHaveBeenCalled()
+})
+
+test('treats a malformed preference response as a load failure', async () => {
+  getPreferences.mockResolvedValue({ data: { unexpected: true } })
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户通知与 OCR 设置加载失败')
+  expect(screen.getByLabelText('启用通知')).toBeDisabled()
+  expect(screen.getByLabelText('启用 OCR')).toBeDisabled()
+})
+
 test('does not render notification or OCR secrets and uses endpoint for OCR drafts', async () => {
   const user = userEvent.setup()
   const notificationUrl = 'https://notify.example.invalid/private-url'

@@ -302,6 +302,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const [savingSettings, setSavingSettings] = useState(false)
   const [confirmingClear, setConfirmingClear] = useState(false)
   const [clearingKey, setClearingKey] = useState(false)
+  const [accountPrefsReady, setAccountPrefsReady] = useState(!initialAccountId)
 
   useEffect(() => {
     setSelectedAccountId((current) => {
@@ -317,6 +318,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setConnectionError('')
     setRuntimeError('')
     setAccountError('')
+    setAccountPrefsReady(!selectedAccountId)
 
     const requests = [getAnswerConnection(), getRuntimeSettings()]
     if (selectedAccountId) requests.push(getPreferences(selectedAccountId))
@@ -337,6 +339,23 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     if (selectedAccountId && accountResult) {
       if (accountResult.status === 'fulfilled') {
         const source = unwrap(accountResult.value, ['preferences']) || {}
+        if (
+          !source
+          || typeof source !== 'object'
+          || Array.isArray(source)
+          || !source.notification_config
+          || typeof source.notification_config !== 'object'
+          || Array.isArray(source.notification_config)
+          || !source.ocr_config
+          || typeof source.ocr_config !== 'object'
+          || Array.isArray(source.ocr_config)
+        ) {
+          setAccountPrefsReady(false)
+          setAccountError('账户通知与 OCR 设置加载失败')
+          setLoadError(failures.join('；'))
+          setLoading(false)
+          return
+        }
         const notificationSource = safeConfig(source.notification_config, { notification: true })
         const ocrSource = safeConfig(source.ocr_config)
         originalNotificationRef.current = notificationSource
@@ -359,8 +378,10 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           model: stringValue(ocrSource.model),
           api_key: '',
         })
+        setAccountPrefsReady(true)
       } else {
-        failures.push(errorMessage(accountResult.reason, '账户通知与 OCR 设置加载失败'))
+        setAccountPrefsReady(false)
+        setAccountError(errorMessage(accountResult.reason, '账户通知与 OCR 设置加载失败'))
       }
     }
     setLoadError(failures.join('；'))
@@ -385,6 +406,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setConnectionError('')
     setRuntimeError('')
     setSuccess('')
+    setTestState('idle')
+    setTestMessage('')
   }
 
   const updateRuntime = (field) => (event) => {
@@ -439,8 +462,12 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       const saved = await saveAnswerConnection(answerPayload(connection, apiKey))
       if (saved) setConnection((current) => ({ ...current, ...normalizeConnection(saved) }))
       setApiKey('')
+      setTestState('idle')
+      setTestMessage('')
       setSuccess('连接设置已保存')
     } catch (error) {
+      setTestState('idle')
+      setTestMessage('')
       setConnectionError(errorMessage(error, '连接设置保存失败，请重试'))
     } finally {
       setSavingConnection(false)
@@ -460,6 +487,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         api_key_mask: null,
       }))
       setApiKey('')
+      setTestState('idle')
+      setTestMessage('')
       setConfirmingClear(false)
       setSuccess('API Key 已清除')
     } catch (error) {
@@ -486,13 +515,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setSavingSettings(true)
     setRuntimeError('')
     setConnectionError('')
-    setAccountError('')
     setSuccess('')
+    let accountSaveStarted = false
     try {
       await saveRuntimeSettings({ max_active_accounts: Number(runtime.max_active_accounts) })
       const savedConnection = await saveAnswerConnection(answerPayload(connection, apiKey))
       if (savedConnection) setConnection((current) => ({ ...current, ...normalizeConnection(savedConnection) }))
-      if (selectedAccountId) {
+      if (selectedAccountId && accountPrefsReady) {
+        accountSaveStarted = true
         const accountPayload = preferenceConfigPayload(
           notification,
           ocr,
@@ -504,11 +534,17 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         originalOcrRef.current = safeConfig(accountPayload.ocr_config)
         setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
         setOcr((current) => ({ ...current, api_key: '' }))
+      } else if (selectedAccountId) {
+        setAccountError('账户通知与 OCR 设置尚未成功加载，未保存账户偏好。请重试加载。')
       }
       setApiKey('')
       setSuccess('设置已保存')
     } catch (error) {
-      setRuntimeError(errorMessage(error, '设置保存失败，请重试'))
+      if (accountSaveStarted) {
+        setAccountError(errorMessage(error, '账户通知与 OCR 设置保存失败，请重试'))
+      } else {
+        setRuntimeError(errorMessage(error, '设置保存失败，请重试'))
+      }
     } finally {
       setSavingSettings(false)
     }
@@ -578,6 +614,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                   setApiKey(event.target.value)
                   setConnectionError('')
                   setSuccess('')
+                  setTestState('idle')
+                  setTestMessage('')
                 }}
                 autoComplete="new-password"
                 spellCheck="false"
@@ -634,12 +672,20 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           </div>
         </details>
 
-        <details className="group border-b border-separator">
+        <details open={Boolean(accountError)} className="group border-b border-separator">
           <summary className="touch-target flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-inset [&::-webkit-details-marker]:hidden">
             <span>通知</span>
             <span aria-hidden="true" className="text-label-tertiary transition-transform group-open:rotate-180 motion-reduce:transition-none">⌄</span>
           </summary>
           <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
+            {accountError ? (
+              <Alert variant="danger" aria-live="polite">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <span>{accountError}</span>
+                  <Button type="button" variant="outline" onClick={loadSettings}>重新加载账户设置</Button>
+                </div>
+              </Alert>
+            ) : null}
             {selectedAccountId ? (
               <p className="text-sm text-label-secondary">以下设置只作用于 {selectedAccount?.name || '当前账户'}。</p>
             ) : (
@@ -658,20 +704,20 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
               </Field>
             ) : null}
             <label className="touch-target flex min-h-11 items-center gap-3 text-sm">
-              <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(notification.enabled)} onChange={updateAccountConfig(setNotification, 'enabled')} disabled={!selectedAccountId} />
+                <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(notification.enabled)} onChange={updateAccountConfig(setNotification, 'enabled')} disabled={!selectedAccountId || !accountPrefsReady} />
               <span className="font-medium text-label-primary">启用通知</span>
             </label>
             <Field label="通知渠道" htmlFor="notification-provider">
-              <Input id="notification-provider" value={notification.provider} onChange={updateAccountConfig(setNotification, 'provider')} disabled={!selectedAccountId} placeholder="例如：webhook" />
+              <Input id="notification-provider" value={notification.provider} onChange={updateAccountConfig(setNotification, 'provider')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="例如：webhook" />
             </Field>
             <Field label="通知地址" htmlFor="notification-url">
-              <Input id="notification-url" value={notification.url} onChange={updateAccountConfig(setNotification, 'url')} disabled={!selectedAccountId} placeholder="https://…" />
+              <Input id="notification-url" value={notification.url} onChange={updateAccountConfig(setNotification, 'url')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="https://…" />
             </Field>
             <Field label="通知 Token" htmlFor="notification-token" description={configuredSecret(originalNotificationRef.current, ['token']) ? '已有 Token；留空表示保留' : '可选'}>
-              <Input id="notification-token" type="password" value={notification.token} onChange={updateAccountConfig(setNotification, 'token')} disabled={!selectedAccountId} autoComplete="new-password" />
+              <Input id="notification-token" type="password" value={notification.token} onChange={updateAccountConfig(setNotification, 'token')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
             </Field>
             <Field label="替换 Telegram Chat ID" htmlFor="notification-chat-id" description={configuredSecret(originalNotificationRef.current, ['chat_id', 'tg_chat_id']) ? '已有 Chat ID；留空表示保留' : '可选'}>
-              <Input id="notification-chat-id" type="password" value={notification.tg_chat_id} onChange={updateAccountConfig(setNotification, 'tg_chat_id')} disabled={!selectedAccountId} autoComplete="new-password" />
+              <Input id="notification-chat-id" type="password" value={notification.tg_chat_id} onChange={updateAccountConfig(setNotification, 'tg_chat_id')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
             </Field>
           </div>
         </details>
@@ -684,20 +730,20 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
             <p className="text-sm text-label-secondary">OCR 设置只作用于当前账户；密钥输入框始终为空。</p>
             <label className="touch-target flex min-h-11 items-center gap-3 text-sm">
-              <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(ocr.enabled)} onChange={updateAccountConfig(setOcr, 'enabled')} disabled={!selectedAccountId} />
+              <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(ocr.enabled)} onChange={updateAccountConfig(setOcr, 'enabled')} disabled={!selectedAccountId || !accountPrefsReady} />
               <span className="font-medium text-label-primary">启用 OCR</span>
             </label>
             <Field label="OCR 提供方" htmlFor="ocr-provider">
-              <Input id="ocr-provider" value={ocr.provider} onChange={updateAccountConfig(setOcr, 'provider')} disabled={!selectedAccountId} placeholder="例如：openai" />
+              <Input id="ocr-provider" value={ocr.provider} onChange={updateAccountConfig(setOcr, 'provider')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="例如：openai" />
             </Field>
             <Field label="OCR 地址" htmlFor="ocr-endpoint">
-              <Input id="ocr-endpoint" value={ocr.endpoint} onChange={updateAccountConfig(setOcr, 'endpoint')} disabled={!selectedAccountId} placeholder="https://…" />
+              <Input id="ocr-endpoint" value={ocr.endpoint} onChange={updateAccountConfig(setOcr, 'endpoint')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="https://…" />
             </Field>
             <Field label="OCR 模型" htmlFor="ocr-model">
-              <Input id="ocr-model" value={ocr.model} onChange={updateAccountConfig(setOcr, 'model')} disabled={!selectedAccountId} />
+              <Input id="ocr-model" value={ocr.model} onChange={updateAccountConfig(setOcr, 'model')} disabled={!selectedAccountId || !accountPrefsReady} />
             </Field>
             <Field label="替换 OCR API Key" htmlFor="ocr-api-key" description={configuredSecret(originalOcrRef.current, ['api']) ? '已有 OCR Key；留空表示保留' : '可选'}>
-              <Input id="ocr-api-key" type="password" value={ocr.api_key} onChange={updateAccountConfig(setOcr, 'api_key')} disabled={!selectedAccountId} autoComplete="new-password" />
+              <Input id="ocr-api-key" type="password" value={ocr.api_key} onChange={updateAccountConfig(setOcr, 'api_key')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
             </Field>
           </div>
         </details>

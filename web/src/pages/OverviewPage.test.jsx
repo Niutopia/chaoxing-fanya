@@ -103,3 +103,63 @@ test('masks a phone username in the overview while preserving the full value in 
 
   expect(screen.getByLabelText('手机号')).toHaveValue('13800000000')
 })
+
+test('renders a state-appropriate primary action with the actual task target', async () => {
+  render(
+    <OverviewPage
+      accounts={[
+        { id: 'idle-account', name: '空闲账号', enabled: true },
+        { id: 'running-account', name: '运行账号', enabled: true },
+        { id: 'failed-account', name: '失败账号', enabled: true },
+      ]}
+      tasks={[
+        { id: 'running-task', account_id: 'running-account', state: 'running' },
+        { id: 'failed-task', account_id: 'failed-account', state: 'failed', error: '登录失败' },
+      ]}
+      loading={false}
+    />
+  )
+
+  expect(await screen.findByRole('link', { name: '配置并开始' })).toHaveAttribute(
+    'href',
+    '/accounts/idle-account/launch',
+  )
+  expect(screen.getByRole('link', { name: '查看任务' })).toHaveAttribute('href', '/tasks/running-task')
+  expect(screen.getByRole('link', { name: '查看错误' })).toHaveAttribute('href', '/tasks/failed-task')
+})
+
+test('keeps More menu keyboard navigable and restores focus to its trigger', async () => {
+  const user = userEvent.setup()
+  render(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+    />
+  )
+
+  const trigger = screen.getByRole('button', { name: '张三的更多操作' })
+  await user.click(trigger)
+  const menuItems = screen.getAllByRole('menuitem')
+  expect(menuItems[0]).toHaveFocus()
+  await user.keyboard('{ArrowDown}')
+  expect(menuItems[1]).toHaveFocus()
+  await user.keyboard('{Escape}')
+  expect(trigger).toHaveFocus()
+})
+
+test('renders account action failures as a nearby danger alert', async () => {
+  const user = userEvent.setup()
+  verifyAccount.mockRejectedValue(new ApiError('验证失败，请重试', 401, 'account_invalid'))
+  render(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+    />
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '重新验证' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('验证失败，请重试')
+})

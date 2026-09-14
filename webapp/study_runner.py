@@ -8,6 +8,7 @@ does not implement a second course/chapter/job processor.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import threading
 from collections.abc import Callable, Mapping
@@ -27,6 +28,17 @@ from .task_manager import StudyRunContext, _secret_values as _context_secret_val
 
 class StudyRunError(RuntimeError):
     """Raised when account-specific study setup or processing fails."""
+
+    def __init__(self, message: str, *, code: str = "study_run_error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class CourseSelectionInvalid(StudyRunError):
+    """Raised when an explicit Web task course ID is absent from the catalog."""
+
+    def __init__(self, message: str = "course_selection_invalid") -> None:
+        super().__init__(message, code="course_selection_invalid")
 
 
 @dataclass(frozen=True, repr=False)
@@ -286,6 +298,27 @@ class ChaoxingStudyRunner:
     def _course_id(course: Mapping[str, Any]) -> Any:
         return course.get("courseId", course.get("id"))
 
+    @classmethod
+    def _course_items(cls, value: Any) -> list[Mapping[str, Any]]:
+        """Unwrap the catalog shapes used by clients and test doubles.
+
+        The production decoder returns a list, while account integrations
+        commonly wrap it as ``{"courses": [...]}`` or ``{"data": ...}``.
+        Keep malformed responses empty so explicit IDs fail with the stable
+        selection error instead of accidentally selecting every course.
+        """
+
+        if isinstance(value, Mapping):
+            for key in ("courses", "course_list", "items"):
+                if key in value:
+                    return cls._course_items(value[key])
+            if "data" in value:
+                return cls._course_items(value["data"])
+            return []
+        if isinstance(value, (list, tuple)):
+            return [item for item in value if isinstance(item, Mapping)]
+        return []
+
     @staticmethod
     def _course_title(course: Mapping[str, Any]) -> str:
         return str(course.get("title", course.get("name", "")) or "")
@@ -293,6 +326,42 @@ class ChaoxingStudyRunner:
     @staticmethod
     def _chapter_title(point: Mapping[str, Any]) -> str:
         return str(point.get("title", point.get("name", "")) or "")
+
+    @staticmethod
+    def _chapter_id(point: Mapping[str, Any]) -> str:
+        value = point.get("id", point.get("knowledgeId", point.get("chapterId")))
+        return str(value if value is not None else "")
+
+    @staticmethod
+    def _job_id(job: Mapping[str, Any]) -> str:
+        value = job.get("id", job.get("jobid", job.get("jobId", job.get("_jobid"))))
+        return str(value if value is not None else "")
+
+    @staticmethod
+    def _job_title(job: Mapping[str, Any]) -> str:
+        return str(
+            job.get("title", job.get("name", job.get("type", ""))) or ""
+        )
+
+    @staticmethod
+    def _job_result_status(result: Any) -> str:
+        if isinstance(result, str):
+            value = result.strip().lower()
+            if value in {"completed", "success", "done"}:
+                return "completed"
+            if value in {"running", "pending", "stopping", "failed", "error"}:
+                return value
+        is_failure = getattr(result, "is_failure", None)
+        if callable(is_failure):
+            try:
+                return "failed" if is_failure() else "completed"
+            except Exception:
+                return "failed"
+        if isinstance(result, Mapping):
+            status = str(result.get("status", result.get("state", ""))).lower()
+            if status in {"failed", "error", "invalid"} or result.get("ok") is False:
+                return "failed"
+        return "completed"
 
     def run(self, context: StudyRunContext) -> None:
         """Run one account context and report progress to its reporter."""
@@ -304,8 +373,10 @@ class ChaoxingStudyRunner:
         tiku_config = self._answer_config(context)
         tiku_config["cache_file"] = str(self.data_dir / "answer-cache.json")
 
+        auth_mode = getattr(context.auth, "auth_mode", None)
+        use_cookies = bool(context.auth.cookies) if auth_mode is None else auth_mode == "cookies"
         common_config: dict[str, Any] = {
-            "use_cookies": bool(context.auth.cookies),
+            "use_cookies": use_cookies,
             "username": context.auth.username,
             "password": context.auth.password,
             "course_list": list(context.course_ids),
@@ -326,29 +397,283 @@ class ChaoxingStudyRunner:
             "total_tasks": 0,
         }
         counts_lock = threading.Lock()
+        tree_lock = threading.RLock()
+
+        # The runner owns one mutable, reporter-facing tree.  Every count is
+        # derived from catalog/point/job callbacks emitted by the real engine;
+        # no synthetic ``jobCount=1`` fallback is used.
+        course_nodes: list[dict[str, Any]] = []
+        course_by_id: dict[str, dict[str, Any]] = {}
+        chapter_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        job_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        active_jobs: dict[str, dict[str, Any]] = {}
+        completed_courses: set[str] = set()
+        completed_chapters: set[tuple[str, str]] = set()
+        completed_tasks: set[tuple[str, str, str]] = set()
+        course_terminal: set[str] = set()
+
+        def course_key(course: Mapping[str, Any]) -> str:
+            return str(self._course_id(course) or "")
+
+        def chapter_key(course: Mapping[str, Any], point: Mapping[str, Any]) -> tuple[str, str]:
+            return course_key(course), self._chapter_id(point)
+
+        def job_key(
+            course: Mapping[str, Any], point: Mapping[str, Any], job: Mapping[str, Any]
+        ) -> tuple[str, str, str]:
+            return (*chapter_key(course, point), self._job_id(job))
+
+        def report_tree() -> None:
+            with tree_lock:
+                snapshot = copy.deepcopy(course_nodes)
+            self._report(context.reporter, "set_courses", snapshot)
+
+        def report_counts() -> None:
+            with tree_lock, counts_lock:
+                counts["completed_courses"] = len(completed_courses)
+                counts["completed_chapters"] = len(completed_chapters)
+                counts["completed_tasks"] = len(completed_tasks)
+                counts["total_chapters"] = sum(
+                    len(course.get("chapters", [])) for course in course_nodes
+                )
+                counts["total_tasks"] = sum(
+                    len(chapter.get("jobs", []))
+                    for course in course_nodes
+                    for chapter in course.get("chapters", [])
+                )
+                snapshot = dict(counts)
+            self._report(context.reporter, "set_counts", **snapshot)
+
+        def report_active_jobs() -> None:
+            with tree_lock:
+                snapshot = copy.deepcopy(active_jobs)
+            self._report(context.reporter, "set_active_jobs", snapshot)
+
+        def ensure_course_node(course: Mapping[str, Any]) -> dict[str, Any]:
+            key = course_key(course)
+            node = course_by_id.get(key)
+            if node is None:
+                node = {
+                    "id": self._course_id(course),
+                    "title": self._course_title(course),
+                    "status": "pending",
+                    "chapters": [],
+                }
+                course_by_id[key] = node
+                course_nodes.append(node)
+            return node
+
+        def ensure_chapter_node(
+            course: Mapping[str, Any], point: Mapping[str, Any]
+        ) -> dict[str, Any]:
+            key = chapter_key(course, point)
+            node = chapter_by_key.get(key)
+            if node is None:
+                node = {
+                    "id": self._chapter_id(point),
+                    "title": self._chapter_title(point),
+                    "status": "completed" if point.get("has_finished") else "pending",
+                    "jobs": [],
+                }
+                chapter_by_key[key] = node
+                ensure_course_node(course).setdefault("chapters", []).append(node)
+            return node
+
+        def course_points_callback(
+            course: Mapping[str, Any], points: Any
+        ) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            if isinstance(points, Mapping):
+                points = points.get("points", [])
+            if not isinstance(points, (list, tuple)):
+                points = []
+            with tree_lock:
+                ensure_course_node(course)
+                for point in points:
+                    if isinstance(point, Mapping):
+                        ensure_chapter_node(course, point)
+            report_counts()
+            report_tree()
+
+        def course_start_callback(course: Mapping[str, Any]) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            with tree_lock:
+                node = ensure_course_node(course)
+                node["status"] = "running"
+            self._report(
+                context.reporter,
+                "set_current",
+                course=self._course_title(course),
+                chapter=None,
+            )
+            report_tree()
+
+        def course_done_callback(course: Mapping[str, Any]) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            key = course_key(course)
+            with tree_lock:
+                node = ensure_course_node(course)
+                node["status"] = "completed"
+                completed_courses.add(key)
+                course_terminal.add(key)
+            report_counts()
+            report_tree()
+
+        def course_failed_callback(course: Mapping[str, Any]) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            key = course_key(course)
+            with tree_lock:
+                node = ensure_course_node(course)
+                node["status"] = "failed"
+                course_terminal.add(key)
+            report_tree()
+
+        def chapter_status_callback(
+            course: Mapping[str, Any], point: Mapping[str, Any], status: str
+        ) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            key = chapter_key(course, point)
+            normalized_status = str(status or "failed").strip().lower()
+            if normalized_status not in {"failed", "not_open", "running"}:
+                normalized_status = "failed"
+            with tree_lock:
+                chapter = ensure_chapter_node(course, point)
+                chapter["status"] = normalized_status
+                if normalized_status != "completed":
+                    completed_chapters.discard(key)
+            report_tree()
 
         def chapter_start_callback(course: Mapping[str, Any], point: Mapping[str, Any]):
             if context.cancel_event.is_set():
                 raise StudyCancelled()
+            with tree_lock:
+                node = ensure_chapter_node(course, point)
+                node["status"] = "running"
             self._report(
                 context.reporter,
                 "set_current",
                 course=self._course_title(course),
                 chapter=self._chapter_title(point),
             )
+            report_tree()
+
+        def job_list_callback(
+            course: Mapping[str, Any],
+            point: Mapping[str, Any],
+            jobs: Any,
+            job_info: Mapping[str, Any] | None = None,
+        ) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            if not isinstance(jobs, (list, tuple)):
+                jobs = []
+            with tree_lock:
+                chapter = ensure_chapter_node(course, point)
+                if isinstance(job_info, Mapping) and job_info.get("notOpen"):
+                    chapter["status"] = "not_open"
+                current_by_id = {
+                    str(job.get("id", job.get("jobid", job.get("jobId", "")))): job
+                    for job in chapter.get("jobs", [])
+                    if isinstance(job, Mapping)
+                }
+                next_jobs: list[dict[str, Any]] = []
+                for job in jobs:
+                    if not isinstance(job, Mapping):
+                        continue
+                    key = job_key(course, point, job)
+                    existing = job_by_key.get(key)
+                    if existing is None:
+                        existing = {
+                            "id": self._job_id(job),
+                            "title": self._job_title(job),
+                            "status": "pending",
+                        }
+                        job_by_key[key] = existing
+                    elif existing.get("id") == "" and current_by_id.get("") is not None:
+                        existing["title"] = self._job_title(job)
+                    next_jobs.append(existing)
+                chapter["jobs"] = next_jobs
+            report_counts()
+            report_tree()
+
+        def job_start_callback(
+            course: Mapping[str, Any], point: Mapping[str, Any], job: Mapping[str, Any]
+        ) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            key = job_key(course, point, job)
+            with tree_lock:
+                chapter = ensure_chapter_node(course, point)
+                item = job_by_key.get(key)
+                if item is None:
+                    item = {
+                        "id": self._job_id(job),
+                        "title": self._job_title(job),
+                        "status": "pending",
+                    }
+                    job_by_key[key] = item
+                    chapter.setdefault("jobs", []).append(item)
+                item["status"] = "running"
+                active_jobs[":".join(key)] = {
+                    "id": item["id"],
+                    "title": item["title"],
+                    "course": self._course_title(course),
+                    "chapter": self._chapter_title(point),
+                    "status": "running",
+                }
+            self._report(
+                context.reporter,
+                "set_current",
+                course=self._course_title(course),
+                chapter=self._chapter_title(point),
+                task=self._job_title(job),
+            )
+            report_active_jobs()
+            report_tree()
+
+        def job_done_callback(
+            course: Mapping[str, Any],
+            point: Mapping[str, Any],
+            job: Mapping[str, Any],
+            result: Any,
+        ) -> None:
+            if context.cancel_event.is_set():
+                raise StudyCancelled()
+            key = job_key(course, point, job)
+            with tree_lock:
+                item = job_by_key.get(key)
+                if item is None:
+                    item = {
+                        "id": self._job_id(job),
+                        "title": self._job_title(job),
+                        "status": "pending",
+                    }
+                    job_by_key[key] = item
+                    ensure_chapter_node(course, point).setdefault("jobs", []).append(item)
+                status = self._job_result_status(result)
+                item["status"] = status
+                active_jobs.pop(":".join(key), None)
+                if status == "completed":
+                    completed_tasks.add(key)
+            report_active_jobs()
+            report_counts()
+            report_tree()
 
         def chapter_done_callback(course: Mapping[str, Any], point: Mapping[str, Any]):
             if context.cancel_event.is_set():
                 raise StudyCancelled()
-            try:
-                job_count = int(point.get("jobCount", 1) or 1)
-            except (TypeError, ValueError):
-                job_count = 1
-            with counts_lock:
-                counts["completed_chapters"] += 1
-                counts["completed_tasks"] += job_count
-                snapshot = dict(counts)
-            self._report(context.reporter, "set_counts", **snapshot)
+            key = chapter_key(course, point)
+            with tree_lock:
+                chapter = ensure_chapter_node(course, point)
+                chapter["status"] = "completed"
+                completed_chapters.add(key)
+            report_counts()
+            report_tree()
 
         def video_progress_callback(
             course: Mapping[str, Any],
@@ -361,24 +686,56 @@ class ChaoxingStudyRunner:
             # Keep the chapter callback as the authoritative current label;
             # video updates only add progress metadata.  This also avoids
             # making a fast stream of progress callbacks reorder the UI's
-            # current-course/current-chapter display.
+            # current-course/current-chapter display.  ``process_job`` does
+            # not carry the chapter argument, so locate the active item by
+            # its account-local course and job identity.
+            job_id = self._job_id(job)
+            job_title = self._job_title(job)
+            with tree_lock:
+                for active in active_jobs.values():
+                    if (
+                        active.get("course") == self._course_title(course)
+                        and (
+                            (job_id and active.get("id") == job_id)
+                            or (not job_id and active.get("title") == job_title)
+                        )
+                    ):
+                        active["progress"] = progress
+                        active["total"] = total
             self._report(
                 context.reporter,
                 "set_counts",
                 video_progress=progress,
                 video_total=total,
             )
+            report_active_jobs()
 
         common_config.update(
             {
+                "course_points_callback": course_points_callback,
+                "course_start_callback": course_start_callback,
+                "course_done_callback": course_done_callback,
+                "course_failed_callback": course_failed_callback,
                 "chapter_start_callback": chapter_start_callback,
+                "chapter_status_callback": chapter_status_callback,
                 "chapter_done_callback": chapter_done_callback,
+                "job_list_callback": job_list_callback,
+                "job_start_callback": job_start_callback,
+                "job_done_callback": job_done_callback,
                 "video_progress_callback": video_progress_callback,
             }
         )
         callbacks = {
+            "course_points_callback": course_points_callback,
+            "course_start_callback": course_start_callback,
+            "course_done_callback": course_done_callback,
+            "course_failed_callback": course_failed_callback,
             "chapter_start_callback": chapter_start_callback,
+            "chapter_status_callback": chapter_status_callback,
             "chapter_done_callback": chapter_done_callback,
+            "job_list_callback": job_list_callback,
+            "job_start_callback": job_start_callback,
+            "job_done_callback": job_done_callback,
             "video_progress_callback": video_progress_callback,
         }
 
@@ -416,8 +773,16 @@ class ChaoxingStudyRunner:
                         "config": common_config,
                         "tiku_config": tiku_config,
                         "callbacks": callbacks,
+                        "course_points_callback": course_points_callback,
+                        "course_start_callback": course_start_callback,
+                        "course_done_callback": course_done_callback,
+                        "course_failed_callback": course_failed_callback,
                         "chapter_start_callback": chapter_start_callback,
+                        "chapter_status_callback": chapter_status_callback,
                         "chapter_done_callback": chapter_done_callback,
+                        "job_list_callback": job_list_callback,
+                        "job_start_callback": job_start_callback,
+                        "job_done_callback": job_done_callback,
                         "video_progress_callback": video_progress_callback,
                         "answer_semaphore": context.answer_semaphore,
                         "session": session,
@@ -429,7 +794,8 @@ class ChaoxingStudyRunner:
                     raise StudyCancelled()
 
                 login_result = _invoke_login(
-                    engine, login_with_cookies=bool(context.auth.cookies)
+                    engine,
+                    login_with_cookies=use_cookies,
                 )
                 if not _result_status(login_result):
                     message = (
@@ -444,67 +810,84 @@ class ChaoxingStudyRunner:
                 get_courses = getattr(engine, "get_course_list", None)
                 if not callable(get_courses):
                     raise StudyRunError("study engine does not provide course retrieval")
-                all_courses = get_courses() or []
+                all_courses = self._course_items(get_courses())
 
                 # Keep filtering and course processing in the existing engine.
                 import main
 
+                requested_course_ids = [str(item) for item in context.course_ids]
+                available_course_ids = {
+                    str(self._course_id(course))
+                    for course in all_courses
+                    if isinstance(course, Mapping) and self._course_id(course) is not None
+                }
+                missing_course_ids = [
+                    course_id
+                    for course_id in requested_course_ids
+                    if course_id not in available_course_ids
+                ]
+                if requested_course_ids and missing_course_ids:
+                    # Web task IDs are explicit and must never silently fall
+                    # back to “all courses”.  The CLI keeps main.filter_courses
+                    # unchanged for its interactive/legacy path.
+                    raise CourseSelectionInvalid()
                 course_task = main.filter_courses(
-                    list(all_courses), list(context.course_ids)
+                    list(all_courses), requested_course_ids
                 )
                 selected_courses = list(course_task or [])
+                selected_course_ids = {
+                    str(self._course_id(course))
+                    for course in selected_courses
+                    if isinstance(course, Mapping) and self._course_id(course) is not None
+                }
+                if requested_course_ids and selected_course_ids != set(requested_course_ids):
+                    raise CourseSelectionInvalid()
                 with counts_lock:
                     counts["total_courses"] = len(selected_courses)
                     initial_counts = dict(counts)
                 self._report(context.reporter, "set_counts", **initial_counts)
-                self._report(
-                    context.reporter,
-                    "set_courses",
-                    [
-                        {
-                            "id": self._course_id(course),
-                            "title": self._course_title(course),
-                            "status": "pending",
-                        }
-                        for course in selected_courses
-                    ],
-                )
+                for course in selected_courses:
+                    ensure_course_node(course)
+                report_tree()
 
                 for course in selected_courses:
                     if context.cancel_event.is_set():
                         raise StudyCancelled()
-                    self._report(
-                        context.reporter,
-                        "set_current",
-                        course=self._course_title(course),
-                        chapter=None,
-                    )
+                    course_start_callback(course)
                     process_course = getattr(engine, "process_course", None)
-                    if callable(process_course):
-                        # A test/integration engine may expose the existing
-                        # course processor as a method.  The real Chaoxing
-                        # client does not, so production continues through
-                        # ``main.process_course`` below.
-                        signature = _callable_signature(process_course)
-                        if signature is not None and len(signature.parameters) <= 1:
-                            process_course(course)
+                    try:
+                        if callable(process_course):
+                            # A test/integration engine may expose the existing
+                            # course processor as a method.  The real Chaoxing
+                            # client does not, so production continues through
+                            # ``main.process_course`` below.
+                            signature = _callable_signature(process_course)
+                            if signature is not None and len(signature.parameters) <= 1:
+                                process_course(course)
+                            else:
+                                process_course(course, common_config)
                         else:
-                            process_course(course, common_config)
-                    else:
-                        main.process_course(engine, course, common_config)
+                            main.process_course(engine, course, common_config)
+                    except StudyCancelled:
+                        raise
+                    except BaseException:
+                        course_failed_callback(course)
+                        raise
                     if context.cancel_event.is_set():
                         raise StudyCancelled()
-                    with counts_lock:
-                        counts["completed_courses"] += 1
-                        final_counts = dict(counts)
-                    self._report(context.reporter, "set_counts", **final_counts)
+                    # The legacy processor emits either course_done or
+                    # course_failed after it has observed all chapter results.
+                    # Keep a safe fallback for injected engines that expose a
+                    # processor but do not emit a terminal callback.
+                    if course_key(course) not in course_terminal:
+                        course_done_callback(course)
         except StudyCancelled:
             raise
         except StudyRunError as exc:
             # An injected engine may raise this type itself; keep the same
             # public error class while still applying the task's secret
             # redaction boundary.
-            raise StudyRunError(self._safe_error(context, exc)) from None
+            raise StudyRunError(self._safe_error(context, exc), code=exc.code) from None
         except BaseException as exc:
             raise StudyRunError(self._safe_error(context, exc)) from None
 
@@ -513,5 +896,6 @@ __all__ = [
     "ChaoxingStudyRunner",
     "EngineFactoryRequest",
     "StudyCancelled",
+    "CourseSelectionInvalid",
     "StudyRunError",
 ]

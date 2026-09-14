@@ -21,15 +21,27 @@ class AccountProfile:
     has_cookies: bool
     verification_status: Literal["unverified", "valid", "invalid"]
     last_verified_at: str | None
+    # The selected credential source is public metadata, not the credential
+    # itself.  A default keeps older integrations that construct profiles
+    # positionally source-compatible while the store migrates old databases.
+    auth_mode: Literal["password", "cookies"] = "password"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AccountAuth:
     """Credentials and cookies resolved for one account."""
 
     username: str
     password: str
     cookies: dict[str, str]
+    # ``None`` preserves the legacy in-memory constructor behavior; persisted
+    # account rows always resolve to an explicit mode in SQLiteStore.
+    auth_mode: Literal["password", "cookies"] | None = None
+
+    def __repr__(self) -> str:
+        """Never include account identity or credential material in reprs."""
+
+        return "AccountAuth(<redacted>)"
 
 
 @dataclass(frozen=True)

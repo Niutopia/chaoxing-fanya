@@ -46,7 +46,7 @@ python app.py        # 默认 http://localhost:5000
 
 # 前端（新终端）
 cd web
-npm install
+npm ci
 npm run dev          # 默认 http://localhost:3000
 ```
 
@@ -72,11 +72,21 @@ Start and inspect the deployment with:
 docker compose up --build -d
 docker compose ps
 curl -fsS http://127.0.0.1:5001/api/health
-docker compose logs -f web
-docker compose stop web
+docker compose logs --tail=100 web
+container_id="$(docker compose ps -q web)"
+if [ -z "$container_id" ]; then
+  echo "无法备份：Compose 服务 web 未运行，请先执行 docker compose up -d。" >&2
+  exit 1
+fi
+data_volume="$(docker inspect "$container_id" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
+if [ -z "$data_volume" ]; then
+  echo "无法备份：运行中的 web 容器没有 /app/data 命名卷。" >&2
+  exit 1
+fi
 backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-backup.XXXXXX")"
-docker run --rm -v chaoxing-fanya_chaoxing-data:/source -v "$backup_dir":/backup alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
+docker run --rm -v "${data_volume}:/source:ro" -v "$backup_dir:/backup" alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
 echo "Backup written to $backup_dir/chaoxing-data-backup.tgz"
+docker compose stop web
 ```
 
 Enter the answer API key once in Settings using the password-style Replace API
@@ -99,8 +109,9 @@ clean_and_build_portable.bat
 
 **命令行模式**
 ```bash
-python main.py                               # 使用默认配置模板
-python main.py -c config.ini                 # 指定配置
+python main.py                               # 交互式运行（按提示输入账号密码）
+cp config.ini.example config.ini             # 首次使用时复制配置模板
+python main.py -c config.ini                 # 读取指定配置文件运行
 python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|continue]
 ```
 
@@ -147,7 +158,7 @@ chaoxing/
 ## 常见问题
 
 - Docker 端口被占用：确认宿主机 `127.0.0.1:5001` 未被占用；容器内 Web 服务监听 `0.0.0.0:5000`
-- 依赖安装失败：后端 `pip install -r requirements.txt --force-reinstall`；前端删除 `node_modules` 与锁文件后重新 `npm install`
+- 依赖安装失败：后端 `pip install -r requirements.txt --force-reinstall`；前端保留 `package-lock.json`，删除 `node_modules` 后在 `web/` 执行 `npm ci`
 - Web 页面未自动打开：手动访问 `http://127.0.0.1:5001`，查看 `docker compose ps` 与健康检查输出
 - Docker 设置未生效：打开 Web 设置页面确认配置，并检查持久化数据是否挂载到 `/app/data`
 

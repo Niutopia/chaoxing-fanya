@@ -103,8 +103,28 @@ def remove_task_log_sink(sink_id: int | None = None) -> None:
             _MANAGERS.clear()
 
 
+def unregister_task_log_sink(manager: "TaskManager") -> None:
+    """Detach one manager while preserving the shared routing sink.
+
+    Loguru owns one process-global sink, but Flask tests and embedded hosts can
+    create several independent task managers.  Removing a manager must not
+    drop records for the remaining managers; the underlying sink is removed
+    only when the last manager leaves.
+    """
+
+    global _SINK_ID
+    with _SINK_LOCK:
+        _MANAGERS.discard(manager)
+        if _MANAGERS:
+            return
+        if _SINK_ID is not None:
+            logger.remove(_SINK_ID)
+        _SINK_ID = None
+
+
 __all__ = [
     "install_task_log_sink",
     "remove_task_log_sink",
+    "unregister_task_log_sink",
     "run_with_task_context",
 ]

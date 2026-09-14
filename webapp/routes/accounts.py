@@ -29,7 +29,9 @@ class NoopTaskGuard:
         return False
 
 
-_ACCOUNT_FIELDS = frozenset({"name", "username", "password", "cookies", "enabled"})
+_ACCOUNT_FIELDS = frozenset(
+    {"name", "username", "password", "cookies", "enabled", "auth_mode", "authMode"}
+)
 _PREFERENCE_FIELDS = frozenset(
     {
         "selected_course_ids",
@@ -114,6 +116,7 @@ def _account_data(profile) -> dict[str, Any]:
         "has_cookies": profile.has_cookies,
         "verification_status": profile.verification_status,
         "last_verified_at": profile.last_verified_at,
+        "auth_mode": getattr(profile, "auth_mode", "password"),
     }
 
 
@@ -349,12 +352,22 @@ def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, 
         if isinstance(password, str) and password.strip():
             values["password"] = password
     if "cookies" in payload:
-        values["cookies"] = _parse_cookies(payload["cookies"])
+        raw_cookies = payload["cookies"]
+        # The edit form uses a blank Cookie Header as “preserve existing”.
+        # A real mapping/header still follows the normal parser and can be
+        # used to replace the stored encrypted value.
+        if not (isinstance(raw_cookies, str) and not raw_cookies.strip()):
+            values["cookies"] = _parse_cookies(raw_cookies)
     if "enabled" in payload:
         enabled = payload["enabled"]
         if not isinstance(enabled, bool):
             raise ValueError("invalid account enabled value")
         values["enabled"] = enabled
+    raw_auth_mode = payload.get("auth_mode", payload.get("authMode"))
+    if raw_auth_mode is not None:
+        if raw_auth_mode not in {"password", "cookies"}:
+            raise ValueError("invalid account auth mode")
+        values["auth_mode"] = raw_auth_mode
     return values
 
 
@@ -537,7 +550,7 @@ def update_account(account_id: str):
             return _error("Account not found", "account_not_found", 404)
         service = _services().get("account_service")
         if service is not None and any(
-            key in values for key in ("username", "password", "cookies")
+            key in values for key in ("username", "password", "cookies", "auth_mode")
         ):
             invalidate = getattr(service, "invalidate_courses", None)
             if callable(invalidate):

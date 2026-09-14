@@ -58,14 +58,14 @@ const AccountSidebar = React.forwardRef(function AccountSidebar(
           ) : (
             accounts.map((account) => {
               const task = taskForAccount(tasks, account.id)
-              const state = task?.state ?? 'idle'
+              const state = account.enabled === false ? 'disabled' : task?.state ?? 'idle'
               const label = `${account.name}：${taskStateLabel(state)}`
               return (
                 <NavLink
                   key={account.id}
                   to={`/accounts/${encodeURIComponent(account.id)}/launch`}
                   className={(linkState) =>
-                    cn(navLinkClass(linkState), !account.enabled && 'opacity-60')
+                    cn(navLinkClass(linkState), account.enabled === false && 'opacity-60')
                   }
                   onClick={onNavigate}
                 >

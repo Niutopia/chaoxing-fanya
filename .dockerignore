@@ -85,3 +85,16 @@ chaoxing-data-backup.tgz
 **/*.tar.gz
 *.tar
 **/*.tar
+
+# Archives and portable build output are distribution artifacts, not image
+# inputs.  Exclude them at every nesting level to keep Docker context small.
+*.zip
+**/*.zip
+portable/
+**/portable/
+chaoxing_portable/
+**/chaoxing_portable/
+portable_build/
+**/portable_build/
+build_portable/
+**/build_portable/

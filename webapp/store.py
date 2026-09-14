@@ -40,13 +40,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     username TEXT NOT NULL,
     password_token TEXT,
     cookies_token TEXT,
+    auth_mode TEXT NOT NULL DEFAULT 'password',
     enabled INTEGER NOT NULL DEFAULT 1,
     verification_status TEXT NOT NULL DEFAULT 'unverified',
     last_verified_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (enabled IN (0, 1)),
-    CHECK (verification_status IN ('unverified', 'valid', 'invalid'))
+    CHECK (verification_status IN ('unverified', 'valid', 'invalid')),
+    CHECK (auth_mode IN ('password', 'cookies'))
 );
 
 CREATE TABLE IF NOT EXISTS account_preferences (
@@ -130,6 +132,33 @@ class SQLiteStore:
         with _SCHEMA_LOCK:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)
+                # Older persistent volumes do not have an explicit
+                # authentication mode.  Add it in place and normalize any
+                # malformed legacy values before the app serves profiles.
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(accounts)")
+                }
+                added_auth_mode = "auth_mode" not in columns
+                if added_auth_mode:
+                    connection.execute(
+                        "ALTER TABLE accounts ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'password'"
+                    )
+                if added_auth_mode:
+                    # Before auth_mode existed, cookie-only rows were the
+                    # persisted representation of cookie authentication.  A
+                    # migration must retain that behavior instead of making
+                    # those accounts attempt a blank-password login.
+                    connection.execute(
+                        "UPDATE accounts SET auth_mode = CASE "
+                        "WHEN password_token IS NULL AND cookies_token IS NOT NULL "
+                        "THEN 'cookies' ELSE 'password' END"
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE accounts SET auth_mode = 'password' "
+                        "WHERE auth_mode IS NULL OR auth_mode NOT IN ('password', 'cookies')"
+                    )
 
     @staticmethod
     def _profile_from_row(row: sqlite3.Row) -> AccountProfile:
@@ -142,6 +171,7 @@ class SQLiteStore:
             has_cookies=row["cookies_token"] is not None,
             verification_status=row["verification_status"],
             last_verified_at=row["last_verified_at"],
+            auth_mode=(row["auth_mode"] or "password"),
         )
 
     @staticmethod
@@ -150,6 +180,12 @@ class SQLiteStore:
     ) -> str:
         if value not in _VALID_VERIFICATION_STATUSES:
             raise ValueError("verification_status must be unverified, valid, or invalid")
+        return value
+
+    @staticmethod
+    def _validate_auth_mode(value: Literal["password", "cookies"] | str) -> str:
+        if value not in {"password", "cookies"}:
+            raise ValueError("auth_mode must be password or cookies")
         return value
 
     @staticmethod
@@ -261,7 +297,7 @@ class SQLiteStore:
     def get_account_auth(self, account_id: str) -> AccountAuth | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT username, password_token, cookies_token FROM accounts WHERE id = ?",
+                "SELECT username, password_token, cookies_token, auth_mode FROM accounts WHERE id = ?",
                 (str(account_id),),
             ).fetchone()
             if row is None:
@@ -275,6 +311,7 @@ class SQLiteStore:
                 username=str(row["username"]),
                 password=password,
                 cookies=self._decrypt_cookies(row["cookies_token"]),
+                auth_mode=self._validate_auth_mode(row["auth_mode"] or "password"),
             )
 
     def create_account(
@@ -287,21 +324,35 @@ class SQLiteStore:
         verification_status: Literal["unverified", "valid", "invalid"] = "unverified",
         last_verified_at: str | None = None,
         cookies: Mapping[str, Any] | None = None,
+        auth_mode: Literal["password", "cookies"] | None = None,
     ) -> AccountProfile:
         status = self._validate_verification_status(verification_status)
+        auth_mode_explicit = auth_mode is not None
+        if auth_mode is None:
+            # Legacy callers supplied both password and cookies and expected
+            # the existing cookie-login preference.  New callers can make the
+            # choice explicit with auth_mode.
+            auth_mode = "cookies" if cookies is not None else "password"
+        mode = self._validate_auth_mode(auth_mode)
         account_id = str(uuid.uuid4())
         now = _utc_now()
         password_token = (
-            self.secret_box.encrypt(password) if password is not None else None
+            self.secret_box.encrypt(password)
+            if password is not None and (mode == "password" or not auth_mode_explicit)
+            else None
         )
-        cookies_token = self._encrypt_cookies(cookies)
+        cookies_token = (
+            self._encrypt_cookies(cookies)
+            if cookies is not None and (mode == "cookies" or not auth_mode_explicit)
+            else None
+        )
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO accounts
-                    (id, name, username, password_token, cookies_token, enabled,
-                     verification_status, last_verified_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, name, username, password_token, cookies_token, auth_mode,
+                     enabled, verification_status, last_verified_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -309,6 +360,7 @@ class SQLiteStore:
                     str(username),
                     password_token,
                     cookies_token,
+                    mode,
                     int(bool(enabled)),
                     status,
                     last_verified_at,
@@ -334,38 +386,107 @@ class SQLiteStore:
         | None = None,
         last_verified_at: str | None | object = _UNSET,
         cookies: Mapping[str, Any] | None | object = _UNSET,
+        auth_mode: Literal["password", "cookies"] | str | None = None,
     ) -> AccountProfile | None:
         account_id = str(account_id)
-        updates: list[str] = []
-        values: list[Any] = []
-        if name is not None:
-            updates.append("name = ?")
-            values.append(str(name))
-        if username is not None:
-            updates.append("username = ?")
-            values.append(str(username))
-        if password is not _UNSET and password is not None:
-            updates.append("password_token = ?")
-            values.append(self.secret_box.encrypt(password))
-        if enabled is not None:
-            updates.append("enabled = ?")
-            values.append(int(bool(enabled)))
-        if verification_status is not None:
-            updates.append("verification_status = ?")
-            values.append(self._validate_verification_status(verification_status))
-        if last_verified_at is not _UNSET:
-            updates.append("last_verified_at = ?")
-            values.append(last_verified_at)
-        if cookies is not _UNSET:
-            updates.append("cookies_token = ?")
-            values.append(self._encrypt_cookies(cookies))
-
         with self._connection() as connection:
             existing = connection.execute(
                 "SELECT * FROM accounts WHERE id = ?", (account_id,)
             ).fetchone()
             if existing is None:
                 return None
+
+            updates: list[str] = []
+            values: list[Any] = []
+            credential_changed = False
+            current_mode = self._validate_auth_mode(existing["auth_mode"] or "password")
+            selected_mode = (
+                self._validate_auth_mode(auth_mode)
+                if auth_mode is not None
+                else current_mode
+            )
+
+            if name is not None:
+                updates.append("name = ?")
+                values.append(str(name))
+            if username is not None:
+                updates.append("username = ?")
+                values.append(str(username))
+                if str(username) != str(existing["username"]):
+                    credential_changed = True
+            if enabled is not None:
+                updates.append("enabled = ?")
+                values.append(int(bool(enabled)))
+
+            current_password = (
+                self.secret_box.decrypt(existing["password_token"])
+                if existing["password_token"] is not None
+                else ""
+            )
+            current_cookies = self._decrypt_cookies(existing["cookies_token"])
+            password_supplied = (
+                password is not _UNSET
+                and password is not None
+                and not (isinstance(password, str) and not password.strip())
+            )
+            cookies_supplied = cookies is not _UNSET
+            normalized_cookies = (
+                self._normalize_cookies(cookies)
+                if cookies_supplied and cookies is not None
+                else {}
+            )
+            if password_supplied and str(password) != current_password:
+                credential_changed = True
+            if cookies_supplied and normalized_cookies != current_cookies:
+                credential_changed = True
+            if auth_mode is not None and selected_mode != current_mode:
+                credential_changed = True
+
+            if auth_mode is not None:
+                # Selecting a source and clearing its incompatible secret are
+                # one SQLite transaction.  A mode switch is credential
+                # material even when the replacement field is blank.
+                updates.append("auth_mode = ?")
+                values.append(selected_mode)
+                if selected_mode == "password":
+                    password_token = (
+                        self.secret_box.encrypt(str(password))
+                        if password_supplied
+                        else existing["password_token"]
+                    )
+                    cookies_token = None
+                else:
+                    password_token = None
+                    cookies_token = (
+                        self._encrypt_cookies(normalized_cookies)
+                        if cookies_supplied
+                        else existing["cookies_token"]
+                    )
+                updates.extend(["password_token = ?", "cookies_token = ?"])
+                values.extend([password_token, cookies_token])
+            else:
+                # Compatibility path for direct store integrations.  The
+                # account editor sends auth_mode explicitly; cookie refresh
+                # callbacks use save_cookies so they do not reset verification.
+                if password_supplied:
+                    updates.append("password_token = ?")
+                    values.append(self.secret_box.encrypt(str(password)))
+                if cookies_supplied:
+                    updates.append("cookies_token = ?")
+                    values.append(self._encrypt_cookies(normalized_cookies))
+
+            if credential_changed:
+                # Verification is tied to the exact credential material.  A
+                # caller cannot combine a stale valid marker with a change.
+                updates.extend(["verification_status = ?", "last_verified_at = ?"])
+                values.extend(["unverified", None])
+            else:
+                if verification_status is not None:
+                    updates.append("verification_status = ?")
+                    values.append(self._validate_verification_status(verification_status))
+                if last_verified_at is not _UNSET:
+                    updates.append("last_verified_at = ?")
+                    values.append(last_verified_at)
             if updates:
                 updates.append("updated_at = ?")
                 values.extend([_utc_now(), account_id])
@@ -390,7 +511,39 @@ class SQLiteStore:
     def save_cookies(
         self, account_id: str, cookies: Mapping[str, Any] | None
     ) -> AccountProfile | None:
-        return self.update_account(account_id, cookies=cookies)
+        """Persist refreshed session cookies without invalidating verification.
+
+        Authentication callbacks run as part of a successful login.  Treating
+        those server-issued cookies as a user credential edit would mark the
+        account unverified immediately before the caller records success.
+        """
+
+        account_id = str(account_id)
+        token = self._encrypt_cookies(cookies)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+            if token != existing["cookies_token"]:
+                connection.execute(
+                    "UPDATE accounts SET cookies_token = ?, updated_at = ? WHERE id = ?",
+                    (token, _utc_now(), account_id),
+                )
+                existing = connection.execute(
+                    "SELECT * FROM accounts WHERE id = ?", (account_id,)
+                ).fetchone()
+            return self._profile_from_row(existing)
+
+    def record_verification(self, account_id: str, *, valid: bool) -> AccountProfile | None:
+        """Persist a verification result without resolving credentials again."""
+
+        return self.update_account(
+            account_id,
+            verification_status="valid" if valid else "invalid",
+            last_verified_at=_utc_now(),
+        )
 
     def get_preferences(self, account_id: str) -> AccountPreferences | None:
         with self._connection() as connection:
