@@ -488,10 +488,10 @@ class TaskManager:
             context = record.context
         state: TaskState = "completed"
         error: str | None = None
+        normal_return = False
         try:
             run_with_task_context(task_id, self._invoke_runner, context)
-            if context.cancel_event.is_set():
-                state = "stopped"
+            normal_return = True
         except BaseException as exc:
             state = "failed"
             with self._lock:
@@ -500,6 +500,13 @@ class TaskManager:
                 error = self._sanitize(record, exc)
         finally:
             with self._lock:
+                # Select the terminal state while holding the same lock used
+                # by ``cancel``.  This closes the return/finalization race:
+                # cancellation that wins before finalization is observed and
+                # produces stopping -> stopped, while a cancel arriving after
+                # a completed transition simply receives that terminal state.
+                if normal_return:
+                    state = "stopped" if context.cancel_event.is_set() else "completed"
                 self._finish_locked(record, state, error)
 
     def _sanitize(self, record: _TaskRuntime, value: Any) -> str:

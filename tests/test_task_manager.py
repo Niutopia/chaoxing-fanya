@@ -58,6 +58,33 @@ class OutcomeRunner:
             context.cancel_event.set()
 
 
+class ReturnBoundaryRunner:
+    """Expose the tiny return/finalization window without sleeping."""
+
+    def __init__(self):
+        self.manager = None
+        self.context = None
+        self.cancel_check_reached = threading.Event()
+        self.release_cancel_check = threading.Event()
+
+    def run(self, context):
+        self.context = context
+        original_is_set = context.cancel_event.is_set
+
+        def gated_is_set():
+            # The pre-fix worker checks outside the manager lock.  The fixed
+            # worker checks while holding it; return the value observed before
+            # cancellation only for the former path, and re-read for the
+            # latter path after the barrier releases.
+            under_manager_lock = self.manager.lock._is_owned()
+            observed = original_is_set()
+            self.cancel_check_reached.set()
+            assert self.release_cancel_check.wait(timeout=2)
+            return original_is_set() if under_manager_lock else observed
+
+        context.cancel_event.is_set = gated_is_set
+
+
 @pytest.fixture
 def task_inputs():
     def make(account_id):
@@ -135,6 +162,20 @@ def test_cancel_delivers_event_and_reaches_stopped(task_inputs):
     assert runner.contexts[task.id].cancel_event.is_set()
     runner.acknowledge_cancel(task.id)
     manager.wait(task.id, timeout=1)
+    assert manager.get_snapshot(task.id).state == "stopped"
+
+
+def test_cancel_between_runner_return_and_finalization_reaches_stopped(task_inputs):
+    runner = ReturnBoundaryRunner()
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    runner.manager = manager
+    task = manager.start(**task_inputs("account-a"))
+
+    assert runner.cancel_check_reached.wait(timeout=1)
+    runner.context.cancel_event.set()
+    runner.release_cancel_check.set()
+    manager.wait(task.id, timeout=1)
+
     assert manager.get_snapshot(task.id).state == "stopped"
 
 
