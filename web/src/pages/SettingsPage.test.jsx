@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, expect, vi } from 'vitest'
@@ -131,6 +131,27 @@ test('clears the draft key after a successful connection save', async () => {
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   expect(saveAnswerConnection).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'new-secret' }))
   expect(key).toHaveValue('')
+})
+
+test('clears global success before a pending key clear and keeps confirmation scoped', async () => {
+  const user = userEvent.setup()
+  let resolveClear
+  saveAnswerConnection.mockResolvedValue({ has_api_key: true, api_key_mask: 'sk-••••••' })
+  clearAnswerKey.mockImplementation(() => new Promise((resolve) => {
+    resolveClear = resolve
+  }))
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存设置' }))
+  expect(await screen.findByText('设置已保存')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+
+  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
+  resolveClear({ has_api_key: false, api_key_mask: null })
+  const clearConfirmation = await screen.findByText('API Key 已清除')
+  expect(clearConfirmation.closest('details')).not.toBeNull()
+  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
 })
 
 test('invalidates a successful connection test when any draft value changes', async () => {
@@ -285,11 +306,11 @@ test('preserves edits and invalidates a probe when save completes', async () => 
 
   renderPage()
   const model = await screen.findByLabelText('模型')
+  await user.click(screen.getByRole('button', { name: '测试连接' }))
+  expect(probePayload).toEqual(expect.objectContaining({ model: 'gemini-3.8-flash-high' }))
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   await user.clear(model)
   await user.type(model, 'edited-during-save')
-  await user.click(screen.getByRole('button', { name: '测试连接' }))
-  expect(probePayload).toEqual(expect.objectContaining({ model: 'edited-during-save' }))
 
   resolveSave({ model: 'saved-response-model' })
   await screen.findByText('连接设置已保存')
@@ -300,6 +321,94 @@ test('preserves edits and invalidates a probe when save completes', async () => 
     expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
   })
   expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
+})
+
+test('does not let an older combined save overwrite a switched account load error', async () => {
+  const user = userEvent.setup()
+  let resolveAccountSave
+  getPreferences
+    .mockResolvedValueOnce({ notification_config: {}, ocr_config: {} })
+    .mockRejectedValueOnce(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
+  savePreferences.mockImplementationOnce(() => new Promise((resolve) => {
+    resolveAccountSave = resolve
+  }))
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage
+        accountId="account-a"
+        accounts={[{ id: 'account-a', name: '账号 A' }, { id: 'account-b', name: '账号 B' }]}
+      />
+    </MemoryRouter>,
+  )
+
+  await screen.findByText('账号 A')
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith('account-a', expect.any(Object)))
+
+  await user.selectOptions(screen.getByLabelText('当前账户'), 'account-b')
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
+
+  await act(async () => {
+    resolveAccountSave({})
+  })
+  await waitFor(() => {
+    expect(screen.getByRole('alert')).toHaveTextContent('账户偏好加载失败')
+    expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
+  })
+})
+
+test('disables connection testing throughout a connection mutation', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
+    resolveSave = resolve
+  }))
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存连接' }))
+  expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled()
+  resolveSave({ has_api_key: true, api_key_mask: 'sk-••••••' })
+  await screen.findByText('连接设置已保存')
+  expect(screen.getByRole('button', { name: '测试连接' })).not.toBeDisabled()
+})
+
+test('merges saved connection metadata while preserving edited drafts', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  getAnswerConnection.mockResolvedValue({
+    enabled: true,
+    base_url: 'http://localhost:8849/v1',
+    model: 'gemini-3.8-flash-high',
+    has_api_key: false,
+    api_key_mask: null,
+    last_test_status: 'untested',
+  })
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
+    resolveSave = resolve
+  }))
+  renderPage()
+
+  const key = await screen.findByLabelText('替换 API Key')
+  const model = screen.getByLabelText('模型')
+  await user.type(key, 'round4-secret')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+  await user.clear(model)
+  await user.type(model, 'edited-during-save')
+
+  resolveSave({
+    model: 'saved-response-model',
+    has_api_key: true,
+    api_key_mask: 'sk-••••••',
+    last_test_status: 'success',
+    api_key: 'response-plaintext-must-not-leak',
+  })
+  await screen.findByText('连接设置已保存')
+
+  expect(model).toHaveValue('edited-during-save')
+  expect(key).toHaveValue('')
+  expect(screen.getByText('sk-••••••')).toBeInTheDocument()
+  expect(document.body.textContent).not.toContain('response-plaintext-must-not-leak')
 })
 
 test('invalidates a probe started while API key clear is in flight', async () => {
@@ -315,9 +424,9 @@ test('invalidates a probe started while API key clear is in flight', async () =>
 
   renderPage()
   await screen.findByLabelText('模型')
+  await user.click(screen.getByRole('button', { name: '测试连接' }))
   await user.click(screen.getByRole('button', { name: '清除 API Key' }))
   await user.click(screen.getByRole('button', { name: '确认清除' }))
-  await user.click(screen.getByRole('button', { name: '测试连接' }))
 
   resolveClear({ has_api_key: false })
   await screen.findByText('API Key 已清除')

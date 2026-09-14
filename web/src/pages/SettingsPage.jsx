@@ -98,6 +98,66 @@ function normalizeRuntime(value) {
 
 const CONFIG_MASK = 'Configured (••••)'
 
+function connectionSource(value) {
+  const source = unwrap(value, ['connection', 'answer_connection'])
+  return source && typeof source === 'object' && !Array.isArray(source) ? source : null
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+/** Pick only non-secret connection fields returned by a save response. */
+function connectionResponseFields(value) {
+  const source = connectionSource(value)
+  if (!source) return {}
+  const fields = {}
+  if (hasOwn(source, 'enabled')) fields.enabled = source.enabled === true
+  if (hasOwn(source, 'base_url')) fields.base_url = stringValue(source.base_url, DEFAULT_CONNECTION.base_url)
+  if (hasOwn(source, 'model')) fields.model = stringValue(source.model, DEFAULT_CONNECTION.model)
+  if (hasOwn(source, 'timeout_seconds')) fields.timeout_seconds = numberValue(source.timeout_seconds, DEFAULT_CONNECTION.timeout_seconds)
+  if (hasOwn(source, 'max_retries')) fields.max_retries = numberValue(source.max_retries, DEFAULT_CONNECTION.max_retries)
+  if (hasOwn(source, 'max_concurrency')) fields.max_concurrency = numberValue(source.max_concurrency, DEFAULT_CONNECTION.max_concurrency)
+  return fields
+}
+
+/** Keep only safe server metadata; never copy a response's plaintext key. */
+function safeConnectionMetadata(value, replacementApiKey = '') {
+  const source = connectionSource(value)
+  const metadata = {}
+  if (source) {
+    if (hasOwn(source, 'has_api_key')) metadata.has_api_key = source.has_api_key === true
+    if (hasOwn(source, 'api_key_mask')) {
+      const configured = metadata.has_api_key ?? source.api_key_mask != null
+      metadata.api_key_mask = safeMask(source.api_key_mask, configured)
+    }
+    if (metadata.has_api_key === true && !hasOwn(metadata, 'api_key_mask')) metadata.api_key_mask = CONFIG_MASK
+    if (metadata.has_api_key === false && !hasOwn(metadata, 'api_key_mask')) metadata.api_key_mask = null
+    if (typeof source.last_test_status === 'string') metadata.last_test_status = source.last_test_status
+  }
+
+  // A successful save response from an older server may omit metadata.  The
+  // non-empty replacement itself is enough to show safe configured state;
+  // the plaintext is never copied into the connection model.
+  if (typeof replacementApiKey === 'string' && replacementApiKey.trim() && !hasOwn(metadata, 'has_api_key')) {
+    metadata.has_api_key = true
+    if (!hasOwn(metadata, 'api_key_mask')) metadata.api_key_mask = CONFIG_MASK
+  }
+  return metadata
+}
+
+function mergeSavedConnection(current, saved, replacementApiKey, draftChanged) {
+  const next = {
+    ...current,
+    ...(draftChanged ? {} : connectionResponseFields(saved)),
+    ...safeConnectionMetadata(saved, replacementApiKey),
+  }
+  // A test result belongs to the payload that was saved.  Once a user edits
+  // that payload while the request is pending, the current draft is untested.
+  if (draftChanged) next.last_test_status = 'untested'
+  return next
+}
+
 function configKey(key) {
   return String(key).trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
 }
@@ -301,10 +361,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const [ocr, setOcr] = useState({ enabled: false, provider: '', endpoint: '', model: '', api_key: '' })
   const originalNotificationRef = useRef({})
   const originalOcrRef = useRef({})
+  const selectedAccountIdRef = useRef(selectedAccountId)
+  const loadGenerationRef = useRef(0)
   const requestId = useRef(0)
   const testGeneration = useRef(0)
   const connectionRef = useRef(connection)
   const apiKeyRef = useRef(apiKey)
+  const connectionMutationRef = useRef(0)
+  const settingsSaveOperationRef = useRef(0)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [connectionError, setConnectionError] = useState('')
@@ -319,6 +383,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const [confirmingClear, setConfirmingClear] = useState(false)
   const [clearingKey, setClearingKey] = useState(false)
   const [accountPrefsReady, setAccountPrefsReady] = useState(!initialAccountId)
+
+  selectedAccountIdRef.current = selectedAccountId
 
   useEffect(() => {
     connectionRef.current = connection
@@ -337,6 +403,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
 
   const loadSettings = useCallback(async () => {
     const currentRequest = ++requestId.current
+    ++loadGenerationRef.current
     testGeneration.current += 1
     setLoading(true)
     setLoadError('')
@@ -439,6 +506,19 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setTestMessage('')
   }
 
+  const beginConnectionMutation = () => {
+    connectionMutationRef.current += 1
+  }
+
+  const endConnectionMutation = () => {
+    connectionMutationRef.current = Math.max(0, connectionMutationRef.current - 1)
+  }
+
+  const isCurrentSettingsSave = (context) => (
+    context.loadGeneration === loadGenerationRef.current
+    && String(context.accountId ?? '') === String(selectedAccountIdRef.current ?? '')
+  )
+
   const updateConnection = (field) => (event) => {
     const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value
     setConnection((current) => {
@@ -467,6 +547,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }
 
   const handleTestConnection = async () => {
+    if (connectionMutationRef.current > 0 || savingConnection || savingSettings || clearingKey) return
     const validationError = validateConnection(connection)
     if (validationError) {
       setConnectionError(validationError)
@@ -502,6 +583,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }
 
   const handleSaveConnection = async () => {
+    if (connectionMutationRef.current > 0) return
     const validationError = validateConnection(connection)
     if (validationError) {
       setConnectionError(validationError)
@@ -509,6 +591,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       return
     }
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
+    const submittedApiKey = apiKey
+    beginConnectionMutation()
     invalidateConnectionTest()
     setConnectionSuccess('')
     setSavingConnection(true)
@@ -516,12 +600,19 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setSuccess('')
     try {
       const saved = await saveAnswerConnection(answerPayload(connection, apiKey))
-      if (fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)) {
-        if (saved) {
-          const nextConnection = { ...connectionRef.current, ...normalizeConnection(saved) }
-          connectionRef.current = nextConnection
-          setConnection(nextConnection)
-        }
+      // Invalidate both before the mutation and as soon as its response
+      // arrives, so a probe cannot become valid during a later save step.
+      invalidateConnectionTest()
+      const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
+      const nextConnection = mergeSavedConnection(
+        connectionRef.current,
+        saved,
+        submittedApiKey,
+        draftChanged,
+      )
+      connectionRef.current = nextConnection
+      setConnection(nextConnection)
+      if (submittedApiKey === apiKeyRef.current) {
         apiKeyRef.current = ''
         setApiKey('')
       }
@@ -529,51 +620,53 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     } catch (error) {
       setConnectionError(errorMessage(error, '连接设置保存失败，请重试'))
     } finally {
-      testGeneration.current += 1
-      setTestState('idle')
-      setTestMessage('')
+      invalidateConnectionTest()
       setSavingConnection(false)
+      endConnectionMutation()
     }
   }
 
   const handleClearKey = async () => {
-    if (!confirmingClear || clearingKey) return
+    if (!confirmingClear || clearingKey || connectionMutationRef.current > 0) return
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
+    const submittedApiKey = apiKey
+    beginConnectionMutation()
     invalidateConnectionTest()
+    setSuccess('')
     setConnectionSuccess('')
     setClearingKey(true)
     setConnectionError('')
     try {
       const cleared = await clearAnswerKey()
-      if (fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)) {
-        const nextConnection = {
-          ...connectionRef.current,
-          ...(cleared ? normalizeConnection(cleared) : {}),
-          has_api_key: false,
-          api_key_mask: null,
-        }
-        connectionRef.current = nextConnection
-        setConnection(nextConnection)
+      invalidateConnectionTest()
+      const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
+      const nextConnection = {
+        ...connectionRef.current,
+        ...(draftChanged ? {} : connectionResponseFields(cleared)),
+        ...safeConnectionMetadata(cleared),
+        has_api_key: false,
+        api_key_mask: null,
+        last_test_status: 'untested',
+      }
+      connectionRef.current = nextConnection
+      setConnection(nextConnection)
+      if (submittedApiKey === apiKeyRef.current) {
         apiKeyRef.current = ''
         setApiKey('')
-      } else {
-        // Keep edits made while the request was in flight, while reflecting
-        // the server-side key removal in the non-draft status fields.
-        setConnection((current) => ({ ...current, has_api_key: false, api_key_mask: null }))
       }
       setConfirmingClear(false)
       setConnectionSuccess('API Key 已清除')
     } catch (error) {
       setConnectionError(errorMessage(error, 'API Key 清除失败，请重试'))
     } finally {
-      testGeneration.current += 1
-      setTestState('idle')
-      setTestMessage('')
+      invalidateConnectionTest()
       setClearingKey(false)
+      endConnectionMutation()
     }
   }
 
   const handleSaveSettings = async () => {
+    if (connectionMutationRef.current > 0) return
     setAccountError('')
     setConnectionSuccess('')
     const validationError = validateRuntime(runtime, connection)
@@ -595,6 +688,13 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     }
 
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
+    const submittedApiKey = apiKey
+    const saveContext = {
+      accountId: selectedAccountId,
+      loadGeneration: loadGenerationRef.current,
+    }
+    const operation = ++settingsSaveOperationRef.current
+    beginConnectionMutation()
     invalidateConnectionTest()
     setSavingSettings(true)
     setRuntimeError('')
@@ -603,13 +703,26 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     let accountSaveStarted = false
     try {
       await saveRuntimeSettings({ max_active_accounts: Number(runtime.max_active_accounts) })
+      if (!isCurrentSettingsSave(saveContext)) return
       const savedConnection = await saveAnswerConnection(answerPayload(connection, apiKey))
-      if (savedConnection && fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)) {
-        const nextConnection = { ...connectionRef.current, ...normalizeConnection(savedConnection) }
-        connectionRef.current = nextConnection
-        setConnection(nextConnection)
+      // Invalidate at the response boundary as well as at mutation start;
+      // combined saves still have account preference work to finish.
+      invalidateConnectionTest()
+      if (!isCurrentSettingsSave(saveContext)) return
+      const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
+      const nextConnection = mergeSavedConnection(
+        connectionRef.current,
+        savedConnection,
+        submittedApiKey,
+        draftChanged,
+      )
+      connectionRef.current = nextConnection
+      setConnection(nextConnection)
+      if (submittedApiKey === apiKeyRef.current) {
+        apiKeyRef.current = ''
+        setApiKey('')
       }
-      if (selectedAccountId && accountPrefsReady) {
+      if (selectedAccountId && accountPrefsReady && isCurrentSettingsSave(saveContext)) {
         accountSaveStarted = true
         const accountPayload = preferenceConfigPayload(
           notification,
@@ -618,18 +731,21 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           originalOcrRef.current,
         )
         await savePreferences(selectedAccountId, accountPayload)
-        originalNotificationRef.current = safeConfig(accountPayload.notification_config, { notification: true })
-        originalOcrRef.current = safeConfig(accountPayload.ocr_config)
-        setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
-        setOcr((current) => ({ ...current, api_key: '' }))
-        setAccountError('')
+        if (isCurrentSettingsSave(saveContext)) {
+          originalNotificationRef.current = safeConfig(accountPayload.notification_config, { notification: true })
+          originalOcrRef.current = safeConfig(accountPayload.ocr_config)
+          setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
+          setOcr((current) => ({ ...current, api_key: '' }))
+          setAccountError('')
+        }
       }
-      if (fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)) {
+      if (isCurrentSettingsSave(saveContext) && submittedApiKey === apiKeyRef.current) {
         apiKeyRef.current = ''
         setApiKey('')
       }
-      setSuccess('设置已保存')
+      if (isCurrentSettingsSave(saveContext)) setSuccess('设置已保存')
     } catch (error) {
+      if (!isCurrentSettingsSave(saveContext)) return
       if (accountSaveStarted) {
         setAccountError(errorMessage(error, '账户通知与 OCR 设置保存失败，请重试'))
         setSuccess('')
@@ -637,10 +753,9 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         setRuntimeError(errorMessage(error, '设置保存失败，请重试'))
       }
     } finally {
-      testGeneration.current += 1
-      setTestState('idle')
-      setTestMessage('')
-      setSavingSettings(false)
+      invalidateConnectionTest()
+      if (settingsSaveOperationRef.current === operation) setSavingSettings(false)
+      endConnectionMutation()
     }
   }
 
@@ -749,11 +864,11 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                     <Button type="button" variant="destructive" loading={clearingKey} onClick={handleClearKey}>确认清除</Button>
                   </div>
                 ) : (
-                  <Button type="button" variant="outline" onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
+                  <Button type="button" variant="outline" disabled={savingConnection || savingSettings || clearingKey} onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
                 )
               ) : null}
-              <Button type="button" variant="outline" loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
-              <Button type="button" onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
+              <Button type="button" variant="outline" disabled={savingConnection || savingSettings || clearingKey} loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
+              <Button type="button" disabled={savingSettings || clearingKey} onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
             </div>
           </div>
         </details>
@@ -770,7 +885,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
             </Field>
             <p className="text-sm leading-5 text-label-secondary">全局答题并发数和请求超时在上方的答题连接中统一配置。</p>
             <div className="flex justify-end border-t border-separator pt-4">
-              <Button type="button" loading={savingSettings} onClick={handleSaveSettings}>保存设置</Button>
+              <Button type="button" disabled={savingConnection || clearingKey} loading={savingSettings} onClick={handleSaveSettings}>保存设置</Button>
             </div>
           </div>
         </details>
@@ -799,7 +914,10 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                 <select
                   id="settings-account"
                   value={selectedAccountId}
-                  onChange={(event) => setSelectedAccountId(event.target.value)}
+                  onChange={(event) => {
+                    selectedAccountIdRef.current = event.target.value
+                    setSelectedAccountId(event.target.value)
+                  }}
                   className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
                 >
                   {accounts.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
