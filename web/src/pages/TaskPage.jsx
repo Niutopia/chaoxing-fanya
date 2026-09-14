@@ -91,6 +91,9 @@ function aggregateCounts(snapshot, details) {
       : (snapshotTotal > 0 ? snapshotTotal : null))
   let courseCompleted = numberFrom(sources, ['completed_courses', 'courses_completed'])
   if (courseCompleted === null && courses.length > 0) courseCompleted = courses.filter(isComplete).length
+  if (courseCompleted === null && courses.length === 0 && ACTIVE_STATES.has(snapshot?.state)) {
+    courseCompleted = numberFrom([snapshot], ['progress'])
+  }
   if (courseCompleted === null && courseTotal !== null && snapshot?.state === 'completed') courseCompleted = courseTotal
 
   const chapterTotal = numberFrom(sources, ['total_chapters', 'chapters_total'])
@@ -337,7 +340,7 @@ function TaskCourseList({ courses, expanded, onToggle }) {
   )
 }
 
-function CancelDialog({ open, accountLabel, courseLabel, pending, error, triggerRef, onOpenChange, onConfirm }) {
+function CancelDialog({ open, accountLabel, courseLabel, pending, error, triggerRef, focusFallbackRef, onOpenChange, onConfirm }) {
   const continueRef = useRef(null)
 
   return (
@@ -352,7 +355,13 @@ function CancelDialog({ open, accountLabel, courseLabel, pending, error, trigger
           }}
           onCloseAutoFocus={(event) => {
             event.preventDefault()
-            triggerRef?.current?.focus()
+            const trigger = triggerRef?.current
+            if (trigger && !trigger.disabled && document.contains(trigger)) {
+              trigger.focus()
+              return
+            }
+            const fallback = focusFallbackRef?.current
+            if (fallback && !fallback.disabled && document.contains(fallback)) fallback.focus()
           }}
           onEscapeKeyDown={(event) => {
             if (pending) event.preventDefault()
@@ -425,6 +434,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const seenSequencesRef = useRef(new Set())
   const cancelRequestedRef = useRef(false)
   const cancelTriggerRef = useRef(null)
+  const monitorBackLinkRef = useRef(null)
 
   const currentGeneration = taskGenerationRef.current.generation
 
@@ -624,6 +634,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <Link
+            ref={monitorBackLinkRef}
             to="/"
             className="touch-target touch-target-compact inline-flex min-h-9 items-center gap-1.5 rounded-md px-2 text-sm text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
           >
@@ -760,6 +771,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
         pending={cancelling}
         error={cancelError}
         triggerRef={cancelTriggerRef}
+        focusFallbackRef={monitorBackLinkRef}
         onOpenChange={(open) => {
           if (!cancelling) setConfirmCancel(open)
         }}

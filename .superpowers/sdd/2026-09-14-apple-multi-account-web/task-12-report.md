@@ -52,3 +52,28 @@ The implementation is committed as:
 ### Fix Round 1 commit
 
 `fix: harden task monitor cancellation and terminal details`
+
+## Fix Round 2
+
+### TDD RED
+
+- Added the live course-count fallback and successful-cancellation focus regressions before changing production code. `npm --prefix web test -- TaskPage.test.jsx` failed with 19 tests run and 2 failures: `restores focus to the overview link when successful cancellation disables the trigger` expected the overview link to be focused but received `<body>`, and `uses snapshot progress as the live course completed fallback` expected `1 / 3` but received `— / 3`.
+- The new aggregate value intentionally creates a second visible `1 / n` value beside the overall progress meter, so existing assertions were made selector-specific through the accessible aggregate count labels; no behavior was weakened.
+
+### Fixes
+
+- `aggregateCounts` now uses an active snapshot's `progress` only as the course completed fallback when explicit counts and course details are unavailable; chapter and task counts remain independent and continue to report `—` when their sources are missing.
+- Radix Dialog close autofocus now restores the enabled, mounted stop trigger when available and otherwise focuses the stable, enabled `返回任务总览` link. Ordinary Escape/Continue dismissal still returns focus to the trigger, while confirmed cancellation leaves focus on the meaningful fallback after the trigger becomes disabled.
+- Added contract coverage for the live course fallback, successful cancellation focus restoration, and the single cancellation request assertion.
+
+### Fix Round 2 verification
+
+- `npm --prefix web test -- TaskPage.test.jsx` passed — 1 test file, 19 tests.
+- `npm --prefix web test -- TaskPage.test.jsx OverviewPage.test.jsx LaunchPage.test.jsx SettingsPage.test.jsx AppShell.test.jsx AccountDialog.test.jsx` passed — 6 test files, 60 tests.
+- `npm --prefix web test` passed — 9 test files, 74 tests.
+- `npm --prefix web run build` passed — Vite transformed 1,382 modules and emitted production assets. Only the existing stale Baseline/Browserslist data notices were printed.
+- `git diff --check` passed with no whitespace errors.
+
+### Fix Round 2 commit
+
+`fix: preserve task progress and cancel focus` (`9ad0b5f`)

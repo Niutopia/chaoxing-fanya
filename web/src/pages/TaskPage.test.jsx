@@ -120,6 +120,22 @@ test('stop changes to a noninteractive stopping state', async () => {
   expect(cancelTask).toHaveBeenCalledTimes(1)
 })
 
+test('restores focus to the overview link when successful cancellation disables the trigger', async () => {
+  const user = userEvent.setup()
+  cancelTask.mockResolvedValue({ ...runningSnapshot, state: 'stopping' })
+  renderPage('/tasks/task-a')
+
+  const trigger = await screen.findByRole('button', { name: '停止任务' })
+  const overviewLink = screen.getByRole('link', { name: '返回任务总览' })
+  await user.click(trigger)
+  await user.click(screen.getByRole('button', { name: '确认停止' }))
+
+  expect(cancelTask).toHaveBeenCalledTimes(1)
+  expect(await screen.findByRole('button', { name: '正在停止' })).toBeDisabled()
+  expect(trigger).toBeDisabled()
+  expect(overviewLink).toHaveFocus()
+})
+
 test('restores trigger focus and closes the cancel dialog with Escape', async () => {
   const user = userEvent.setup()
   renderPage('/tasks/task-a')
@@ -162,17 +178,17 @@ test('retains snapshot while reconnecting and recovers on the next poll', async 
     .mockResolvedValueOnce({ ...runningSnapshot, progress: 2 })
   renderPage('/tasks/task-a')
   await flushInitialPoll()
-  expect(screen.getByText('1 / 3')).toBeInTheDocument()
+  expect(screen.getByLabelText('已完成课程数量')).toHaveTextContent('1 / 3')
   await act(async () => {
     await vi.advanceTimersByTimeAsync(2000)
   })
   expect(screen.getByText('正在重新连接')).toBeInTheDocument()
-  expect(screen.getByText('1 / 3')).toBeInTheDocument()
+  expect(screen.getByLabelText('已完成课程数量')).toHaveTextContent('1 / 3')
   await act(async () => {
     await vi.advanceTimersByTimeAsync(2000)
   })
   expect(screen.queryByText('正在重新连接')).not.toBeInTheDocument()
-  expect(screen.getByText('2 / 3')).toBeInTheDocument()
+  expect(screen.getByLabelText('已完成课程数量')).toHaveTextContent('2 / 3')
 })
 
 test('appends unique log sequences and expands course details', async () => {
@@ -248,14 +264,14 @@ test('ignores a stale cancel success after changing to another task', async () =
   cancelTask.mockReturnValue(pendingCancel.promise)
 
   const { navigate } = renderNavigablePage('/tasks/task-a', { onSnapshot })
-  await screen.findByText('1 / 10')
+  expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent('1 / 10')
   onSnapshot.mockClear()
   await user.click(screen.getByRole('button', { name: '停止任务' }))
   await user.click(screen.getByRole('button', { name: '确认停止' }))
   expect(cancelTask).toHaveBeenCalledWith('task-a')
 
   await navigate('/tasks/task-b')
-  expect(await screen.findByText('9 / 10')).toBeInTheDocument()
+  expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent('9 / 10')
   pendingCancel.resolve({
     id: 'task-a',
     account_id: 'account-a',
@@ -265,8 +281,8 @@ test('ignores a stale cancel success after changing to another task', async () =
   })
   await flushInitialPoll()
 
-  expect(screen.getByText('9 / 10')).toBeInTheDocument()
-  expect(screen.queryByText('10 / 10')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('已完成课程数量')).toHaveTextContent('9 / 10')
+  expect(screen.getByLabelText('已完成课程数量')).not.toHaveTextContent('10 / 10')
   expect(onSnapshot.mock.calls.some(([snapshot]) => snapshot.id === 'task-a' && snapshot.state === 'stopping')).toBe(false)
 })
 
@@ -285,11 +301,11 @@ test('ignores a stale cancel rejection while the next task is stopping', async (
   cancelTask.mockImplementation((taskId) => taskId === 'task-a' ? pendingA.promise : pendingB.promise)
 
   const { navigate } = renderNavigablePage('/tasks/task-a')
-  await screen.findByText('1 / 2')
+  expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent('1 / 2')
   await user.click(screen.getByRole('button', { name: '停止任务' }))
   await user.click(screen.getByRole('button', { name: '确认停止' }))
   await navigate('/tasks/task-b')
-  await screen.findByText('1 / 2')
+  expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent('1 / 2')
   await user.click(screen.getByRole('button', { name: '停止任务' }))
   await user.click(screen.getByRole('button', { name: '确认停止' }))
   expect(cancelTask).toHaveBeenCalledTimes(2)
@@ -351,6 +367,22 @@ test('uses fallback values for missing elapsed and count fields', async () => {
 
   expect(await screen.findByLabelText('任务已用时间')).toHaveTextContent('—')
   expect(screen.getByLabelText('已完成课程数量')).toHaveTextContent(/^—$/)
+  expect(screen.getByLabelText('已完成章节数量')).toHaveTextContent(/^—$/)
+  expect(screen.getByLabelText('已完成任务数量')).toHaveTextContent(/^—$/)
+})
+
+test('uses snapshot progress as the live course completed fallback', async () => {
+  getTask.mockResolvedValue({
+    id: 'task-a',
+    account_id: 'account-a',
+    state: 'running',
+    progress: 1,
+    total: 3,
+  })
+  getTaskDetails.mockResolvedValue({ courses: [], active_jobs: {}, counts: {} })
+  renderPage('/tasks/task-a')
+
+  expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent(/^1 \/ 3$/)
   expect(screen.getByLabelText('已完成章节数量')).toHaveTextContent(/^—$/)
   expect(screen.getByLabelText('已完成任务数量')).toHaveTextContent(/^—$/)
 })
