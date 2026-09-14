@@ -1,13 +1,14 @@
 from pathlib import Path
 from typing import Any, Mapping
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 
 from .account_service import AccountService
 from .answer_connection import AnswerConnectionService
 from .crypto import SecretBox
 from .routes.accounts import NoopTaskGuard, accounts
 from .routes.settings import settings
+from .routes.tasks import tasks
 from .store import SQLiteStore
 from .task_logging import install_task_log_sink
 from .task_manager import TaskManager
@@ -48,11 +49,13 @@ def _default_task_runner(_context):
 
 def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
+    default_static_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
     data_dir = Path("data").resolve()
     app.config.from_mapping(
         DATA_DIR=data_dir,
         DATABASE_PATH=data_dir / "chaoxing-web.sqlite3",
         RUNNING_IN_DOCKER=False,
+        STATIC_DIR=default_static_dir,
     )
     if test_config:
         app.config.update(test_config)
@@ -141,6 +144,7 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     )
     app.register_blueprint(accounts)
     app.register_blueprint(settings)
+    app.register_blueprint(tasks)
 
     @app.get("/api/health")
     def health():
@@ -149,5 +153,24 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
+
+    # Keep the API namespace outside the SPA catch-all.  This route is
+    # deliberately registered after all API blueprints so an unknown API URL
+    # still reaches the JSON 404 handler instead of returning index.html.
+    static_dir = Path(app.config["STATIC_DIR"])
+    if static_dir.is_dir():
+
+        @app.get("/")
+        def serve_index():
+            return send_from_directory(static_dir, "index.html")
+
+        @app.get("/<path:path>")
+        def serve_static(path: str):
+            if path == "api" or path.startswith("api/"):
+                return not_found(None)
+            candidate = static_dir / path
+            if candidate.is_file():
+                return send_from_directory(static_dir, path)
+            return send_from_directory(static_dir, "index.html")
 
     return app

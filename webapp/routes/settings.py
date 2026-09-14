@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
@@ -15,6 +16,11 @@ from ..answer_connection import (
     normalize_completion_url,
 )
 from ..models import AnswerConnection, RuntimeSettings
+from .tasks import (
+    answer_fingerprint,
+    invalidate_answer_test,
+    record_answer_test,
+)
 
 
 settings = Blueprint("settings", __name__, url_prefix="/api/settings")
@@ -61,6 +67,50 @@ def _answer_service() -> AnswerConnectionService:
 
 def _error(message: str, code: str, status_code: int):
     return jsonify(status=False, msg=message, code=code), status_code
+
+
+def _tasks_in_use() -> bool:
+    """Return whether any process-local task can observe shared settings.
+
+    Settings are global to the process and are captured by a task at startup.
+    Mutating them while a task is running would make the UI's settings appear
+    to change underneath an active run, so all such mutations are rejected at
+    one manager boundary.  Draft connection tests intentionally do not call
+    this helper because they never mutate the saved connection.
+    """
+
+    services = _services()
+    manager = services.get("task_manager")
+    if manager is None:
+        return False
+    list_tasks = getattr(manager, "list_tasks", None)
+    if not callable(list_tasks):
+        return False
+    try:
+        snapshots = list_tasks()
+    except Exception:
+        return False
+    def is_active(snapshot: Any) -> bool:
+        state = (
+            snapshot.get("state")
+            if isinstance(snapshot, Mapping)
+            else getattr(snapshot, "state", None)
+        )
+        return state in {"running", "stopping"}
+
+    return any(is_active(snapshot) for snapshot in snapshots)
+
+
+def _settings_in_use_error():
+    return _error("Settings are in use by an active task", "settings_in_use", 409)
+
+
+def _settings_boundary():
+    """Serialize a settings mutation with task admission when available."""
+
+    manager = _services().get("task_manager")
+    lock = getattr(manager, "lock", None)
+    return lock if lock is not None else nullcontext()
 
 
 def _json_mapping() -> Mapping[str, Any] | None:
@@ -192,6 +242,8 @@ def get_answer_connection():
 
 @settings.put("/answer-connection")
 def put_answer_connection():
+    if _tasks_in_use():
+        return _settings_in_use_error()
     payload = _json_mapping()
     if payload is None:
         return _error(
@@ -201,11 +253,15 @@ def put_answer_connection():
         )
     try:
         values = _answer_payload(payload)
-        connection = _services()["store"].save_answer_connection(**values)
-        service = _answer_service()
-        refresh = getattr(service, "refresh_semaphore", None)
-        if callable(refresh):
-            refresh()
+        with _settings_boundary():
+            if _tasks_in_use():
+                return _settings_in_use_error()
+            connection = _services()["store"].save_answer_connection(**values)
+            invalidate_answer_test()
+            service = _answer_service()
+            refresh = getattr(service, "refresh_semaphore", None)
+            if callable(refresh):
+                refresh()
     except (TypeError, ValueError):
         return _error(
             "Invalid answer connection settings",
@@ -217,7 +273,11 @@ def put_answer_connection():
 
 @settings.delete("/answer-connection/key")
 def delete_answer_key():
-    connection = _services()["store"].clear_answer_key()
+    with _settings_boundary():
+        if _tasks_in_use():
+            return _settings_in_use_error()
+        connection = _services()["store"].clear_answer_key()
+        invalidate_answer_test()
     return jsonify(status=True, data=_connection_data(connection))
 
 
@@ -279,6 +339,18 @@ def test_answer_connection():
             )
         else:
             return _error("Answer API is unavailable", "answer_unavailable", 502)
+    # Only a successful probe of the currently saved, resolved connection can
+    # authorize an answer-enabled task.  Drafts with a request-only key are
+    # still fully supported for connection testing, but their key is never
+    # persisted or considered a test of the saved connection.
+    try:
+        saved = _services()["store"].resolve_answer_connection()
+        same_saved_connection = answer_fingerprint(draft) == answer_fingerprint(saved)
+    except Exception:
+        saved = None
+        same_saved_connection = False
+    if same_saved_connection:
+        record_answer_test(saved, status="success" if result.ok else "failed")
     if result.ok:
         return jsonify(status=True, data=result.as_dict())
     return _error(
@@ -299,11 +371,24 @@ def get_runtime_settings():
 
 @settings.put("/runtime")
 def put_runtime_settings():
+    if _tasks_in_use():
+        return _settings_in_use_error()
     payload = _json_mapping()
     if payload is None or set(payload) - _RUNTIME_FIELDS:
         return _error("Invalid runtime settings", "invalid_runtime", 400)
     try:
-        runtime = _services()["store"].save_runtime_settings(**dict(payload))
+        with _settings_boundary():
+            if _tasks_in_use():
+                return _settings_in_use_error()
+            runtime = _services()["store"].save_runtime_settings(**dict(payload))
+            manager = _services().get("task_manager")
+            resize = getattr(manager, "set_max_active_accounts", None)
+            if callable(resize):
+                resize(runtime.max_active_accounts)
+            elif manager is not None:
+                # Compatibility for a tiny injected manager double.  The
+                # guard above guarantees no active run is using old limits.
+                manager.max_active_accounts = runtime.max_active_accounts
     except (TypeError, ValueError):
         return _error("Invalid runtime settings", "invalid_runtime", 400)
     return jsonify(

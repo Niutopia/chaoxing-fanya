@@ -414,6 +414,29 @@ class TaskManager:
     def semaphore(self) -> threading.BoundedSemaphore:
         return self._active_slots
 
+    def set_max_active_accounts(self, value: int) -> None:
+        """Apply a new active-account limit at an idle settings boundary.
+
+        The HTTP settings route rejects mutations while tasks are active, so
+        replacing the semaphore here cannot strand an in-flight permit.  The
+        lock still makes direct integrations deterministic and keeps a future
+        caller from racing a start operation.
+        """
+
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 10
+        ):
+            raise ValueError("max_active_accounts must be between 1 and 10")
+        with self._lock:
+            if self.active_by_account:
+                raise TaskManagerError(
+                    "cannot change active-account limit while tasks are running"
+                )
+            self.max_active_accounts = value
+            self._active_slots = threading.BoundedSemaphore(value)
+
     def _lookup(self, task_id: str) -> _TaskRuntime:
         record = self._tasks.get(str(task_id))
         if record is None:
@@ -434,6 +457,8 @@ class TaskManager:
         preferences: AccountPreferences,
         auth: AccountAuth,
         answer: ResolvedAnswerConnection | None = None,
+        *,
+        answer_semaphore: threading.Semaphore | None | object = _UNSET,
     ) -> TaskSnapshot:
         """Admit and asynchronously start one account-owned study task."""
 
@@ -448,6 +473,11 @@ class TaskManager:
         copied_preferences = _account_preferences(preferences)
         copied_auth = _account_auth(auth)
         copied_answer = _answer_connection(answer)
+        task_answer_semaphore = (
+            self.answer_semaphore
+            if answer_semaphore is _UNSET
+            else answer_semaphore
+        )
 
         with self._lock:
             if account in self.active_by_account:
@@ -465,7 +495,7 @@ class TaskManager:
                 preferences=copied_preferences,
                 auth=copied_auth,
                 answer=copied_answer,
-                answer_semaphore=self.answer_semaphore,
+                answer_semaphore=task_answer_semaphore,
                 cancel_event=threading.Event(),
                 reporter=reporter,
             )

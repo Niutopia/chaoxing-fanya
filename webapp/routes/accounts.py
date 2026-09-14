@@ -262,7 +262,16 @@ def _profile(account_id: str):
 
 
 def _active(account_id: str) -> bool:
-    guard = _services().get("task_guard") or NoopTaskGuard()
+    services = _services()
+    # ``create_app`` wires the process-local TaskManager as the guard.  Keep
+    # the separately named extension as an integration seam for older route
+    # tests/custom hosts, but fall back to the real manager whenever a host
+    # did not provide a guard explicitly.
+    guard = services.get("task_guard")
+    manager = services.get("task_manager")
+    if guard is None or isinstance(guard, NoopTaskGuard):
+        guard = manager
+    guard = guard or NoopTaskGuard()
     has_active = getattr(guard, "has_active_task", None)
     return bool(has_active(str(account_id))) if callable(has_active) else False
 
