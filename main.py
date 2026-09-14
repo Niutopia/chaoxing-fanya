@@ -2,6 +2,7 @@
 import argparse
 import configparser
 import enum
+from functools import partial
 import sys
 import threading
 import time
@@ -192,8 +193,16 @@ def init_chaoxing(common_config, tiku_config):
     # 获取AI题库并发配置（仅在使用AI题库时生效）
     ai_concurrency = tiku_config.get("ai_concurrency")
     
-    # 为当前账号创建独立的 HTTP 会话，并保留 CLI 的 cookie 文件行为
-    initial_cookies = load_cookie_file()
+    # 为当前账号创建独立的 HTTP 会话，并保留 CLI 的 cookie 文件行为。
+    # CLI 未提供 cookie_path 时继续读写默认 cookies.txt；Web 调用方可
+    # 传入账号专属路径，避免不同账号共享该文件。
+    cookie_path = common_config.get("cookie_path")
+    if cookie_path is None:
+        initial_cookies = load_cookie_file()
+        cookie_update_callback = save_cookie_file
+    else:
+        initial_cookies = load_cookie_file(cookie_path)
+        cookie_update_callback = partial(save_cookie_file, path=cookie_path)
     session = build_session(initial_cookies)
     chaoxing = Chaoxing(
         account=account,
@@ -201,7 +210,7 @@ def init_chaoxing(common_config, tiku_config):
         query_delay=query_delay,
         ai_concurrency=ai_concurrency,
         session=session,
-        cookie_update_callback=save_cookie_file,
+        cookie_update_callback=cookie_update_callback,
     )
     
     return chaoxing

@@ -1,5 +1,6 @@
 import os
 import sys
+from functools import partial
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import threading
@@ -14,8 +15,9 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 STATIC_DIR = os.path.join(SCRIPT_DIR, "web", "dist")
 
-from api.base import Chaoxing, Account, StudyResult
+from api.base import Chaoxing, Account, StudyResult, build_session
 from api.answer import Tiku
+from api.cookies import account_cookie_path, load_cookie_file, save_cookie_file
 from api.exceptions import LoginError
 from api.logger import logger
 import main as main_module
@@ -64,6 +66,20 @@ log_queue = queue.Queue()
 # 任务详细信息缓存
 task_details: Dict[str, dict] = {}
 
+
+def _build_legacy_web_chaoxing(account: Account, tiku: Tiku) -> Chaoxing:
+    """Build an account-scoped Chaoxing client for legacy Web endpoints."""
+
+    cookie_path = account_cookie_path(account.username)
+    session = build_session(load_cookie_file(cookie_path))
+    return Chaoxing(
+        account=account,
+        tiku=tiku,
+        query_delay=0,
+        session=session,
+        cookie_update_callback=partial(save_cookie_file, path=cookie_path),
+    )
+
 class LogCapture:
     """捕获日志输出"""
     def __init__(self, task_id: str):
@@ -97,7 +113,7 @@ def login():
         
         account = Account(username, password)
         tiku = Tiku()
-        chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=0)
+        chaoxing = _build_legacy_web_chaoxing(account, tiku)
         
         login_result = chaoxing.login(login_with_cookies=use_cookies)
         
@@ -128,7 +144,7 @@ def get_courses():
         
         account = Account(username, password)
         tiku = Tiku()
-        chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=0)
+        chaoxing = _build_legacy_web_chaoxing(account, tiku)
         
         login_result = chaoxing.login(login_with_cookies=use_cookies)
         if not login_result['status']:
@@ -229,7 +245,10 @@ def start_study():
             'speed': min(2.0, max(1.0, speed)),
             'jobs': jobs,
             'notopen_action': notopen_action,
-            'use_cookies': False
+            'use_cookies': False,
+            # Keep the legacy background task's cookie jar isolated by user;
+            # main.init_chaoxing still uses the shared path for CLI callers.
+            'cookie_path': account_cookie_path(username)
         }
         
         # 在后台线程中运行学习任务
