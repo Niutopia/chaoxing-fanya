@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,6 +18,7 @@ from webapp import create_app
 from webapp.crypto import SecretBox
 from webapp.store import SQLiteStore
 from api.answer import AI
+from api.logger import logger
 
 
 @pytest.mark.parametrize(
@@ -278,3 +280,35 @@ def test_injected_ai_semaphore_gates_simultaneous_provider_requests():
         assert second.result(timeout=2) == "A"
     for provider in providers:
         provider._httpx_client.close()
+
+
+def test_ai_completion_error_never_logs_response_body_secret():
+    response_secret = "upstream-reflected-answer-api-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"error": {"message": response_secret}},
+        )
+
+    provider = AI()
+    provider._httpx_client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider.key = "request-bearer-secret"
+    provider.model = "test-model"
+    provider.endpoint = "http://answer.invalid/v1/chat/completions"
+    provider.min_interval_seconds = 0
+    provider.max_retries = 1
+    provider.retry_delay = 0
+
+    visible_logs = io.StringIO()
+    sink_id = logger.add(visible_logs, format="{message}", level="TRACE")
+    try:
+        result = provider._invoke_completion(
+            [{"role": "user", "content": "question"}],
+        )
+    finally:
+        logger.remove(sink_id)
+        provider._httpx_client.close()
+
+    assert result is None
+    assert response_secret not in visible_logs.getvalue()

@@ -123,8 +123,13 @@ class CacheDAO:
             if self._lock is None:
                 self._lock = threading.RLock()
                 self._lock_registry[self.cache_file] = self._lock
-        if not self.cache_file.is_file():
-            self._write_cache({})
+        # Serialize the existence check and first write with all other DAO
+        # instances for this resolved path.  A constructor must not observe a
+        # missing file, then let another task populate it before overwriting
+        # that answer with an empty cache.
+        with self._lock:
+            if not self.cache_file.is_file():
+                self._write_cache({})
 
     def _read_cache(self) -> dict:
         # 新增缓存文件读取的异常处理
@@ -974,6 +979,8 @@ class AI(Tiku):
             return None
         last_error = None
         for attempt in range(1, self.max_retries + 1):
+            error_category = "request_error"
+            rate_limited = False
             try:
                 # 全局并发控制：限制同时在请求中的题目数量
                 sem = self._request_semaphore
@@ -998,11 +1005,14 @@ class AI(Tiku):
                     if sem is not None:
                         sem.release()
                 if response.status_code != 200:
-                    try:
-                        err_body = response.json()
-                    except Exception:
-                        err_body = response.text[:200]
-                    raise RuntimeError(f"Error code: {response.status_code} - {err_body}")
+                    if response.status_code == 429:
+                        rate_limited = True
+                        error_category = "rate_limit"
+                    else:
+                        error_category = f"http_{response.status_code}"
+                    # Never include upstream response JSON/text here: a
+                    # hostile provider can reflect the bearer key in either.
+                    raise RuntimeError("AI completion request failed")
 
                 data = response.json()
                 raw_content = data["choices"][0]["message"]["content"] or ""
@@ -1036,7 +1046,7 @@ class AI(Tiku):
                     try:
                         payload = json.loads(json_candidate_stripped)
                         answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
-                    except json.JSONDecodeError as json_exc:
+                    except json.JSONDecodeError:
                         payload = None
                         candidate_fixed = json_candidate_stripped
                         # 针对形如 {'Answer': ['输入/输出']} 的内容，尝试将单引号替换为双引号后再次解析
@@ -1049,9 +1059,7 @@ class AI(Tiku):
                         if payload is not None:
                             answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
                         else:
-                            logger.warning(
-                                f"AI大模型返回内容不是标准JSON，将按纯文本处理: {json_exc}; candidate={json_candidate_stripped[:200]!r}"
-                            )
+                            logger.warning("AI大模型返回内容不是标准JSON，将按纯文本处理")
                             answers = _ensure_answer_list(base_text)
                 else:
                     # 没有可用的 JSON 片段，直接按纯文本处理
@@ -1066,16 +1074,23 @@ class AI(Tiku):
                     return None
                 return "\n".join(answers).strip()
             except Exception as exc:
-                last_error = exc
-                msg = str(exc)
-                if "429" in msg or "rate limit" in msg.lower():
+                if not rate_limited:
+                    if isinstance(exc, httpx.TimeoutException):
+                        error_category = "timeout"
+                    elif isinstance(exc, (json.JSONDecodeError, KeyError, TypeError, ValueError)):
+                        error_category = "invalid_response"
+                    elif isinstance(exc, httpx.HTTPError):
+                        error_category = "http_error"
+                safe_error = f"AI completion request failed ({error_category})"
+                last_error = safe_error
+                if rate_limited:
                     cool_down = max(self.min_interval_seconds * 2, 5)
                     logger.warning(
-                        f"AI大模型请求失败 ({attempt}/{self.max_retries}) 且触发限流，将休眠 {cool_down:.2f} 秒: {exc}"
+                        f"AI大模型请求失败 ({attempt}/{self.max_retries}) 且触发限流，将休眠 {cool_down:.2f} 秒: {safe_error}"
                     )
                     time.sleep(cool_down)
                 else:
-                    logger.warning(f"AI大模型请求失败 ({attempt}/{self.max_retries}): {exc}")
+                    logger.warning(f"AI大模型请求失败 ({attempt}/{self.max_retries}): {safe_error}")
                     time.sleep(self.retry_delay * attempt)
         logger.error(f"AI大模型连续失败，最后错误: {last_error}")
         return None
