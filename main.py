@@ -21,7 +21,7 @@ from typing import Any
 
 from tqdm import tqdm
 
-from api.answer import Tiku
+from api.answer import AI, Tiku
 from api.base import Chaoxing, Account, StudyResult, build_session
 from api.exceptions import LoginError, InputFormatError
 from api.logger import logger
@@ -169,7 +169,12 @@ def init_config():
         return build_config_from_args(args)
 
 
-def init_chaoxing(common_config, tiku_config):
+def init_chaoxing(
+    common_config,
+    tiku_config,
+    *,
+    answer_semaphore: threading.Semaphore | None = None,
+):
     """初始化超星实例"""
     username = common_config.get("username", "")
     password = common_config.get("password", "")
@@ -186,6 +191,8 @@ def init_chaoxing(common_config, tiku_config):
     tiku = Tiku()
     tiku.config_set(tiku_config)  # 载入配置
     tiku = tiku.get_tiku_from_config()  # 载入题库
+    if isinstance(tiku, AI) and answer_semaphore is not None:
+        tiku.set_request_semaphore(answer_semaphore)
     tiku.init_tiku()  # 初始化题库
     
     # 获取查询延迟设置

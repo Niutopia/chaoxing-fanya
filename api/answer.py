@@ -110,10 +110,19 @@ class CacheDAO:
     @Reference: https://github.com/SocialSisterYi/xuexiaoyi-to-xuexitong-tampermonkey-proxy
     """
     DEFAULT_CACHE_FILE = "cache.json"
+    _lock_registry: dict[Path, threading.RLock] = {}
+    _lock_registry_guard = threading.Lock()
 
     def __init__(self, file: str = DEFAULT_CACHE_FILE):
-        self.cache_file = Path(file)
-        self._lock = threading.RLock()
+        self.cache_file = Path(file).resolve()
+        # A provider is created once per account, but concurrent Web account
+        # tasks create separate CacheDAO instances.  Resolve the path before
+        # looking up the lock so relative/absolute aliases still coordinate.
+        with self._lock_registry_guard:
+            self._lock = self._lock_registry.get(self.cache_file)
+            if self._lock is None:
+                self._lock = threading.RLock()
+                self._lock_registry[self.cache_file] = self._lock
         if not self.cache_file.is_file():
             self._write_cache({})
 
@@ -125,7 +134,8 @@ class CacheDAO:
                     return {}
                 try:
                     with self.cache_file.open("r", encoding="utf8") as fp:
-                        return json.load(fp)
+                        value = json.load(fp)
+                        return value if isinstance(value, dict) else {}
                 except json.JSONDecodeError as e:
                     logger.error(f"缓存文件 JSON 解析失败: {e}, 尝试恢复...")
                     # 尝试从原始二进制中以 utf-8 忽略错误地恢复有效 JSON 段
@@ -136,7 +146,8 @@ class CacheDAO:
                         end = text.rfind('}')
                         if start != -1 and end != -1 and start < end:
                             try:
-                                return json.loads(text[start:end+1])
+                                value = json.loads(text[start:end+1])
+                                return value if isinstance(value, dict) else {}
                             except Exception:
                                 pass
                     except Exception:
@@ -159,7 +170,8 @@ class CacheDAO:
                         end = text.rfind('}')
                         if start != -1 and end != -1 and start < end:
                             try:
-                                return json.loads(text[start:end+1])
+                                value = json.loads(text[start:end+1])
+                                return value if isinstance(value, dict) else {}
                             except Exception:
                                 pass
                     except Exception:
@@ -226,6 +238,7 @@ class Tiku:
         self._name = None
         self._api = None
         self._conf = None
+        self._cache: Optional[CacheDAO] = None
 
     @property
     def name(self):
@@ -263,6 +276,14 @@ class Tiku:
             return
 
         conf = self._conf
+
+        # Construct one cache per provider and reuse it for every question.
+        # Web callers provide a persistent data-directory path; CLI callers
+        # retain the historical relative ``cache.json`` default.
+        cache_file = conf.get("cache_file") if hasattr(conf, "get") else None
+        self._cache = CacheDAO(
+            str(cache_file) if cache_file else CacheDAO.DEFAULT_CACHE_FILE
+        )
 
         # 设置提交模式（缺省为不直接提交）
         submit_val = str(conf.get('submit', 'false')).strip().lower()
@@ -324,8 +345,13 @@ class Tiku:
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
         logger.debug(f"处理后标题：{q_info['title']}")
 
-        # 先过缓存
-        cache_dao = CacheDAO()
+        # 先过缓存。 ``init_tiku`` creates the DAO once, while this lazy
+        # fallback keeps direct/legacy callers compatible when they query a
+        # provider without explicitly initializing it first.
+        cache_dao = self._cache
+        if cache_dao is None:
+            cache_dao = CacheDAO()
+            self._cache = cache_dao
         answer = cache_dao.get_cache(q_info['title'])
         if answer:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
@@ -847,7 +873,10 @@ class TikuAdapter(Tiku):
 class AI(Tiku):
     """AI大模型答题实现，带重试与更鲁棒的解析"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        request_semaphore: Optional[threading.Semaphore] = None,
+    ) -> None:
         super().__init__()
         self.name = 'AI大模型答题'
         self.last_request_time = None
@@ -862,7 +891,8 @@ class AI(Tiku):
         self._interval_lock = threading.Lock()
         # 全局并发控制：限制同一 AI 客户端同时在请求中的题目数量
         self.max_active_requests: int = 3
-        self._request_semaphore: Optional[threading.Semaphore] = None
+        self._request_semaphore: Optional[threading.Semaphore] = request_semaphore
+        self._injected_request_semaphore = request_semaphore
         # 精简提示词：直接输出 JSON，禁止多余内容
         self._system_prompts = {
             "single": (
@@ -886,6 +916,22 @@ class AI(Tiku):
                 "格式：{\"Answer\": [\"答案\"]}"
             ),
         }
+
+    def set_request_semaphore(
+        self, semaphore: Optional[threading.Semaphore]
+    ) -> None:
+        """Inject the process-wide answer gate used by Web account tasks."""
+
+        self._injected_request_semaphore = semaphore
+        self._request_semaphore = semaphore
+
+    @property
+    def request_semaphore(self) -> Optional[threading.Semaphore]:
+        return self._request_semaphore
+
+    @request_semaphore.setter
+    def request_semaphore(self, semaphore: Optional[threading.Semaphore]) -> None:
+        self.set_request_semaphore(semaphore)
 
     def _build_client(self):
         httpx_kwargs = {"timeout": self.timeout}
@@ -1056,7 +1102,10 @@ class AI(Tiku):
             self.max_active_requests = 3
         if self.max_active_requests < 1:
             self.max_active_requests = 1
-        self._request_semaphore = threading.Semaphore(self.max_active_requests)
+        if self._injected_request_semaphore is None:
+            self._request_semaphore = threading.Semaphore(self.max_active_requests)
+        else:
+            self._request_semaphore = self._injected_request_semaphore
         self._build_client()
 
 
