@@ -268,6 +268,111 @@ test('clears an account preference error after a successful retry', async () => 
   expect(screen.queryByText('账户偏好保存失败')).not.toBeInTheDocument()
 })
 
+test('preserves edits and invalidates a probe when save completes', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  let resolveProbe
+  let probePayload
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
+    resolveSave = resolve
+  }))
+  testAnswerConnection.mockImplementation((payload) => {
+    probePayload = payload
+    return new Promise((resolve) => {
+      resolveProbe = resolve
+    })
+  })
+
+  renderPage()
+  const model = await screen.findByLabelText('模型')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+  await user.clear(model)
+  await user.type(model, 'edited-during-save')
+  await user.click(screen.getByRole('button', { name: '测试连接' }))
+  expect(probePayload).toEqual(expect.objectContaining({ model: 'edited-during-save' }))
+
+  resolveSave({ model: 'saved-response-model' })
+  await screen.findByText('连接设置已保存')
+  resolveProbe({ ok: true, model_found: true })
+
+  await waitFor(() => {
+    expect(model).toHaveValue('edited-during-save')
+    expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
+  })
+  expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
+})
+
+test('invalidates a probe started while API key clear is in flight', async () => {
+  const user = userEvent.setup()
+  let resolveClear
+  let resolveProbe
+  clearAnswerKey.mockImplementation(() => new Promise((resolve) => {
+    resolveClear = resolve
+  }))
+  testAnswerConnection.mockImplementation(() => new Promise((resolve) => {
+    resolveProbe = resolve
+  }))
+
+  renderPage()
+  await screen.findByLabelText('模型')
+  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+  await user.click(screen.getByRole('button', { name: '测试连接' }))
+
+  resolveClear({ has_api_key: false })
+  await screen.findByText('API Key 已清除')
+  resolveProbe({ ok: true, model_found: true })
+
+  await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
+  expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
+})
+
+test('clears prior connection success when an account switch load fails', async () => {
+  const user = userEvent.setup()
+  getPreferences
+    .mockResolvedValueOnce({ notification_config: {}, ocr_config: {} })
+    .mockRejectedValueOnce(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage
+        accountId="account-a"
+        accounts={[{ id: 'account-a', name: '账号 A' }, { id: 'account-b', name: '账号 B' }]}
+      />
+    </MemoryRouter>,
+  )
+
+  await screen.findByText('账号 A')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+  await screen.findByText('连接设置已保存')
+  await user.selectOptions(screen.getByLabelText('当前账户'), 'account-b')
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
+  expect(screen.queryByText('连接设置已保存')).not.toBeInTheDocument()
+})
+
+test('scopes connection save and clear confirmations while account error is visible', async () => {
+  const user = userEvent.setup()
+  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
+  saveAnswerConnection.mockResolvedValue({ has_api_key: true, api_key_mask: 'sk-••••••' })
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  await screen.findByRole('alert')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+  const saveConfirmation = await screen.findByText('连接设置已保存')
+  expect(saveConfirmation.closest('details')).not.toBeNull()
+
+  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+  const clearConfirmation = await screen.findByText('API Key 已清除')
+  expect(clearConfirmation.closest('details')).not.toBeNull()
+})
+
 test('does not render notification or OCR secrets and uses endpoint for OCR drafts', async () => {
   const user = userEvent.setup()
   const notificationUrl = 'https://notify.example.invalid/private-url'

@@ -144,41 +144,53 @@ class SQLiteStore:
                     connection.execute(
                         "ALTER TABLE accounts ADD COLUMN auth_mode TEXT NOT NULL DEFAULT 'password'"
                     )
-                if added_auth_mode:
-                    # Before auth_mode existed, cookie-only rows were the
-                    # persisted representation of cookie authentication.  A
-                    # migration must retain that behavior instead of making
-                    # those accounts attempt a blank-password login.
-                    connection.execute(
-                        "UPDATE accounts SET auth_mode = CASE "
-                        "WHEN password_token IS NULL AND cookies_token IS NOT NULL "
-                        "THEN 'cookies' ELSE 'password' END"
+                # Normalize every persisted row, not only databases where the
+                # mode column was newly added.  Older schemas (and a few
+                # early development schemas) may contain an invalid mode or
+                # both encrypted secrets.  Pick a deterministic mode, retain
+                # exactly that mode's material, and invalidate verification
+                # whenever the row is changed.
+                rows = connection.execute(
+                    "SELECT id, password_token, cookies_token, auth_mode, "
+                    "verification_status, last_verified_at FROM accounts"
+                ).fetchall()
+                for row in rows:
+                    raw_mode = row["auth_mode"]
+                    if raw_mode in {"password", "cookies"}:
+                        mode = raw_mode
+                        # A freshly-added column has a default password value;
+                        # infer the old cookie-only representation before
+                        # applying the one-secret invariant.
+                        if (
+                            added_auth_mode
+                            and mode == "password"
+                            and row["password_token"] is None
+                            and row["cookies_token"] is not None
+                        ):
+                            mode = "cookies"
+                    elif row["password_token"] is None and row["cookies_token"] is not None:
+                        mode = "cookies"
+                    else:
+                        mode = "password"
+
+                    password_token = (
+                        row["password_token"] if mode == "password" else None
                     )
-                else:
-                    connection.execute(
-                        "UPDATE accounts SET auth_mode = 'password' "
-                        "WHERE auth_mode IS NULL OR auth_mode NOT IN ('password', 'cookies')"
+                    cookies_token = (
+                        row["cookies_token"] if mode == "cookies" else None
                     )
-                if added_auth_mode:
-                    # Legacy volumes had no mode marker, so rows containing
-                    # both secrets are ambiguous.  The migration chooses the
-                    # password source when one exists and removes the
-                    # incompatible cookie material transactionally; this is a
-                    # credential change and therefore invalidates verification.
-                    now = _utc_now()
-                    connection.execute(
-                        "UPDATE accounts SET cookies_token = NULL, "
-                        "verification_status = 'unverified', last_verified_at = NULL, "
-                        "updated_at = ? WHERE auth_mode = 'password' "
-                        "AND cookies_token IS NOT NULL",
-                        (now,),
+                    changed = (
+                        raw_mode != mode
+                        or row["password_token"] != password_token
+                        or row["cookies_token"] != cookies_token
                     )
+                    if not changed:
+                        continue
                     connection.execute(
-                        "UPDATE accounts SET password_token = NULL, "
-                        "verification_status = 'unverified', last_verified_at = NULL, "
-                        "updated_at = ? WHERE auth_mode = 'cookies' "
-                        "AND password_token IS NOT NULL",
-                        (now,),
+                        "UPDATE accounts SET auth_mode = ?, password_token = ?, "
+                        "cookies_token = ?, verification_status = 'unverified', "
+                        "last_verified_at = NULL, updated_at = ? WHERE id = ?",
+                        (mode, password_token, cookies_token, _utc_now(), row["id"]),
                     )
 
     @staticmethod
@@ -348,23 +360,22 @@ class SQLiteStore:
         auth_mode: Literal["password", "cookies"] | None = None,
     ) -> AccountProfile:
         status = self._validate_verification_status(verification_status)
-        auth_mode_explicit = auth_mode is not None
         if auth_mode is None:
-            # Legacy callers supplied both password and cookies and expected
-            # the existing cookie-login preference.  New callers can make the
-            # choice explicit with auth_mode.
+            # Legacy callers supplied cookies without a mode and expected the
+            # existing cookie-login preference.  The compatibility path still
+            # chooses cookies, but it now persists only that source.
             auth_mode = "cookies" if cookies is not None else "password"
         mode = self._validate_auth_mode(auth_mode)
         account_id = str(uuid.uuid4())
         now = _utc_now()
         password_token = (
             self.secret_box.encrypt(password)
-            if password is not None and (mode == "password" or not auth_mode_explicit)
+            if password is not None and mode == "password"
             else None
         )
         cookies_token = (
             self._encrypt_cookies(cookies)
-            if cookies is not None and (mode == "cookies" or not auth_mode_explicit)
+            if cookies is not None and mode == "cookies"
             else None
         )
         with self._connection() as connection:
@@ -559,6 +570,12 @@ class SQLiteStore:
             ).fetchone()
             if existing is None:
                 return None
+            # Session refreshes are only persisted for cookie-auth accounts.
+            # Password accounts may use an in-memory session for the current
+            # request, but storing its cookies would violate the one-source
+            # invariant and silently create a dual-secret row.
+            if self._validate_auth_mode(existing["auth_mode"] or "password") != "cookies":
+                return self._profile_from_row(existing)
             if token != existing["cookies_token"]:
                 connection.execute(
                     "UPDATE accounts SET cookies_token = ?, updated_at = ? WHERE id = ?",

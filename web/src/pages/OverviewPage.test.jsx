@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
@@ -295,5 +296,35 @@ test('successful enable or disable closes More and restores its trigger focus', 
 
   expect(await screen.findByText('账户已停用')).toBeInTheDocument()
   expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  expect(trigger).toHaveFocus()
+})
+
+test('keeps More menu focus behavior under React StrictMode', async () => {
+  const user = userEvent.setup()
+  renderOverview(
+    <StrictMode>
+      <OverviewPage
+        accounts={[{ id: 'a', name: '张三', enabled: true }]}
+        tasks={[]}
+        loading={false}
+      />
+    </StrictMode>,
+  )
+
+  const trigger = screen.getByRole('button', { name: '张三的更多操作' })
+  await user.click(trigger)
+  expect(screen.getByRole('menuitem', { name: '编辑账户' })).toHaveFocus()
+
+  await user.keyboard('{Escape}')
+  expect(trigger).toHaveFocus()
+
+  await user.click(trigger)
+  await user.click(screen.getByRole('heading', { name: '账户概览' }))
+  expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  expect(trigger).toHaveFocus()
+
+  await user.click(trigger)
+  await user.click(screen.getByRole('menuitem', { name: '停用账户' }))
+  expect(await screen.findByText('账户已停用')).toBeInTheDocument()
   expect(trigger).toHaveFocus()
 })

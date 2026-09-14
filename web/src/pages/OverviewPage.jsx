@@ -122,8 +122,11 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   const hasOpenedRef = useRef(false)
   const mountedRef = useRef(true)
 
-  useEffect(() => () => {
-    mountedRef.current = false
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
   }, [])
 
   useEffect(() => {

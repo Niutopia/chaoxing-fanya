@@ -362,17 +362,20 @@ def test_validation_exception_is_redacted_at_http_boundary(
     client, fake_account_service, store
 ):
     account = store.create_account(
-        "已保存", "100", "original-password", cookies={"sid": "known-cookie"}
+        "已保存",
+        "100",
+        None,
+        auth_mode="cookies",
+        cookies={"sid": "known-cookie"},
     )
     fake_account_service.fail_verification(
         account.id,
-        "password=original-password cookie=_uid=known-cookie",
+        "cookie=_uid=known-cookie",
     )
     response = client.post(f"/api/accounts/{account.id}/verify")
     body_text = response.get_data(as_text=True)
     assert response.status_code == 401
     assert response.get_json()["code"] == "account_invalid"
-    assert "original-password" not in body_text
     assert "known-cookie" not in body_text
 
 
@@ -413,12 +416,12 @@ def test_account_service_uses_fresh_scoped_clients_and_sessions(tmp_path):
 def test_account_service_redacts_login_failure_and_records_invalid(tmp_path):
     store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
     account = store.create_account(
-        "账号", "100", "known-password", cookies={"sid": "known-cookie"}
+        "账号", "100", "known-password", auth_mode="password"
     )
     factory = FakeChaoxingFactory(
         [
             {
-                "login_error": "password=known-password cookie=known-cookie",
+                "login_error": "password=known-password",
             }
         ]
     )
@@ -427,7 +430,6 @@ def test_account_service_redacts_login_failure_and_records_invalid(tmp_path):
     with pytest.raises(AccountValidationError) as error:
         service.verify(account.id)
     assert "known-password" not in str(error.value)
-    assert "known-cookie" not in str(error.value)
     assert store.get_account(account.id).verification_status == "invalid"
 
 

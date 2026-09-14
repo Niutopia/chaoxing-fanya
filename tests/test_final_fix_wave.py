@@ -319,7 +319,7 @@ def test_blank_password_and_cookie_editor_values_preserve_existing_credentials(c
         "账号",
         "user",
         "password",
-        cookies={"sid": "cookie"},
+        auth_mode="password",
         verification_status="valid",
         last_verified_at="2026-09-14T00:00:00+00:00",
     )
@@ -329,8 +329,30 @@ def test_blank_password_and_cookie_editor_values_preserve_existing_credentials(c
     assert cookie_response.status_code == 200
     auth = store.get_account_auth(profile.id)
     assert auth.password == "password"
-    assert auth.cookies == {"sid": "cookie"}
+    assert auth.cookies == {}
     assert store.get_account(profile.id).verification_status == "valid"
+
+    cookie_profile = store.create_account(
+        "Cookie 账号",
+        "cookie-user",
+        None,
+        auth_mode="cookies",
+        cookies={"sid": "cookie"},
+        verification_status="valid",
+        last_verified_at="2026-09-14T00:00:00+00:00",
+    )
+    password_response = client.patch(
+        f"/api/accounts/{cookie_profile.id}", json={"password": ""}
+    )
+    cookie_response = client.patch(
+        f"/api/accounts/{cookie_profile.id}", json={"cookies": ""}
+    )
+    assert password_response.status_code == 200
+    assert cookie_response.status_code == 200
+    cookie_auth = store.get_account_auth(cookie_profile.id)
+    assert cookie_auth.password == ""
+    assert cookie_auth.cookies == {"sid": "cookie"}
+    assert store.get_account(cookie_profile.id).verification_status == "valid"
 
 
 class UnreadableTaskManager:
