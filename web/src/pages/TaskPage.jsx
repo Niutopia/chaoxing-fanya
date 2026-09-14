@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import * as Dialog from '@radix-ui/react-dialog'
 import { ArrowLeft, ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
-import { ApiError } from '../api/client'
 import { cancelTask, getTask, getTaskDetails, getTaskLogs } from '../api/tasks'
 import usePolling from '../hooks/usePolling'
 import Alert from '../components/ui/Alert'
@@ -38,6 +38,111 @@ function scalarNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback
 }
 
+function numericMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.entries(value).reduce((result, [key, item]) => {
+    if (typeof item === 'boolean') return result
+    const number = Number(item)
+    if (Number.isFinite(number)) result[key] = number
+    return result
+  }, {})
+}
+
+function timestampSeconds(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  if (Number.isFinite(number)) return Math.abs(number) > 100000000000 ? number / 1000 : number
+  if (typeof value !== 'string') return null
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed / 1000 : null
+}
+
+function numberFrom(sources, keys) {
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue
+    for (const key of keys) {
+      if (source[key] === undefined || source[key] === null || source[key] === '') continue
+      const number = Number(source[key])
+      if (Number.isFinite(number) && number >= 0) return number
+    }
+  }
+  return null
+}
+
+function isComplete(value) {
+  const state = scalarText(value?.status ?? value?.state)?.toLowerCase()
+  return state === 'completed' || state === 'complete' || state === 'done' || state === 'success' || state === 'succeeded'
+}
+
+function sumChapterValues(courses, selector) {
+  return courses.reduce((sum, course) => sum + courseChapters(course).filter(selector).length, 0)
+}
+
+function aggregateCounts(snapshot, details) {
+  const courses = Array.isArray(details?.courses) ? details.courses : []
+  const jobs = details?.active_jobs && typeof details.active_jobs === 'object'
+    ? Object.values(details.active_jobs).filter((job) => job && typeof job === 'object')
+    : []
+  const sources = [details?.counts, snapshot?.stats]
+  const snapshotTotal = numberFrom([snapshot], ['total'])
+  const courseTotal = numberFrom(sources, ['total_courses', 'courses_total'])
+    ?? (courses.length > 0
+      ? courses.length
+      : (snapshotTotal > 0 ? snapshotTotal : null))
+  let courseCompleted = numberFrom(sources, ['completed_courses', 'courses_completed'])
+  if (courseCompleted === null && courses.length > 0) courseCompleted = courses.filter(isComplete).length
+  if (courseCompleted === null && courseTotal !== null && snapshot?.state === 'completed') courseCompleted = courseTotal
+
+  const chapterTotal = numberFrom(sources, ['total_chapters', 'chapters_total'])
+    ?? (courses.length > 0 ? courses.reduce((sum, course) => sum + courseChapters(course).length, 0) : null)
+  let chapterCompleted = numberFrom(sources, ['completed_chapters', 'chapters_completed'])
+  if (chapterCompleted === null && courses.length > 0) chapterCompleted = sumChapterValues(courses, isComplete)
+  if (chapterCompleted === null && chapterTotal !== null && snapshot?.state === 'completed') chapterCompleted = chapterTotal
+
+  const taskTotal = numberFrom(sources, ['total_tasks', 'tasks_total'])
+    ?? (jobs.length > 0 ? jobs.length : null)
+  let taskCompleted = numberFrom(sources, ['completed_tasks', 'tasks_completed'])
+  if (taskCompleted === null && taskTotal !== null && snapshot?.state === 'completed') taskCompleted = taskTotal
+
+  return {
+    courses: { completed: courseCompleted, total: courseTotal },
+    chapters: { completed: chapterCompleted, total: chapterTotal },
+    tasks: { completed: taskCompleted, total: taskTotal },
+  }
+}
+
+function formatCountValue(value) {
+  if (value === null || value === undefined) return '—'
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)))
+}
+
+function formatCountPair(pair) {
+  if (!pair || (pair.completed === null && pair.total === null)) return '—'
+  return `${formatCountValue(pair.completed)} / ${formatCountValue(pair.total)}`
+}
+
+function elapsedSeconds(snapshot, now = Date.now()) {
+  const explicit = numberFrom([snapshot], ['elapsed_seconds', 'elapsedSeconds', 'duration_seconds', 'durationSeconds'])
+  if (explicit !== null) return Math.round(explicit)
+  const started = timestampSeconds(snapshot?.started_at ?? snapshot?.startedAt)
+  if (started === null) return null
+  const finished = timestampSeconds(snapshot?.finished_at ?? snapshot?.finishedAt)
+  if (finished === null && !ACTIVE_STATES.has(snapshot?.state)) return null
+  const end = finished ?? now / 1000
+  return Math.max(0, Math.round(end - started))
+}
+
+function formatElapsed(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '—'
+  const seconds = Math.max(0, Math.round(Number(value)))
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainder = String(seconds % 60).padStart(2, '0')
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${remainder}`
+    : `${minutes}:${remainder}`
+}
+
 function normalizeSnapshot(value, taskId = '') {
   const source = unwrap(value, ['task', 'snapshot'])
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null
@@ -55,6 +160,7 @@ function normalizeSnapshot(value, taskId = '') {
     error: safeErrorMessage({ message: scalarText(source.error) }, ''),
     started_at: source.started_at ?? source.startedAt ?? null,
     finished_at: source.finished_at ?? source.finishedAt ?? null,
+    stats: numericMap(source.stats ?? source.counts),
   }
 }
 
@@ -231,51 +337,77 @@ function TaskCourseList({ courses, expanded, onToggle }) {
   )
 }
 
-function CancelDialog({ open, accountLabel, courseLabel, pending, error, onOpenChange, onConfirm }) {
-  if (!open) return null
+function CancelDialog({ open, accountLabel, courseLabel, pending, error, triggerRef, onOpenChange, onConfirm }) {
+  const continueRef = useRef(null)
+
   return (
-    <div className="fixed inset-0 z-40 bg-black/25" role="presentation">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="cancel-task-title"
-        aria-describedby="cancel-task-description"
-        className="fixed left-1/2 top-1/2 z-50 w-[min(440px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-separator bg-surface p-5 text-label-primary outline-none"
-      >
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <h2 id="cancel-task-title" className="text-lg font-semibold tracking-tight">确认停止任务</h2>
-            <p id="cancel-task-description" className="mt-1 text-sm leading-5 text-label-secondary">
-              将停止账户“{accountLabel}”正在处理的课程“{courseLabel}”。
-            </p>
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/25" />
+        <Dialog.Content
+          className="fixed left-1/2 top-1/2 z-50 w-[min(440px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-separator bg-surface p-5 text-label-primary outline-none"
+          onOpenAutoFocus={(event) => {
+            event.preventDefault()
+            continueRef.current?.focus()
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            triggerRef?.current?.focus()
+          }}
+          onEscapeKeyDown={(event) => {
+            if (pending) event.preventDefault()
+          }}
+          onPointerDownOutside={(event) => {
+            if (pending) event.preventDefault()
+          }}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <Dialog.Title className="text-lg font-semibold tracking-tight">
+                确认停止任务
+              </Dialog.Title>
+              <Dialog.Description className="mt-1 text-sm leading-5 text-label-secondary">
+                将停止账户“{accountLabel}”正在处理的课程“{courseLabel}”。
+              </Dialog.Description>
+            </div>
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                className="touch-target touch-target-compact inline-flex size-8 shrink-0 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                aria-label="关闭停止确认对话框"
+                disabled={pending}
+              >
+                <X aria-hidden="true" size={17} strokeWidth={1.8} />
+              </button>
+            </Dialog.Close>
           </div>
-          <button
-            type="button"
-            className="touch-target touch-target-compact inline-flex size-8 shrink-0 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            aria-label="关闭停止确认对话框"
-            disabled={pending}
-            onClick={() => onOpenChange(false)}
-          >
-            <X aria-hidden="true" size={17} strokeWidth={1.8} />
-          </button>
-        </div>
-        {error ? <Alert className="mt-4" variant="danger" aria-live="polite">{error}</Alert> : null}
-        <div className="mt-5 flex justify-end gap-2 border-t border-separator pt-4">
-          <Button type="button" variant="ghost" disabled={pending} onClick={() => onOpenChange(false)}>
-            继续运行
-          </Button>
-          <Button type="button" variant="destructive" loading={pending} onClick={onConfirm}>
-            确认停止
-          </Button>
-        </div>
-      </div>
-    </div>
+          {error ? <Alert className="mt-4" variant="danger" aria-live="polite">{error}</Alert> : null}
+          <div className="mt-5 flex justify-end gap-2 border-t border-separator pt-4">
+            <Dialog.Close asChild>
+              <Button ref={continueRef} type="button" variant="ghost" disabled={pending}>
+                继续运行
+              </Button>
+            </Dialog.Close>
+            <Button type="button" variant="destructive" loading={pending} onClick={onConfirm}>
+              确认停止
+            </Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   )
 }
 
 function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const { taskId: routeTaskId } = useParams()
   const taskId = routeTaskId ?? ''
+  const taskGenerationRef = useRef({ taskId, generation: 0 })
+  if (taskGenerationRef.current.taskId !== taskId) {
+    taskGenerationRef.current = {
+      taskId,
+      generation: taskGenerationRef.current.generation + 1,
+    }
+  }
   const [snapshot, setSnapshot] = useState(null)
   const [details, setDetails] = useState({ courses: [], active_jobs: {}, counts: {} })
   const [logs, setLogs] = useState([])
@@ -288,9 +420,13 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const [cancelling, setCancelling] = useState(false)
   const [cancelError, setCancelError] = useState('')
   const [expandedCourses, setExpandedCourses] = useState(() => new Set())
+  const [clockNow, setClockNow] = useState(() => Date.now())
   const cursorRef = useRef(0)
   const seenSequencesRef = useRef(new Set())
   const cancelRequestedRef = useRef(false)
+  const cancelTriggerRef = useRef(null)
+
+  const currentGeneration = taskGenerationRef.current.generation
 
   useEffect(() => {
     setSnapshot(null)
@@ -305,10 +441,17 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     setCancelling(false)
     setCancelError('')
     setExpandedCourses(new Set())
+    setClockNow(Date.now())
     cursorRef.current = 0
     seenSequencesRef.current = new Set()
     cancelRequestedRef.current = false
   }, [taskId])
+
+  useEffect(() => {
+    if (!snapshot || !ACTIVE_STATES.has(snapshot.state)) return undefined
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [snapshot?.state])
 
   const loadSnapshotAndDetails = useCallback(async () => {
     const [snapshotResult, detailsResult] = await Promise.allSettled([
@@ -407,8 +550,14 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const activeJobLabel = currentJobLabel(details.active_jobs)
   const currentVideo = snapshot?.current_task ?? activeJobLabel
   const reconnecting = snapshotError || detailsError || logsError
-  const isStopping = Boolean(snapshot && (snapshot.state === 'stopping' || cancelling || confirmCancel))
+  const isStopping = Boolean(snapshot && (snapshot.state === 'stopping' || cancelling))
   const canCancel = Boolean(snapshot && ACTIVE_STATES.has(snapshot.state) && !notFound)
+  const ownerAccountId = snapshot?.account_id ?? account?.id
+  const launchHref = ownerAccountId
+    ? `/accounts/${encodeURIComponent(ownerAccountId)}/launch`
+    : null
+  const counts = useMemo(() => aggregateCounts(snapshot, details), [snapshot, details])
+  const elapsed = formatElapsed(elapsedSeconds(snapshot, clockNow))
 
   const jobs = useMemo(
     () => Object.entries(details.active_jobs ?? {}).filter(([, job]) => job && typeof job === 'object'),
@@ -426,16 +575,24 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
 
   const handleCancel = async () => {
     if (!canCancel || cancelling || cancelRequestedRef.current) return
+    const requestTaskId = taskId
+    const requestGeneration = currentGeneration
+    const isCurrentRequest = () => (
+      taskGenerationRef.current.taskId === requestTaskId
+      && taskGenerationRef.current.generation === requestGeneration
+    )
     cancelRequestedRef.current = true
     setCancelling(true)
     setCancelError('')
     try {
-      const result = await cancelTask(taskId)
+      const result = await cancelTask(requestTaskId)
+      if (!isCurrentRequest()) return
       const nextSnapshot = normalizeSnapshot(result, taskId) ?? { ...snapshot, state: 'stopping' }
       setSnapshot(nextSnapshot)
       onSnapshot?.(nextSnapshot)
       setConfirmCancel(false)
     } catch (error) {
+      if (!isCurrentRequest()) return
       cancelRequestedRef.current = false
       setCancelling(false)
       if (isNotFound(error)) {
@@ -444,6 +601,8 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       } else {
         setCancelError(safeErrorMessage(error, '停止任务失败，请重试'))
       }
+    } finally {
+      if (!isCurrentRequest()) return
     }
   }
 
@@ -479,6 +638,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
           <TaskStatus state={snapshot.state} />
           {canCancel ? (
             <Button
+              ref={cancelTriggerRef}
               type="button"
               variant="destructive"
               disabled={isStopping}
@@ -489,6 +649,14 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
             >
               {isStopping ? '正在停止' : '停止任务'}
             </Button>
+          ) : null}
+          {TERMINAL_STATES.has(snapshot.state) && launchHref ? (
+            <Link
+              to={launchHref}
+              className="touch-target touch-target-compact inline-flex min-h-9 items-center rounded-md px-2.5 text-sm text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            >
+              返回课程启动
+            </Link>
           ) : null}
         </div>
       </header>
@@ -513,6 +681,8 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
               <dd className="min-w-0 truncate text-right font-medium">{snapshot.current_chapter ?? '—'}</dd>
               <dt className="text-label-secondary">当前视频</dt>
               <dd className="min-w-0 truncate text-right font-medium">{currentVideo ?? '—'}</dd>
+              <dt className="text-label-secondary">已用时间</dt>
+              <dd aria-label="任务已用时间" className="min-w-0 truncate text-right font-medium tabular-nums">{elapsed}</dd>
             </dl>
           </div>
         </section>
@@ -546,6 +716,27 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
         </section>
       </div>
 
+      <section className="mt-6 border-y border-separator bg-surface" aria-labelledby="task-counts-title">
+        <div className="border-b border-separator px-4 py-3">
+          <h2 id="task-counts-title" className="font-semibold">任务统计</h2>
+          <p className="mt-0.5 text-xs text-label-secondary">当前账户本次任务的聚合数量。</p>
+        </div>
+        <dl className="grid gap-4 px-4 py-4 sm:grid-cols-3">
+          <div>
+            <dt className="text-xs text-label-secondary">课程</dt>
+            <dd aria-label="已完成课程数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.courses)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-label-secondary">章节</dt>
+            <dd aria-label="已完成章节数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.chapters)}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-label-secondary">任务</dt>
+            <dd aria-label="已完成任务数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.tasks)}</dd>
+          </div>
+        </dl>
+      </section>
+
       <section className="mt-6 border-y border-separator bg-surface" aria-labelledby="task-courses-title">
         <div className="border-b border-separator px-4 py-3">
           <h2 id="task-courses-title" className="font-semibold">课程详情</h2>
@@ -568,6 +759,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
         courseLabel={courseLabel}
         pending={cancelling}
         error={cancelError}
+        triggerRef={cancelTriggerRef}
         onOpenChange={(open) => {
           if (!cancelling) setConfirmCancel(open)
         }}
