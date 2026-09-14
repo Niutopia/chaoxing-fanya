@@ -21,12 +21,13 @@ from typing import Any
 from tqdm import tqdm
 
 from api.answer import Tiku
-from api.base import Chaoxing, Account, StudyResult
+from api.base import Chaoxing, Account, StudyResult, build_session
 from api.exceptions import LoginError, InputFormatError
 from api.logger import logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
+from api.cookies import load_cookie_file, save_cookie_file
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -191,8 +192,17 @@ def init_chaoxing(common_config, tiku_config):
     # 获取AI题库并发配置（仅在使用AI题库时生效）
     ai_concurrency = tiku_config.get("ai_concurrency")
     
-    # 实例化超星API
-    chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=query_delay, ai_concurrency=ai_concurrency)
+    # 为当前账号创建独立的 HTTP 会话，并保留 CLI 的 cookie 文件行为
+    initial_cookies = load_cookie_file()
+    session = build_session(initial_cookies)
+    chaoxing = Chaoxing(
+        account=account,
+        tiku=tiku,
+        query_delay=query_delay,
+        ai_concurrency=ai_concurrency,
+        session=session,
+        cookie_update_callback=save_cookie_file,
+    )
     
     return chaoxing
 
@@ -242,7 +252,8 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
             live = Live(
                 attachment=job,
                 defaults=defaults,
-                course_id=course.get("courseId")
+                course_id=course.get("courseId"),
+                session=chaoxing.session,
             )
             
             # 启动直播处理线程
