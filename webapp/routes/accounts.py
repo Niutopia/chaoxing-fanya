@@ -50,6 +50,42 @@ def _error(message: str, code: str, status_code: int):
     return jsonify(status=False, msg=message, code=code), status_code
 
 
+def _safe_validation_message(account_id: str, error: Exception) -> str:
+    """Redact account secrets before returning a validation error.
+
+    The production AccountService already sanitizes backend messages, but the
+    service is injected at application composition time and may be replaced by
+    another implementation.  Treat its exception text as untrusted at this
+    HTTP boundary too, while retaining useful non-secret diagnostics.
+    """
+
+    fallback = "Account validation failed"
+    try:
+        message = str(error).strip()
+    except Exception:
+        return fallback
+    if not message:
+        return fallback
+
+    try:
+        auth = _services()["store"].get_account_auth(str(account_id))
+    except Exception:
+        return fallback
+    if auth is None:
+        return fallback
+
+    secrets: list[str] = []
+    password = getattr(auth, "password", None)
+    if password:
+        secrets.append(str(password))
+    cookies = getattr(auth, "cookies", {})
+    if isinstance(cookies, Mapping):
+        secrets.extend(str(value) for value in cookies.values() if value)
+    for secret in secrets:
+        message = message.replace(secret, "[redacted]")
+    return message or fallback
+
+
 def _account_data(profile) -> dict[str, Any]:
     """Serialize only the intentionally public account-profile fields."""
 
@@ -143,9 +179,11 @@ def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, 
         password = payload["password"]
         if password is not None and not isinstance(password, str):
             raise ValueError("invalid account password")
-        # ``None`` is treated as no replacement, matching the store's
-        # encrypted-secret retention behavior for partial updates.
-        values["password"] = password
+        # Empty secret fields mean "keep the existing value" in the edit UI.
+        # Omitting the field is also important for the active-task guard: a
+        # blank-password PATCH is not a credential mutation.
+        if isinstance(password, str) and password.strip():
+            values["password"] = password
     if "cookies" in payload:
         values["cookies"] = _parse_cookies(payload["cookies"])
     if "enabled" in payload:
@@ -338,7 +376,9 @@ def verify_account(account_id: str):
     except KeyError:
         return _error("Account not found", "account_not_found", 404)
     except AccountValidationError as exc:
-        return _error(str(exc), "account_invalid", 401)
+        return _error(
+            _safe_validation_message(account_id, exc), "account_invalid", 401
+        )
     except AccountServiceError:
         return _error("Account validation failed", "account_invalid", 401)
     return jsonify(status=True, data=_account_data(profile))
@@ -367,7 +407,9 @@ def get_courses(account_id: str):
     except KeyError:
         return _error("Account not found", "account_not_found", 404)
     except AccountValidationError as exc:
-        return _error(str(exc), "account_invalid", 401)
+        return _error(
+            _safe_validation_message(account_id, exc), "account_invalid", 401
+        )
     except CourseRetrievalError:
         return _error("Course retrieval failed", "courses_unavailable", 502)
     except AccountServiceError:

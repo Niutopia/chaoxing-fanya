@@ -11,6 +11,15 @@ from dataclasses import replace
 
 import pytest
 
+from webapp.account_service import (
+    AccountService,
+    AccountValidationError,
+    CourseRetrievalError,
+)
+from webapp.crypto import SecretBox
+from webapp.store import SQLiteStore
+
+
 class FakeTaskGuard:
     def __init__(self) -> None:
         self.active_account_ids: set[str] = set()
@@ -55,6 +64,51 @@ class FakeAccountService:
         courses = [{"id": f"course-{account_id}", "title": "测试课程"}]
         self._courses[account_id] = list(courses)
         return courses
+
+
+class FakeSession:
+    def __init__(self, cookies):
+        self.cookies = dict(cookies)
+
+
+class FakeChaoxingClient:
+    """Deterministic Chaoxing double used by real AccountService tests."""
+
+    def __init__(self, auth, cookie_update_callback, plan):
+        self.auth = auth
+        self.cookie_update_callback = cookie_update_callback
+        self.session = FakeSession(auth.cookies)
+        self.plan = dict(plan)
+        self.login_calls: list[bool] = []
+
+    def login(self, login_with_cookies=False):
+        self.login_calls.append(login_with_cookies)
+        if "login_exception" in self.plan:
+            raise RuntimeError(self.plan["login_exception"])
+        if "login_error" in self.plan:
+            return {"status": False, "msg": self.plan["login_error"]}
+        updated_cookies = self.plan.get("updated_cookies")
+        if updated_cookies is not None:
+            self.session.cookies.update(updated_cookies)
+            self.cookie_update_callback(dict(self.session.cookies))
+        return {"status": True, "msg": "ok"}
+
+    def get_course_list(self):
+        if "course_exception" in self.plan:
+            raise RuntimeError(self.plan["course_exception"])
+        return list(self.plan.get("courses", []))
+
+
+class FakeChaoxingFactory:
+    def __init__(self, plans):
+        self.plans = list(plans)
+        self.clients: list[FakeChaoxingClient] = []
+
+    def __call__(self, *, auth, cookie_update_callback):
+        plan = self.plans.pop(0) if self.plans else {}
+        client = FakeChaoxingClient(auth, cookie_update_callback, plan)
+        self.clients.append(client)
+        return client
 
 
 @pytest.fixture
@@ -153,6 +207,14 @@ def test_patch_without_password_preserves_secret(client, store, saved_account):
     assert store.get_account_auth(saved_account.id).password == "original-password"
 
 
+def test_patch_with_blank_password_preserves_secret(client, store, saved_account):
+    response = client.patch(
+        f"/api/accounts/{saved_account.id}", json={"password": "   "}
+    )
+    assert response.status_code == 200
+    assert store.get_account_auth(saved_account.id).password == "original-password"
+
+
 def test_course_refresh_bypasses_per_account_cache(
     client, fake_account_service, saved_account
 ):
@@ -183,6 +245,111 @@ def test_edit_active_account_is_rejected(client, task_guard, saved_account, payl
     response = client.patch(f"/api/accounts/{saved_account.id}", json=payload)
     assert response.status_code == 409
     assert response.get_json()["code"] == "account_active"
+
+
+def test_active_account_blank_password_patch_is_a_noop(
+    client, task_guard, store, saved_account
+):
+    task_guard.active_account_ids.add(saved_account.id)
+    response = client.patch(
+        f"/api/accounts/{saved_account.id}", json={"password": "\t  "}
+    )
+    assert response.status_code == 200
+    assert response.get_json()["data"]["name"] == saved_account.name
+    assert store.get_account_auth(saved_account.id).password == "original-password"
+
+
+def test_validation_exception_is_redacted_at_http_boundary(
+    client, fake_account_service, store
+):
+    account = store.create_account(
+        "已保存", "100", "original-password", cookies={"sid": "known-cookie"}
+    )
+    fake_account_service.fail_verification(
+        account.id,
+        "password=original-password cookie=_uid=known-cookie",
+    )
+    response = client.post(f"/api/accounts/{account.id}/verify")
+    body_text = response.get_data(as_text=True)
+    assert response.status_code == 401
+    assert response.get_json()["code"] == "account_invalid"
+    assert "original-password" not in body_text
+    assert "known-cookie" not in body_text
+
+
+def test_account_service_uses_fresh_scoped_clients_and_sessions(tmp_path):
+    store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
+    first = store.create_account(
+        "第一账号", "100", "first-password", cookies={"sid": "first-old"}
+    )
+    second = store.create_account(
+        "第二账号", "200", "second-password", cookies={"sid": "second-old"}
+    )
+    factory = FakeChaoxingFactory(
+        [
+            {"updated_cookies": {"sid": "first-verified"}},
+            {"updated_cookies": {"sid": "first-new"}, "courses": [{"id": "one"}]},
+            {"updated_cookies": {"sid": "second-new"}, "courses": [{"id": "two"}]},
+        ]
+    )
+    service = AccountService(store, factory)
+
+    assert service.verify(first.id).verification_status == "valid"
+    assert service.get_courses(first.id, refresh=True) == [{"id": "one"}]
+    assert service.get_courses(second.id, refresh=True) == [{"id": "two"}]
+    assert len(factory.clients) == 3
+    assert factory.clients[0] is not factory.clients[1]
+    assert factory.clients[0].session is not factory.clients[1].session
+    assert factory.clients[1] is not factory.clients[2]
+    assert factory.clients[1].session is not factory.clients[2].session
+    assert all(client.login_calls == [True] for client in factory.clients)
+    assert store.get_account_auth(first.id).cookies == {"sid": "first-new"}
+    assert store.get_account_auth(second.id).cookies == {"sid": "second-new"}
+
+    factory.clients[0].cookie_update_callback({"sid": "first-only"})
+    assert store.get_account_auth(first.id).cookies == {"sid": "first-only"}
+    assert store.get_account_auth(second.id).cookies == {"sid": "second-new"}
+
+
+def test_account_service_redacts_login_failure_and_records_invalid(tmp_path):
+    store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
+    account = store.create_account(
+        "账号", "100", "known-password", cookies={"sid": "known-cookie"}
+    )
+    factory = FakeChaoxingFactory(
+        [
+            {
+                "login_error": "password=known-password cookie=known-cookie",
+            }
+        ]
+    )
+    service = AccountService(store, factory)
+
+    with pytest.raises(AccountValidationError) as error:
+        service.verify(account.id)
+    assert "known-password" not in str(error.value)
+    assert "known-cookie" not in str(error.value)
+    assert store.get_account(account.id).verification_status == "invalid"
+
+
+def test_account_service_keeps_last_successful_courses_after_refresh_failure(
+    tmp_path,
+):
+    store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
+    account = store.create_account("账号", "100", "password")
+    factory = FakeChaoxingFactory(
+        [
+            {"courses": [{"id": "stable"}]},
+            {"course_exception": "temporary outage"},
+        ]
+    )
+    service = AccountService(store, factory)
+
+    assert service.get_courses(account.id) == [{"id": "stable"}]
+    with pytest.raises(CourseRetrievalError):
+        service.get_courses(account.id, refresh=True)
+    assert service.get_courses(account.id) == [{"id": "stable"}]
+    assert len(factory.clients) == 2
 
 
 @pytest.mark.parametrize("cookies", ["malformed", "=missing-name", "name=ok;broken"])
