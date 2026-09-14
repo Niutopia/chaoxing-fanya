@@ -619,8 +619,8 @@ class SQLiteStore:
             if not isinstance(value, Mapping):
                 value = {}
             return RuntimeSettings(
-                max_active_accounts=int(
-                    value.get("max_active_accounts", RuntimeSettings().max_active_accounts)
+                max_active_accounts=value.get(
+                    "max_active_accounts", RuntimeSettings().max_active_accounts
                 )
             )
 
@@ -646,7 +646,7 @@ class SQLiteStore:
                     max_active_accounts = value.get("max_active_accounts")
             if max_active_accounts is None:
                 max_active_accounts = RuntimeSettings().max_active_accounts
-            resolved = RuntimeSettings(max_active_accounts=int(max_active_accounts))
+            resolved = RuntimeSettings(max_active_accounts=max_active_accounts)
             connection.execute(
                 """
                 INSERT INTO settings (key, value_json) VALUES (?, ?)

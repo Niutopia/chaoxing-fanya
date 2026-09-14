@@ -59,3 +59,10 @@ def test_answer_update_without_new_key_preserves_existing_key(tmp_path):
 def test_runtime_limit_rejects_values_outside_one_to_ten(limit):
     with pytest.raises(ValueError):
         RuntimeSettings(max_active_accounts=limit)
+
+
+@pytest.mark.parametrize("limit", [1.9, True, "3"])
+def test_runtime_store_rejects_non_integer_limits(tmp_path, limit):
+    store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
+    with pytest.raises(ValueError):
+        store.save_runtime_settings(max_active_accounts=limit)
