@@ -6,7 +6,7 @@ methods that need them.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -89,3 +89,61 @@ class RuntimeSettings:
             or not 1 <= self.max_active_accounts <= 10
         ):
             raise ValueError("max_active_accounts must be between 1 and 10")
+
+
+# Task state is deliberately a small closed set.  Keeping the state type in
+# the shared model module lets routes, runners, and the manager agree on the
+# terminal-state semantics without importing implementation details from one
+# another.
+TaskState = Literal["running", "stopping", "completed", "failed", "stopped"]
+
+
+@dataclass(frozen=True)
+class TaskSnapshot:
+    """Public, credential-free view of one task's current state.
+
+    ``stats`` is copied by :mod:`webapp.task_manager` whenever a snapshot is
+    returned.  The dataclass is frozen to make accidental top-level mutation
+    difficult, while nested progress metadata remains convenient for JSON
+    serializers and existing callers.
+    """
+
+    id: str
+    account_id: str
+    state: TaskState
+    progress: int | float = 0
+    total: int | float = 0
+    current_course: str | None = None
+    current_chapter: str | None = None
+    current_task: str | None = None
+    error: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    stats: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TaskDetails:
+    """Public, task-scoped course and active-job detail data."""
+
+    courses: list[dict[str, Any]] = field(default_factory=list)
+    active_jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    counts: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TaskLogEntry:
+    """One ordered log record retained in a task's bounded buffer."""
+
+    sequence: int
+    level: str
+    message: str
+    timestamp: float
+
+
+@dataclass(frozen=True)
+class TaskLogPage:
+    """Cursor response returned by ``TaskManager.get_logs``."""
+
+    items: list[TaskLogEntry] = field(default_factory=list)
+    next_cursor: int = 0
