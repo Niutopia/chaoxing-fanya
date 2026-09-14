@@ -3,6 +3,9 @@ from typing import Any, Mapping
 
 from flask import Flask, jsonify
 
+from .crypto import SecretBox
+from .store import SQLiteStore
+
 
 def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
@@ -17,6 +20,10 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app.config["DATA_DIR"] = Path(app.config["DATA_DIR"])
     app.config["DATABASE_PATH"] = app.config["DATA_DIR"] / "chaoxing-web.sqlite3"
     app.config["DATA_DIR"].mkdir(parents=True, exist_ok=True)
+
+    secret_box = SecretBox(app.config["DATA_DIR"])
+    store = SQLiteStore(app.config["DATABASE_PATH"], secret_box)
+    app.extensions["services"] = {"secret_box": secret_box, "store": store}
 
     @app.get("/api/health")
     def health():
