@@ -205,6 +205,10 @@ The shared answer settings are loaded once per task start. Every account gets it
 
 Per-account policies control whether answers are enabled, coverage threshold, and auto-submit. A shared connection failure does not merge or cancel account tasks. Runtime retries use the configured timeout and retry count. If no answer is available after retries, the question remains unanswered; submission remains subject to the existing coverage threshold and must not proceed below it.
 
+The answer cache is intentionally shared because question answers are not account credentials. Web mode stores it under the persistent data directory. All `CacheDAO` instances resolving to the same file must share one process-wide reentrant lock so concurrent accounts cannot lose or corrupt updates.
+
+Visual OCR configuration remains per account. Web tasks must not mutate `CHAOXING_VISION_OCR_*` environment variables or a process-wide cached provider. Resolve an immutable OCR configuration for each task and re-establish it in every worker thread. CLI mode may continue to read the existing environment variables as its default source.
+
 ## HTTP API
 
 All JSON responses retain the project's envelope:
