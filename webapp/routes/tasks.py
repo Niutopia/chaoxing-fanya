@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any
 
@@ -41,6 +42,18 @@ def _manager() -> TaskManager:
     if manager is None:
         raise RuntimeError("task manager is not configured")
     return manager
+
+
+def _coordination_boundary(manager: Any | None = None):
+    """Return the lock shared by task admission and account mutations."""
+
+    manager = manager or _manager()
+    lock = getattr(manager, "lock", None)
+    if lock is None:
+        lock = _services().get("account_task_lock")
+    if lock is None:
+        lock = current_app.extensions.get("account_task_lock")
+    return lock if callable(getattr(lock, "__enter__", None)) else nullcontext()
 
 
 def _error(message: str, code: str, status_code: int):
@@ -304,87 +317,106 @@ def list_tasks():
 
 @tasks.post("/accounts/<account_id>/tasks")
 def start_task(account_id: str):
+    manager = _manager()
     store = _services()["store"]
-    profile = store.get_account(str(account_id))
-    if profile is None:
-        return _error("Account not found", "account_not_found", 404)
-    if not _profile_enabled(profile):
-        return _error("Account is disabled", "account_disabled", 409)
-
     payload = _json_mapping()
     if payload is None:
         return _error("Invalid task payload", "invalid_task", 400)
     if set(payload) - {"course_ids"}:
         return _error("Invalid task payload", "invalid_task", 400)
-    preferences = store.get_preferences(str(account_id))
-    if preferences is None:
-        return _error("Account not found", "account_not_found", 404)
-    if not _valid_preferences(preferences):
-        return _error("Invalid preferences", "invalid_preferences", 400)
-    try:
-        selected_courses, replace_selection = _course_ids(payload, preferences)
-    except ValueError as exc:
-        code = str(exc)
-        if code not in {"courses_required", "invalid_courses"}:
-            code = "invalid_courses"
-        message = "Courses are required" if code == "courses_required" else "Invalid courses"
-        return _error(message, code, 400)
 
-    if replace_selection:
-        # Persist only the selection from this request.  All other per-account
-        # preferences remain untouched.
-        try:
-            preferences = store.save_preferences(
-                str(account_id), replace(preferences, selected_course_ids=selected_courses)
-            )
-        except (KeyError, TypeError, ValueError):
+    # Account/profile reads, preference persistence, credential resolution,
+    # and manager admission form one transaction-like boundary.  Account
+    # mutations use this same lock, so neither side can observe a half-applied
+    # identity/credential/enabled change.
+    with _coordination_boundary(manager):
+        profile = store.get_account(str(account_id))
+        if profile is None:
+            return _error("Account not found", "account_not_found", 404)
+        if not _profile_enabled(profile):
+            return _error("Account is disabled", "account_disabled", 409)
+
+        preferences = store.get_preferences(str(account_id))
+        if preferences is None:
+            return _error("Account not found", "account_not_found", 404)
+        if not _valid_preferences(preferences):
             return _error("Invalid preferences", "invalid_preferences", 400)
-
-    auth = store.get_account_auth(str(account_id))
-    if isinstance(auth, Mapping):
         try:
-            auth = AccountAuth(**dict(auth))
-        except (TypeError, ValueError):
-            auth = None
-    if auth is None or not isinstance(auth, AccountAuth):
-        return _error("Account credentials are not configured", "account_not_ready", 409)
-    if not auth.password and not auth.cookies:
-        return _error("Account credentials are not configured", "account_not_ready", 409)
+            selected_courses, replace_selection = _course_ids(payload, preferences)
+        except ValueError as exc:
+            code = str(exc)
+            if code not in {"courses_required", "invalid_courses"}:
+                code = "invalid_courses"
+            message = "Courses are required" if code == "courses_required" else "Invalid courses"
+            return _error(message, code, 400)
 
-    ready, answer = _answer_ready(preferences)
-    if not ready:
-        return _error("Answer connection has not been tested", "answer_not_ready", 409)
+        if replace_selection:
+            # Persist only the selection from this request.  All other
+            # per-account preferences remain untouched.
+            try:
+                preferences = store.save_preferences(
+                    str(account_id),
+                    replace(preferences, selected_course_ids=selected_courses),
+                )
+            except (KeyError, TypeError, ValueError):
+                return _error("Invalid preferences", "invalid_preferences", 400)
 
-    manager = _manager()
-    answer_service = _answer_service()
-    get_semaphore = getattr(answer_service, "get_semaphore", None)
-    answer_semaphore = None
-    if callable(get_semaphore):
-        # The application factory wires this at construction time.  Keeping
-        # the assignment here also makes explicitly injected managers obey
-        # the same shared answer gate in tests and embedding integrations.
-        try:
-            answer_semaphore = get_semaphore()
-            manager.answer_semaphore = answer_semaphore
-        except Exception:
-            answer_semaphore = None
-    try:
-        start_values = {
-            "account_id": str(account_id),
-            "course_ids": selected_courses,
-            "preferences": preferences,
-            "auth": auth,
-            "answer": answer,
-        }
+        auth = store.get_account_auth(str(account_id))
+        if isinstance(auth, Mapping):
+            try:
+                auth = AccountAuth(**dict(auth))
+            except (TypeError, ValueError):
+                auth = None
+        if auth is None or not isinstance(auth, AccountAuth):
+            return _error("Account credentials are not configured", "account_not_ready", 409)
+        if not auth.password and not auth.cookies:
+            return _error("Account credentials are not configured", "account_not_ready", 409)
+
+        ready, answer = _answer_ready(preferences)
+        if not ready:
+            return _error("Answer connection has not been tested", "answer_not_ready", 409)
+
+        answer_service = _answer_service()
+        get_semaphore = getattr(answer_service, "get_semaphore", None)
+        answer_semaphore = None
         if callable(get_semaphore):
-            start_values["answer_semaphore"] = answer_semaphore
-        snapshot = manager.start(**start_values)
-    except AccountTaskConflict:
-        return _error("Account has an active task", "account_active", 409)
-    except TaskCapacityReached:
-        return _error("Task limit reached", "task_limit_reached", 409)
-    except (TypeError, ValueError):
-        return _error("Invalid task configuration", "invalid_task", 400)
+            # The application factory wires this at construction time.
+            # Keeping the assignment here also makes explicitly injected
+            # managers obey the same shared answer gate in tests and embedding
+            # integrations.
+            try:
+                answer_semaphore = get_semaphore()
+                manager.answer_semaphore = answer_semaphore
+            except Exception:
+                answer_semaphore = None
+        try:
+            start_values = {
+                "account_id": str(account_id),
+                "course_ids": selected_courses,
+                "preferences": preferences,
+                "auth": auth,
+                "answer": answer,
+                "wait_started": False,
+            }
+            if callable(get_semaphore):
+                start_values["answer_semaphore"] = answer_semaphore
+            snapshot = manager.start(**start_values)
+        except AccountTaskConflict:
+            return _error("Account has an active task", "account_active", 409)
+        except TaskCapacityReached:
+            return _error("Task limit reached", "task_limit_reached", 409)
+        except (TypeError, ValueError):
+            return _error("Invalid task configuration", "invalid_task", 400)
+
+    # Do not wait while holding the boundary: the worker's startup wrapper
+    # acquires the manager lock before signalling its event.  A task that
+    # completed and was evicted by an immediate subsequent run needs no wait.
+    waiter = getattr(manager, "wait_until_started", None)
+    if callable(waiter):
+        try:
+            waiter(snapshot.id)
+        except TaskNotFound:
+            pass
     return jsonify(status=True, data=_snapshot_data(snapshot)), 201
 
 

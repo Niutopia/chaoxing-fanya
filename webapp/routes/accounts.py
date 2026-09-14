@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
@@ -48,6 +49,19 @@ def _services() -> Mapping[str, Any]:
 
 def _error(message: str, code: str, status_code: int):
     return jsonify(status=False, msg=message, code=code), status_code
+
+
+def _coordination_boundary():
+    """Return the lock shared with task-start admission."""
+
+    services = _services()
+    manager = services.get("task_manager")
+    lock = getattr(manager, "lock", None)
+    if lock is None:
+        lock = services.get("account_task_lock")
+    if lock is None:
+        lock = current_app.extensions.get("account_task_lock")
+    return lock if callable(getattr(lock, "__enter__", None)) else nullcontext()
 
 
 def _safe_validation_message(account_id: str, error: Exception) -> str:
@@ -324,9 +338,6 @@ def create_account():
 
 @accounts.patch("/<account_id>")
 def update_account(account_id: str):
-    profile = _profile(account_id)
-    if profile is None:
-        return _error("Account not found", "account_not_found", 404)
     payload = _json_mapping()
     if payload is None:
         return _error("Invalid account payload", "invalid_account", 400)
@@ -335,21 +346,28 @@ def update_account(account_id: str):
     except (TypeError, ValueError):
         return _error("Invalid account payload", "invalid_account", 400)
 
-    if _edit_conflicts_with_active_task(account_id, values):
-        return _error("Account has an active task", "account_active", 409)
+    with _coordination_boundary():
+        profile = _profile(account_id)
+        if profile is None:
+            return _error("Account not found", "account_not_found", 404)
 
-    try:
-        updated = _services()["store"].update_account(str(account_id), **values)
-    except (TypeError, ValueError):
-        return _error("Invalid account payload", "invalid_account", 400)
-    if updated is None:
-        return _error("Account not found", "account_not_found", 404)
-    service = _services().get("account_service")
-    if service is not None and any(key in values for key in ("username", "password", "cookies")):
-        invalidate = getattr(service, "invalidate_courses", None)
-        if callable(invalidate):
-            invalidate(str(account_id))
-    return jsonify(status=True, data=_account_data(updated))
+        if _edit_conflicts_with_active_task(account_id, values):
+            return _error("Account has an active task", "account_active", 409)
+
+        try:
+            updated = _services()["store"].update_account(str(account_id), **values)
+        except (TypeError, ValueError):
+            return _error("Invalid account payload", "invalid_account", 400)
+        if updated is None:
+            return _error("Account not found", "account_not_found", 404)
+        service = _services().get("account_service")
+        if service is not None and any(
+            key in values for key in ("username", "password", "cookies")
+        ):
+            invalidate = getattr(service, "invalidate_courses", None)
+            if callable(invalidate):
+                invalidate(str(account_id))
+        return jsonify(status=True, data=_account_data(updated))
 
 
 @accounts.get("/<account_id>")
@@ -362,17 +380,18 @@ def get_account(account_id: str):
 
 @accounts.delete("/<account_id>")
 def delete_account(account_id: str):
-    if _profile(account_id) is None:
-        return _error("Account not found", "account_not_found", 404)
-    if _active(account_id):
-        return _error("Account has an active task", "account_active", 409)
-    if not _services()["store"].delete_account(str(account_id)):
-        return _error("Account not found", "account_not_found", 404)
-    service = _services().get("account_service")
-    invalidate = getattr(service, "invalidate_courses", None) if service else None
-    if callable(invalidate):
-        invalidate(str(account_id))
-    return "", 204
+    with _coordination_boundary():
+        if _profile(account_id) is None:
+            return _error("Account not found", "account_not_found", 404)
+        if _active(account_id):
+            return _error("Account has an active task", "account_active", 409)
+        if not _services()["store"].delete_account(str(account_id)):
+            return _error("Account not found", "account_not_found", 404)
+        service = _services().get("account_service")
+        invalidate = getattr(service, "invalidate_courses", None) if service else None
+        if callable(invalidate):
+            invalidate(str(account_id))
+        return "", 204
 
 
 @accounts.post("/<account_id>/verify")
@@ -437,18 +456,19 @@ def get_preferences(account_id: str):
 @accounts.put("/<account_id>/preferences")
 def put_preferences(account_id: str):
     store = _services()["store"]
-    current = store.get_preferences(str(account_id))
-    if current is None:
-        return _error("Account not found", "account_not_found", 404)
     payload = _json_mapping()
     if payload is None:
         return _error("Invalid preferences", "invalid_preferences", 400)
-    try:
-        preferences = _preferences_payload(payload, current)
-        saved = store.save_preferences(str(account_id), preferences)
-    except (TypeError, ValueError, KeyError):
-        return _error("Invalid preferences", "invalid_preferences", 400)
-    return jsonify(status=True, data=_preferences_data(saved))
+    with _coordination_boundary():
+        current = store.get_preferences(str(account_id))
+        if current is None:
+            return _error("Account not found", "account_not_found", 404)
+        try:
+            preferences = _preferences_payload(payload, current)
+            saved = store.save_preferences(str(account_id), preferences)
+        except (TypeError, ValueError, KeyError):
+            return _error("Invalid preferences", "invalid_preferences", 400)
+        return jsonify(status=True, data=_preferences_data(saved))
 
 
 __all__ = ["accounts", "NoopTaskGuard"]

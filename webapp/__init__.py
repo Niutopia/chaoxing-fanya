@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 from typing import Any, Mapping
 
 from flask import Flask, jsonify, send_from_directory
@@ -121,6 +122,11 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     # explicitly injected guard for compatibility with route tests and custom
     # integrations; otherwise the real process-local manager owns admission.
     task_guard = app.config.get("TASK_GUARD") or task_manager or NoopTaskGuard()
+    coordination_lock = getattr(task_manager, "lock", None)
+    if coordination_lock is None:
+        coordination_lock = app.config.get("ACCOUNT_TASK_LOCK")
+    if coordination_lock is None:
+        coordination_lock = threading.RLock()
     task_log_sink_id = install_task_log_sink(task_manager)
     app.extensions["services"] = {
         "secret_box": secret_box,
@@ -133,8 +139,10 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
         "answer_service": answer_connection_service,
         "task_guard": task_guard,
         "task_manager": task_manager,
+        "account_task_lock": coordination_lock,
     }
     app.extensions["task_manager"] = task_manager
+    app.extensions["account_task_lock"] = coordination_lock
     app.extensions["task_log_sink_id"] = task_log_sink_id
     # Keep the sink ID discoverable alongside other service extension values
     # for fixture teardown code that only inspects the services mapping.
@@ -153,6 +161,22 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
+
+    # Keep unknown API methods/paths in the JSON API namespace.  Without an
+    # all-methods guard, the GET-only SPA fallback would turn an unknown
+    # ``POST /api/...`` into a method-not-allowed response and make the
+    # frontend catch-all appear to own the API.
+    @app.route(
+        "/api",
+        defaults={"path": ""},
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    @app.route(
+        "/api/<path:path>",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    def api_not_found(path: str):
+        return not_found(None)
 
     # Keep the API namespace outside the SPA catch-all.  This route is
     # deliberately registered after all API blueprints so an unknown API URL

@@ -10,6 +10,7 @@ details object, or log entry.
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 import uuid
@@ -163,10 +164,60 @@ def _config_secret_values(config: Any) -> list[str]:
     return values
 
 
+def _notification_secret_values(config: Any) -> list[str]:
+    """Collect provider values that must not escape a task context.
+
+    Notification settings are intentionally provider-agnostic, so their
+    secret fields are not limited to one fixed schema.  In addition to the
+    usual token/key/secret names, integrations commonly call a destination a
+    URL, endpoint, webhook, or chat ID.  Walk nested provider/alias mappings
+    and collect scalar values under those names so a runner can safely report
+    arbitrary notification payloads.
+    """
+
+    values: list[str] = []
+
+    def walk(value: Any, secret_scope: bool = False) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower())
+                compact = normalized.replace("_", "")
+                is_secret_key = (
+                    "url" in compact
+                    or "uri" in compact
+                    or "endpoint" in compact
+                    or "webhook" in compact
+                    or "token" in compact
+                    or "secret" in compact
+                    or "apikey" in compact
+                    or "accesskey" in compact
+                    or "key" in compact
+                    or "authorization" in compact
+                    or "password" in compact
+                    or "credential" in compact
+                    or "chat" in compact
+                )
+                child_secret_scope = secret_scope or is_secret_key
+                if child_secret_scope and not isinstance(
+                    item, (Mapping, list, tuple, set)
+                ):
+                    if item is not None and item != "":
+                        values.append(str(item))
+                else:
+                    walk(item, child_secret_scope)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk(item, secret_scope)
+
+    walk(config)
+    return values
+
+
 def _secret_values(
     auth: AccountAuth,
     answer: Any,
     ocr_config: Mapping[str, Any] | None = None,
+    notification_config: Mapping[str, Any] | None = None,
 ) -> tuple[str, ...]:
     values: list[str] = []
     password = getattr(auth, "password", None)
@@ -179,6 +230,7 @@ def _secret_values(
     if api_key:
         values.append(str(api_key))
     values.extend(_config_secret_values(ocr_config))
+    values.extend(_notification_secret_values(notification_config))
     # Remove duplicates while retaining deterministic replacement order.  Do
     # not discard short values: a cookie/token can technically be one byte,
     # and keeping it out of task logs is more important than preserving prose.
@@ -448,6 +500,7 @@ class TaskManager:
             record.context.auth,
             record.context.answer,
             record.context.preferences.ocr_config,
+            record.context.preferences.notification_config,
         )
 
     def start(
@@ -459,6 +512,7 @@ class TaskManager:
         answer: ResolvedAnswerConnection | None = None,
         *,
         answer_semaphore: threading.Semaphore | None | object = _UNSET,
+        wait_started: bool = True,
     ) -> TaskSnapshot:
         """Admit and asynchronously start one account-owned study task."""
 
@@ -484,6 +538,19 @@ class TaskManager:
                 raise AccountTaskConflict(account)
             if not self._active_slots.acquire(blocking=False):
                 raise TaskCapacityReached("maximum active account tasks reached")
+
+            # Keep one visible task per account.  Terminal records are useful
+            # until the next run is admitted, but retaining every completed
+            # context/log buffer would make process-local state grow without
+            # bound.  Evict only this account's terminal records after the
+            # new run has secured its slot, so a failed admission leaves all
+            # existing state untouched.
+            for old_task_id, old_record in tuple(self._tasks.items()):
+                if (
+                    old_record.snapshot.account_id == account
+                    and old_record.snapshot.state not in {"running", "stopping"}
+                ):
+                    self._tasks.pop(old_task_id, None)
 
             task_id = str(uuid.uuid4())
             now = time.time()
@@ -535,8 +602,11 @@ class TaskManager:
 
         # Waiting for the wrapper's first instruction makes start deterministic
         # for callers that immediately inspect fake-runner state, without
-        # waiting for the runner itself (which may intentionally block).
-        record.started.wait()
+        # waiting for the runner itself (which may intentionally block).  The
+        # HTTP route can defer this wait until after releasing the shared
+        # account/store coordination lock.
+        if wait_started:
+            record.started.wait()
         return self._snapshot_copy(record.snapshot)
 
     def _invoke_runner(self, context: StudyRunContext) -> Any:

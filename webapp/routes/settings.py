@@ -108,8 +108,13 @@ def _settings_in_use_error():
 def _settings_boundary():
     """Serialize a settings mutation with task admission when available."""
 
-    manager = _services().get("task_manager")
+    services = _services()
+    manager = services.get("task_manager")
     lock = getattr(manager, "lock", None)
+    if lock is None:
+        lock = services.get("account_task_lock")
+    if lock is None:
+        lock = current_app.extensions.get("account_task_lock")
     return lock if lock is not None else nullcontext()
 
 

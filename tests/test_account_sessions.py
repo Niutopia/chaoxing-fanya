@@ -188,69 +188,14 @@ def test_cli_initialization_keeps_default_cookie_file_and_callback(monkeypatch):
     assert captured["chaoxing"]["cookie_update_callback"] is main.save_cookie_file
 
 
-def test_web_routes_use_distinct_account_cookie_sessions(monkeypatch):
-    import app as legacy_app
+def test_legacy_web_routes_are_removed_from_wsgi_entry():
+    import app as wsgi_app
 
-    class FakeTiku:
-        pass
-
-    class FakeChaoxing:
-        instances = []
-
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.session = kwargs["session"]
-            self.__class__.instances.append(self)
-
-        def login(self, **kwargs):
-            self.kwargs["cookie_update_callback"]({"_uid": "updated"})
-            return {"status": True, "msg": "登录成功"}
-
-        def get_course_list(self):
-            return []
-
-    loaded_paths = []
-    built_sessions = []
-    saved = []
-
-    def fake_load_cookie_file(path):
-        loaded_paths.append(path)
-        return {"_uid": str(path)}
-
-    def fake_build_session(cookies):
-        session = object()
-        built_sessions.append((session, cookies))
-        return session
-
-    def fake_save_cookie_file(cookies, path= None):
-        saved.append((cookies, path))
-
-    monkeypatch.setattr(legacy_app, "Tiku", FakeTiku)
-    monkeypatch.setattr(legacy_app, "Chaoxing", FakeChaoxing)
-    monkeypatch.setattr(legacy_app, "load_cookie_file", fake_load_cookie_file, raising=False)
-    monkeypatch.setattr(legacy_app, "build_session", fake_build_session, raising=False)
-    monkeypatch.setattr(legacy_app, "save_cookie_file", fake_save_cookie_file, raising=False)
-
-    client = legacy_app.app.test_client()
-    login_response = client.post(
-        "/api/login",
-        json={"username": "100", "password": "pw-a", "use_cookies": True},
-    )
-    courses_response = client.post(
-        "/api/courses",
-        json={"username": "200", "password": "pw-b", "use_cookies": True},
-    )
-
-    assert login_response.status_code == 200
-    assert courses_response.status_code == 200
-    assert loaded_paths == [account_cookie_path("100"), account_cookie_path("200")]
-    assert built_sessions[0][0] is not built_sessions[1][0]
-    assert [instance.kwargs["session"] for instance in FakeChaoxing.instances] == [
-        built_sessions[0][0],
-        built_sessions[1][0],
-    ]
-    assert all(callable(instance.kwargs["cookie_update_callback"]) for instance in FakeChaoxing.instances)
-    assert [path for _, path in saved] == loaded_paths
+    client = wsgi_app.app.test_client()
+    for path in ("/api/login", "/api/courses"):
+        response = client.post(path, json={})
+        assert response.status_code == 404
+        assert response.get_json()["code"] == "not_found"
 
 
 def test_web_task_initialization_uses_account_cookie_path(monkeypatch):

@@ -193,6 +193,7 @@ class ChaoxingStudyRunner:
             context.auth,
             context.answer,
             context.preferences.ocr_config,
+            context.preferences.notification_config,
         )
 
     def _safe_error(self, context: StudyRunContext, error: Any) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -306,3 +307,130 @@ def test_task_context_receives_answer_service_semaphore(client, app, prepared_ac
     assert response.status_code == 201
     task_id = response.get_json()["data"]["id"]
     assert app.extensions["task_manager"].get_context(task_id).answer_semaphore is answer_service.semaphore
+
+
+def test_account_mutation_waits_for_start_admission(client, app, prepared_account, monkeypatch):
+    import webapp.routes.accounts as account_routes
+
+    store = app.extensions["services"]["store"]
+    manager = app.extensions["task_manager"]
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    mutation_boundary_entered = threading.Event()
+    update_called = threading.Event()
+    original_start = manager.start
+    original_update = store.update_account
+
+    def gated_start(*args, **kwargs):
+        start_entered.set()
+        assert release_start.wait(timeout=2)
+        return original_start(*args, **kwargs)
+
+    def tracked_update(*args, **kwargs):
+        update_called.set()
+        return original_update(*args, **kwargs)
+
+    @contextmanager
+    def account_boundary():
+        mutation_boundary_entered.set()
+        with manager.lock:
+            yield
+
+    monkeypatch.setattr(manager, "start", gated_start)
+    monkeypatch.setattr(store, "update_account", tracked_update)
+    monkeypatch.setattr(account_routes, "_coordination_boundary", account_boundary)
+    start_result = {}
+    mutation_result = {}
+
+    def start_request():
+        with app.test_client() as request_client:
+            start_result["response"] = request_client.post(
+                f"/api/accounts/{prepared_account.id}/tasks",
+                json={"course_ids": ["math"]},
+            )
+
+    starter = threading.Thread(target=start_request)
+    starter.start()
+    assert start_entered.wait(timeout=1)
+
+    def mutation_request():
+        with app.test_client() as request_client:
+            mutation_result["response"] = request_client.patch(
+                f"/api/accounts/{prepared_account.id}", json={"name": "new-name"}
+            )
+
+    mutation = threading.Thread(target=mutation_request)
+    mutation.start()
+    assert mutation_boundary_entered.wait(timeout=1)
+    assert not update_called.is_set()
+    release_start.set()
+    mutation.join(timeout=2)
+    starter.join(timeout=2)
+    assert not mutation.is_alive()
+    assert not starter.is_alive()
+    assert start_result["response"].status_code == 201
+    assert mutation_result["response"].status_code == 409
+    assert mutation_result["response"].get_json()["code"] == "account_active"
+
+
+def test_start_waits_for_account_mutation_boundary(client, app, prepared_account, monkeypatch):
+    import webapp.routes.tasks as task_routes
+
+    store = app.extensions["services"]["store"]
+    manager = app.extensions["task_manager"]
+    update_entered = threading.Event()
+    release_update = threading.Event()
+    start_boundary_entered = threading.Event()
+    start_called = threading.Event()
+    original_update = store.update_account
+    original_start = manager.start
+
+    def gated_update(*args, **kwargs):
+        update_entered.set()
+        assert release_update.wait(timeout=2)
+        return original_update(*args, **kwargs)
+
+    def tracked_start(*args, **kwargs):
+        start_called.set()
+        return original_start(*args, **kwargs)
+
+    @contextmanager
+    def task_boundary(_manager=None):
+        start_boundary_entered.set()
+        with manager.lock:
+            yield
+
+    monkeypatch.setattr(store, "update_account", gated_update)
+    monkeypatch.setattr(manager, "start", tracked_start)
+    monkeypatch.setattr(task_routes, "_coordination_boundary", task_boundary)
+    mutation_result = {}
+    start_result = {}
+
+    def mutation_request():
+        with app.test_client() as request_client:
+            mutation_result["response"] = request_client.patch(
+                f"/api/accounts/{prepared_account.id}", json={"name": "new-name"}
+            )
+
+    mutation = threading.Thread(target=mutation_request)
+    mutation.start()
+    assert update_entered.wait(timeout=1)
+
+    def start_request():
+        with app.test_client() as request_client:
+            start_result["response"] = request_client.post(
+                f"/api/accounts/{prepared_account.id}/tasks",
+                json={"course_ids": ["math"]},
+            )
+
+    starter = threading.Thread(target=start_request)
+    starter.start()
+    assert start_boundary_entered.wait(timeout=1)
+    assert not start_called.is_set()
+    release_update.set()
+    starter.join(timeout=2)
+    mutation.join(timeout=2)
+    assert not starter.is_alive()
+    assert not mutation.is_alive()
+    assert mutation_result["response"].status_code == 200
+    assert start_result["response"].status_code == 201

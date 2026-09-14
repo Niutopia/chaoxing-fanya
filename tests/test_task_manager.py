@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from webapp.task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
     TaskManager,
+    TaskNotFound,
 )
 
 
@@ -361,3 +363,71 @@ def test_ocr_secret_is_redacted_from_worker_failure_and_logs(
     assert all(secret not in item for item in seen)
     assert secret not in captured.out
     assert secret not in captured.err
+
+
+def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
+    task_inputs,
+):
+    notification_url = "https://notify.example.invalid/bot/notification-url-secret"
+    chat_id = "telegram-chat-id-secret"
+    token = "provider-token-secret"
+    nested_alias = "nested-secret-alias"
+
+    class FailureRunner:
+        def run(self, context):
+            context.reporter.set_current(course=notification_url)
+            context.reporter.set_counts(notification_url=notification_url)
+            context.reporter.set_courses(
+                [{"id": "course", "notification": {"url": notification_url}}]
+            )
+            context.reporter.set_active_jobs(
+                {"job": {"chat_id": chat_id, "nested": {"token": token}}}
+            )
+            context.reporter.append_log(
+                f"notify {notification_url} {chat_id} {token} {nested_alias}"
+            )
+            raise RuntimeError(
+                f"notification failed: {notification_url} {chat_id} {token} {nested_alias}"
+            )
+
+    values = task_inputs("notification-account")
+    values["preferences"] = replace(
+        values["preferences"],
+        notification_config={
+            "provider": "Telegram",
+            "url": notification_url,
+            "tg_chat_id": chat_id,
+            "nested": {"token": token, "secret_alias": nested_alias},
+        },
+    )
+    manager = TaskManager(runner=FailureRunner(), max_active_accounts=1)
+    task = manager.start(**values)
+    assert manager.wait(task.id, timeout=1)
+
+    visible = " ".join(
+        [
+            repr(manager.get_snapshot(task.id)),
+            repr(manager.get_details(task.id)),
+            repr(manager.get_logs(task.id).items),
+        ]
+    )
+    for secret in (notification_url, chat_id, token, nested_alias):
+        assert secret not in visible
+
+
+def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    first = manager.start(**task_inputs("evict-account"))
+    assert manager.wait(first.id, timeout=1)
+    assert manager.get_snapshot(first.id).state == "completed"
+
+    second = manager.start(**task_inputs("evict-account"))
+    assert manager.wait(second.id, timeout=1)
+    assert [snapshot.id for snapshot in manager.list_tasks()] == [second.id]
+    with pytest.raises(TaskNotFound):
+        manager.get_snapshot(first.id)
+    with pytest.raises(TaskNotFound):
+        manager.get_details(first.id)
+    with pytest.raises(TaskNotFound):
+        manager.get_logs(first.id)
