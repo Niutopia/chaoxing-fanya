@@ -167,3 +167,6 @@ get-pip.py
 web/node_modules/
 web/dist/
 web/.vite/
+!web/src/lib/
+!web/src/lib/utils.js
+.worktrees/
