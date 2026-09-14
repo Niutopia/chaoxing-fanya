@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
+from api.live_process import StudyCancelled
+
 from .models import (
     AccountAuth,
     AccountPreferences,
@@ -492,6 +494,12 @@ class TaskManager:
         try:
             run_with_task_context(task_id, self._invoke_runner, context)
             normal_return = True
+        except StudyCancelled:
+            # The study engine raises this only at a cooperative safe
+            # boundary.  Treat it as the requested terminal state rather than
+            # exposing cancellation as a failed task.
+            state = "stopped"
+            error = None
         except BaseException as exc:
             state = "failed"
             with self._lock:

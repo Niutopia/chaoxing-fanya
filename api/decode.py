@@ -20,7 +20,12 @@ from api.font_decoder import FontDecoder
 from api.logger import logger
 from api.config import GlobalConst as gc
 from api.cookies import use_cookies
-from api.vision_ocr import vision_ocr, is_vision_ocr_enabled
+from api.vision_ocr import (
+    _has_task_vision_ocr_context,
+    _load_vision_ocr_config,
+    is_vision_ocr_enabled,
+    vision_ocr,
+)
 import requests
 
 try:
@@ -34,6 +39,30 @@ _PADDLE_OCR_ENGINE = None
 _PADDLE_OCR_INITIALIZED = False
 _PADDLE_OCR_DEVICE = None  # 记录当前 OCR 引擎运行的设备（gpu / cpu）
 _PADDLE_OCR_LOCK = threading.RLock()
+
+
+def _http_ocr_endpoint() -> str:
+    """Resolve an optional HTTP OCR fallback without cross-task mutation."""
+
+    # A task-local OCR mapping may provide an explicit fallback endpoint.  If
+    # it does not, retain the legacy environment fallback.  The environment
+    # is read-only here; Web task setup never writes process-wide variables.
+    config = _load_vision_ocr_config()
+    if _has_task_vision_ocr_context():
+        if config is not None:
+            for key in ("ocr_endpoint", "http_endpoint", "fallback_endpoint"):
+                value = config.get(key)
+                if value:
+                    return str(value).strip()
+        return ""
+    if config is not None:
+        for key in ("ocr_endpoint", "http_endpoint", "fallback_endpoint"):
+            value = config.get(key)
+            if value:
+                return str(value).strip()
+        # Preserve the CLI's legacy HTTP fallback when external OCR is
+        # environment-configured rather than task-configured.
+    return os.environ.get("CHAOXING_OCR_ENDPOINT", "").strip()
 
 
 def _init_paddle_ocr(preferred_device: Optional[str] = None):
@@ -228,7 +257,7 @@ def _ocr_image_to_text(img_url: str) -> str:
     has_any_ocr = (
         use_external_ocr
         or ENABLE_LOCAL_OCR
-        or os.environ.get("CHAOXING_OCR_ENDPOINT", "").strip()
+        or _http_ocr_endpoint()
     )
     if not has_any_ocr:
         return ""
@@ -266,7 +295,7 @@ def _ocr_image_to_text(img_url: str) -> str:
         except Exception as exc:
             logger.debug(f"外部 AI 视觉 OCR 调用失败: {exc}")
         # 外部 OCR 失败时，不回退到本地，直接尝试 HTTP OCR 或返回空
-        ocr_endpoint = os.environ.get("CHAOXING_OCR_ENDPOINT", "").strip()
+        ocr_endpoint = _http_ocr_endpoint()
         if ocr_endpoint:
             return _call_http_ocr(ocr_endpoint, image_bytes, img_url)
         return ""
@@ -371,7 +400,7 @@ def _ocr_image_to_text(img_url: str) -> str:
                     pass
 
     # 3) 若配置了 HTTP OCR 服务，则作为最后兜底
-    ocr_endpoint = os.environ.get("CHAOXING_OCR_ENDPOINT", "").strip()
+    ocr_endpoint = _http_ocr_endpoint()
     if ocr_endpoint:
         return _call_http_ocr(ocr_endpoint, image_bytes, img_url)
 

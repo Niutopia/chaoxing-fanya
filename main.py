@@ -9,7 +9,9 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
+from collections.abc import Mapping
 from queue import PriorityQueue
+from queue import Empty
 try:
     from queue import ShutDown
 except ImportError:
@@ -27,8 +29,9 @@ from api.exceptions import LoginError, InputFormatError
 from api.logger import logger
 from api.notification import Notification
 from api.live import Live
-from api.live_process import LiveProcessor
+from api.live_process import LiveProcessor, StudyCancelled
 from api.cookies import load_cookie_file, save_cookie_file
+from api.vision_ocr import vision_ocr_context
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -37,10 +40,65 @@ class ChapterResult(enum.Enum):
     PENDING=3
 
 
+def raise_if_cancelled(config: Mapping[str, Any] | None) -> None:
+    """Raise ``StudyCancelled`` at a safe learning-engine boundary.
+
+    The command-line path does not provide a cancellation event, so all
+    existing callers retain their historical behaviour.  Web callers inject
+    one event into ``common_config`` and every course/chapter/job boundary
+    checks it before moving on.
+    """
+
+    if not config:
+        return
+    cancel_event = config.get("cancel_event")
+    is_set = getattr(cancel_event, "is_set", None)
+    if callable(is_set) and is_set():
+        raise StudyCancelled()
+
+
+def run_with_task_context(
+    task_id: str,
+    target,
+    *args,
+    **kwargs,
+):
+    """Run a target under the task-log context used by Web workers."""
+
+    from webapp.task_logging import run_with_task_context as _run_with_task_context
+
+    return _run_with_task_context(str(task_id), target, *args, **kwargs)
+
+
+def _run_worker_with_context(
+    config: Mapping[str, Any] | None,
+    target,
+    *args,
+    **kwargs,
+):
+    """Run a worker under both task logging and task-local OCR context."""
+
+    task_id = config.get("task_id") if config else None
+    ocr_config = config.get("ocr_config") if config else None
+
+    def invoke():
+        with vision_ocr_context(ocr_config):
+            return target(*args, **kwargs)
+
+    if task_id:
+        return run_with_task_context(str(task_id), invoke)
+    return invoke()
+
+
 def log_error(func):
     def wrapper(*args, **kwargs):
         try:
             func(*args, **kwargs)
+        except StudyCancelled:
+            # Cooperative cancellation is an expected terminal path, not a
+            # worker error.  Let the owning runner observe it at the next
+            # safe boundary without emitting an error traceback per thread.
+            raise
         except BaseException as e:
             logger.error(f"Error in thread {threading.current_thread().name}: {e}")
             traceback.print_exception(type(e), e, e.__traceback__)
@@ -174,6 +232,8 @@ def init_chaoxing(
     tiku_config,
     *,
     answer_semaphore: threading.Semaphore | None = None,
+    session=None,
+    cookie_update_callback=None,
 ):
     """初始化超星实例"""
     username = common_config.get("username", "")
@@ -203,14 +263,18 @@ def init_chaoxing(
     # 为当前账号创建独立的 HTTP 会话，并保留 CLI 的 cookie 文件行为。
     # CLI 未提供 cookie_path 时继续读写默认 cookies.txt；Web 调用方可
     # 传入账号专属路径，避免不同账号共享该文件。
-    cookie_path = common_config.get("cookie_path")
-    if cookie_path is None:
-        initial_cookies = load_cookie_file()
-        cookie_update_callback = save_cookie_file
-    else:
-        initial_cookies = load_cookie_file(cookie_path)
-        cookie_update_callback = partial(save_cookie_file, path=cookie_path)
-    session = build_session(initial_cookies)
+    # A Web task supplies an account-owned session and callback directly.
+    # Keeping the explicit arguments optional preserves the CLI's historical
+    # cookies.txt loading/saving behaviour.
+    if session is None:
+        cookie_path = common_config.get("cookie_path")
+        if cookie_path is None:
+            initial_cookies = load_cookie_file()
+            cookie_update_callback = save_cookie_file
+        else:
+            initial_cookies = load_cookie_file(cookie_path)
+            cookie_update_callback = partial(save_cookie_file, path=cookie_path)
+        session = build_session(initial_cookies)
     chaoxing = Chaoxing(
         account=account,
         tiku=tiku,
@@ -223,8 +287,22 @@ def init_chaoxing(
     return chaoxing
 
 
-def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float, progress_callback=None) -> StudyResult:
+def process_job(
+    chaoxing: Chaoxing,
+    course: dict,
+    job: dict,
+    job_info: dict,
+    speed: float,
+    progress_callback=None,
+    config: Mapping[str, Any] | None = None,
+) -> StudyResult:
     """处理单个任务点"""
+    if config is None and isinstance(progress_callback, Mapping) and (
+        "cancel_event" in progress_callback or "task_id" in progress_callback
+    ):
+        config = progress_callback
+        progress_callback = config.get("video_progress_callback")
+    raise_if_cancelled(config)
     # 视频任务
     if job["type"] == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
@@ -232,10 +310,12 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
         video_result = chaoxing.study_video(
             course, job, job_info, _speed=speed, _type="Video", progress_callback=progress_callback
         )
+        raise_if_cancelled(config)
         if video_result.is_failure():
             logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
             video_result = chaoxing.study_video(
                 course, job, job_info, _speed=speed, _type="Audio", progress_callback=progress_callback)
+            raise_if_cancelled(config)
         if video_result.is_failure():
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
@@ -244,19 +324,26 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
     # 文档任务
     elif job["type"] == "document":
         logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
-        return chaoxing.study_document(course, job)
+        result = chaoxing.study_document(course, job)
+        raise_if_cancelled(config)
+        return result
     # 测验任务
     elif job["type"] == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
-        return chaoxing.study_work(course, job, job_info)
+        result = chaoxing.study_work(course, job, job_info)
+        raise_if_cancelled(config)
+        return result
     # 阅读任务
     elif job["type"] == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
-        return chaoxing.study_read(course, job, job_info)
+        result = chaoxing.study_read(course, job, job_info)
+        raise_if_cancelled(config)
+        return result
     # 直播任务
     elif job["type"] == "live":
         logger.trace(f"识别到直播任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
         try:
+            raise_if_cancelled(config)
             # 准备直播所需参数
             defaults = {
                 "userid": chaoxing.get_uid(),
@@ -272,15 +359,33 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
                 session=chaoxing.session,
             )
             
-            # 启动直播处理线程
-            thread = threading.Thread(
-                target=LiveProcessor.run_live,
-                args=(live, speed),
-                daemon=True
-            )
+            live_error: list[BaseException] = []
+
+            # Exceptions raised in a worker thread do not propagate to the
+            # joining caller by themselves.  Capture them so cancellation is
+            # represented by StudyCancelled rather than being converted into
+            # an ordinary failed live job.
+            def run_live_and_capture():
+                try:
+                    _run_worker_with_context(
+                        config,
+                        LiveProcessor.run_live,
+                        live,
+                        speed,
+                        cancel_event=config.get("cancel_event") if config else None,
+                    )
+                except BaseException as exc:
+                    live_error.append(exc)
+
+            thread = threading.Thread(target=run_live_and_capture, daemon=True)
             thread.start()
             thread.join()  # 等待直播处理完成
+            if live_error:
+                raise live_error[0]
+            raise_if_cancelled(config)
             return StudyResult.SUCCESS
+        except StudyCancelled:
+            raise
         except Exception as e:
             logger.error(f"处理直播任务时出错: {str(e)}")
             return StudyResult.ERROR
@@ -312,18 +417,66 @@ class JobProcessor:
         self.config = config
 
     def run(self):
+        raise_if_cancelled(self.config)
         for task in self.tasks:
             self.task_queue.put(task)
 
         for i in range(self.worker_num):
-            thread = threading.Thread(target=self.worker_thread, daemon=True)
+            thread = threading.Thread(
+                target=_run_worker_with_context,
+                args=(self.config, self.worker_thread),
+                daemon=True,
+            )
             self.threads.append(thread)
             thread.start()
 
-        threading.Thread(target=self.retry_thread, daemon=True).start()
+        threading.Thread(
+            target=_run_worker_with_context,
+            args=(self.config, self.retry_thread),
+            daemon=True,
+        ).start()
 
-        self.task_queue.join()
-        time.sleep(0.5)
+        # ``Queue.join`` cannot be interrupted by a cancellation event.  Poll
+        # the unfinished count instead, draining queued work when stopping so
+        # the parent runner can leave only already-running blocking calls to
+        # finish at their next safe checkpoint.
+        while self.task_queue.unfinished_tasks:
+            if self.config.get("cancel_event") is not None and self.config["cancel_event"].is_set():
+                self._drain_pending_tasks()
+            if not self.task_queue.unfinished_tasks:
+                break
+            time.sleep(0.05)
+
+        raise_if_cancelled(self.config)
+        cancel_event = self.config.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.wait(0.5)
+        else:
+            time.sleep(0.5)
+        raise_if_cancelled(self.config)
+
+    def _drain_pending_tasks(self) -> None:
+        """Mark queued tasks complete after cooperative cancellation."""
+
+        while True:
+            try:
+                self.task_queue.get_nowait()
+            except Empty:
+                break
+            else:
+                self.task_queue.task_done()
+
+        while True:
+            try:
+                self.retry_queue.get_nowait()
+            except Empty:
+                break
+            else:
+                # A retry item still owns the original task_queue unfinished
+                # count until it is moved back by retry_thread.
+                self.retry_queue.task_done()
+                if self.task_queue.unfinished_tasks:
+                    self.task_queue.task_done()
 
 
     @log_error
@@ -331,62 +484,122 @@ class JobProcessor:
         tqdm.set_lock(tqdm.get_lock())
         while True:
             try:
-                task = self.task_queue.get()
+                raise_if_cancelled(self.config)
+            except StudyCancelled:
+                return
+            try:
+                task = self.task_queue.get(timeout=0.1)
+            except Empty:
+                if not self.task_queue.unfinished_tasks:
+                    return
+                continue
             except ShutDown:
                 logger.info("Queue shut down")
                 return
 
-            # 处理单个章节，并在需要时通过 config 中的回调上报章节完成进度
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed, self.config)
+            task_finished = False
+            try:
+                # 处理单个章节，并在需要时通过 config 中的回调上报章节完成进度
+                raise_if_cancelled(self.config)
+                task.result = process_chapter(
+                    self.chaoxing,
+                    self.course,
+                    task.point,
+                    self.speed,
+                    self.config,
+                )
+                # A blocking chapter may have returned after cancellation was
+                # requested.  Check before scheduling retries or reporting it
+                # as completed.
+                raise_if_cancelled(self.config)
 
-            match task.result:
-                case ChapterResult.SUCCESS:
-                    logger.debug("Task success: {}", task.point["title"])
-                    self.task_queue.task_done()
-                    logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
-
-                case ChapterResult.NOT_OPEN:
-                    # task.tries += 1
-                    if self.config["notopen_action"] == "continue":
-                        logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                match task.result:
+                    case ChapterResult.SUCCESS:
+                        logger.debug("Task success: {}", task.point["title"])
                         self.task_queue.task_done()
-                        continue
+                        task_finished = True
+                        logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
-                    if task.tries >= self.max_tries:
-                        logger.error(
-                            "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
-                            "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
-                        , task.point["title"])
-                        self.task_queue.task_done()
-                        continue
+                    case ChapterResult.NOT_OPEN:
+                        # task.tries += 1
+                        if self.config["notopen_action"] == "continue":
+                            logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                            self.task_queue.task_done()
+                            task_finished = True
+                            continue
 
-                    # self.wait_queue.put(task)
-                    self.retry_queue.put(task)
+                        if task.tries >= self.max_tries:
+                            logger.error(
+                                "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
+                                "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
+                            , task.point["title"])
+                            self.task_queue.task_done()
+                            task_finished = True
+                            continue
 
-                case ChapterResult.ERROR:
-                    task.tries += 1
-                    logger.warning("Retrying task {} ({}/{} attempts)", task.point["title"], task.tries,
-                                   self.max_tries)
-                    if task.tries >= self.max_tries:
-                        logger.error("Max retries reached for task: {}", task.point["title"])
+                        # self.wait_queue.put(task)
+                        self.retry_queue.put(task)
+
+                    case ChapterResult.ERROR:
+                        task.tries += 1
+                        logger.warning("Retrying task {} ({}/{} attempts)", task.point["title"], task.tries,
+                                       self.max_tries)
+                        if task.tries >= self.max_tries:
+                            logger.error("Max retries reached for task: {}", task.point["title"])
+                            self.failed_tasks.append(task)
+                            self.task_queue.task_done()
+                            task_finished = True
+                            continue
+                        self.retry_queue.put(task)
+
+                    case _:
+                        logger.error("Invalid task state {} for task {}", task.result, task.point["title"])
                         self.failed_tasks.append(task)
                         self.task_queue.task_done()
-                        continue
-                    self.retry_queue.put(task)
-
-                case _:
-                    logger.error("Invalid task state {} for task {}", task.result, task.point["title"])
-                    self.failed_tasks.append(task)
+                        task_finished = True
+            except StudyCancelled:
+                if not task_finished:
                     self.task_queue.task_done()
+                return
+            except BaseException:
+                # Do not strand Queue.join/polling when cancellation or a
+                # network/parser error escapes a chapter worker.
+                if not task_finished:
+                    self.task_queue.task_done()
+                raise
 
     @log_error
     def retry_thread(self):
         try:
             while True:
-                task = self.retry_queue.get()
-                self.task_queue.put(task)
-                self.task_queue.task_done() # task_done is not called when a task failed and needs to be retried, so if is reput into the queue, the task num will increase by one and become more than the real task number
-                time.sleep(1)
+                try:
+                    raise_if_cancelled(self.config)
+                except StudyCancelled:
+                    return
+                try:
+                    task = self.retry_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                moved = False
+                try:
+                    raise_if_cancelled(self.config)
+                    self.task_queue.put(task)
+                    self.task_queue.task_done() # task_done is not called when a task failed and needs to be retried, so if is reput into the queue, the task num will increase by one and become more than the real task number
+                    moved = True
+                finally:
+                    self.retry_queue.task_done()
+                    if not moved:
+                        # The retry item owns the original task_queue count;
+                        # balance it when cancellation prevents requeueing.
+                        self.task_queue.task_done()
+                cancel_event = self.config.get("cancel_event")
+                if cancel_event is not None:
+                    if cancel_event.wait(1):
+                        raise StudyCancelled()
+                else:
+                    time.sleep(1)
+        except StudyCancelled:
+            return
         except ShutDown:
             pass
 
@@ -397,6 +610,7 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     当所有任务点成功完成时，如果 config 中提供了 chapter_done_callback，
     则回调通知外部（如 Web 端）更新进度统计。
     """
+    raise_if_cancelled(config)
     logger.info(f'当前章节: {point["title"]}')
 
     # 通知外部当前章节开始（用于前端显示当前正在学习的章节）
@@ -405,8 +619,11 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         if callable(start_cb):
             try:
                 start_cb(course, point)
+            except StudyCancelled:
+                raise
             except Exception as e:
                 logger.debug(f"调用 chapter_start_callback 时出错: {e}")
+    raise_if_cancelled(config)
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
         # 已经在超星端标记为完成的章节，这里直接视为成功，但不再重复回调
@@ -414,10 +631,13 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     
     # 随机等待，避免请求过快
     chaoxing.rate_limiter.limit_rate(random_time=True,random_min=0, random_max=0.2)
+    raise_if_cancelled(config)
     
     # 获取当前章节的所有任务点
     job_info = None
     jobs, job_info = chaoxing.get_job_list(course, point)
+    raise_if_cancelled(config)
+    job_info = job_info or {}
 
     # 发现未开放章节, 根据配置处理
     if job_info.get("notOpen", False):
@@ -431,7 +651,23 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     job_results:list[StudyResult]=[]
     video_progress_callback = config.get("video_progress_callback") if config else None
     with ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed, progress_callback=video_progress_callback), jobs):
+        def process_one_job(job):
+            # Each executor worker starts with a fresh context, so both task
+            # logging and task-local OCR settings must be re-entered here.
+            return _run_worker_with_context(
+                config,
+                process_job,
+                chaoxing,
+                course,
+                job,
+                job_info,
+                speed,
+                progress_callback=video_progress_callback,
+                config=config,
+            )
+
+        for result in executor.map(process_one_job, jobs):
+            raise_if_cancelled(config)
             job_results.append(result)
     
     for result in job_results:
@@ -444,6 +680,8 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         if callable(callback):
             try:
                 callback(course, point)
+            except StudyCancelled:
+                raise
             except Exception as e:
                 logger.debug(f"调用 chapter_done_callback 时出错: {e}")
 
@@ -453,12 +691,14 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 
 def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """处理单个课程"""
+    raise_if_cancelled(config)
     logger.info(f"开始学习课程: {course['title']}")
     
     # 获取当前课程的所有章节
     point_list = chaoxing.get_course_point(
         course["courseId"], course["clazzId"], course["cpi"]
     )
+    raise_if_cancelled(config)
 
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
 
@@ -466,16 +706,18 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     tqdm.format_sizeof = format_time
     tqdm.set_lock(RLock())
 
-    tasks=[]
+    try:
+        tasks=[]
 
-    for i, point in enumerate(point_list["points"]):
-        task = ChapterTask(point=point, index=i)
-        tasks.append(task)
-    p = JobProcessor(chaoxing, course, tasks, config)
-    p.run()
-
-
-    tqdm.format_sizeof = _old_format_sizeof
+        for i, point in enumerate(point_list["points"]):
+            raise_if_cancelled(config)
+            task = ChapterTask(point=point, index=i)
+            tasks.append(task)
+        p = JobProcessor(chaoxing, course, tasks, config)
+        p.run()
+        raise_if_cancelled(config)
+    finally:
+        tqdm.format_sizeof = _old_format_sizeof
 
     """
     while __point_index < len(point_list["points"]):

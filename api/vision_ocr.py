@@ -18,8 +18,11 @@
 """
 
 import base64
+from contextlib import contextmanager
+import contextvars
 import os
 import threading
+from collections.abc import Iterator, Mapping
 from typing import Optional, Dict, Any
 
 import requests
@@ -81,15 +84,87 @@ PROVIDER_DEFAULTS: Dict[str, Dict[str, str]] = {
 _VISION_OCR_ENABLED: Optional[bool] = None
 _VISION_OCR_CONFIG: Optional[Dict[str, str]] = None
 _VISION_OCR_LOCK = threading.Lock()
+_vision_ocr_context: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("chaoxing_vision_ocr_context", default=None)
+)
+
+
+@contextmanager
+def vision_ocr_context(config: Mapping[str, Any] | None) -> Iterator[None]:
+    """Temporarily bind immutable, task-local OCR settings.
+
+    Web tasks run concurrently, so their OCR credentials and provider values
+    must not be represented by process environment mutations.  A copy is
+    captured on entry and the previous value is restored even when a worker
+    raises.  ``ContextVar`` values are thread-local/context-local; worker
+    wrappers explicitly re-enter this context when creating a new thread.
+    """
+
+    token = _vision_ocr_context.set(dict(config) if config else None)
+    try:
+        yield
+    finally:
+        _vision_ocr_context.reset(token)
+
+
+def _task_vision_ocr_config() -> Optional[Dict[str, str]]:
+    """Return a defensive copy of the active Web-task OCR config."""
+
+    config = _vision_ocr_context.get()
+    if not config:
+        return None
+
+    # Keep context settings permissive enough for task-local test/fake
+    # providers (which may only specify ``provider``), while supplying the
+    # same defaults used by environment-backed configuration.
+    provider = str(config.get("provider", "")).strip().lower()
+    if not provider:
+        return None
+    defaults = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["openai_compatible"])
+    endpoint = str(config.get("endpoint", "") or "").strip() or defaults["endpoint"]
+    model = str(config.get("model", "") or "").strip() or defaults["model"]
+    prompt = str(config.get("prompt", "") or "").strip() or DEFAULT_OCR_PROMPT
+    api_key = str(
+        config.get("api_key", config.get("key", "")) or ""
+    ).strip()
+    resolved: Dict[str, str] = {
+        "provider": provider,
+        "endpoint": endpoint,
+        "api_key": api_key,
+        "model": model,
+        "prompt": prompt,
+    }
+    # Preserve task-specific extension fields (for example a fake transport
+    # marker or an HTTP fallback endpoint), but never expose a caller-owned
+    # mutable mapping to OCR code.
+    for key, value in config.items():
+        if key not in resolved and value is not None:
+            resolved[str(key)] = str(value)
+    return resolved
+
+
+def _has_task_vision_ocr_context() -> bool:
+    """Whether a Web task explicitly bound an OCR mapping."""
+
+    return _vision_ocr_context.get() is not None
 
 
 def _load_vision_ocr_config() -> Optional[Dict[str, str]]:
     """从环境变量加载视觉 OCR 配置"""
     global _VISION_OCR_ENABLED, _VISION_OCR_CONFIG
 
+    # A Web task context always wins over the legacy environment-backed
+    # settings.  Do this before consulting the cached environment config so a
+    # task cannot accidentally observe another task's provider.
+    if _has_task_vision_ocr_context():
+        # An explicitly bound but incomplete/disabled mapping intentionally
+        # masks environment settings for this task; only the absence of a
+        # Web-task context permits the legacy fallback below.
+        return _task_vision_ocr_config()
+
     with _VISION_OCR_LOCK:
         if _VISION_OCR_ENABLED is not None:
-            return _VISION_OCR_CONFIG if _VISION_OCR_ENABLED else None
+            return dict(_VISION_OCR_CONFIG) if _VISION_OCR_ENABLED and _VISION_OCR_CONFIG else None
 
         provider = os.environ.get("CHAOXING_VISION_OCR_PROVIDER", "").strip().lower()
         api_key = os.environ.get("CHAOXING_VISION_OCR_KEY", "").strip()
@@ -129,7 +204,7 @@ def _load_vision_ocr_config() -> Optional[Dict[str, str]]:
         }
         _VISION_OCR_ENABLED = True
         logger.info(f"外部 AI 视觉 OCR 已启用: provider={provider}, model={model}")
-        return _VISION_OCR_CONFIG
+        return dict(_VISION_OCR_CONFIG)
 
 
 def _image_to_base64(image_bytes: bytes) -> str:
@@ -305,3 +380,13 @@ def reset_vision_ocr_config():
     with _VISION_OCR_LOCK:
         _VISION_OCR_ENABLED = None
         _VISION_OCR_CONFIG = None
+
+
+__all__ = [
+    "vision_ocr",
+    "is_vision_ocr_enabled",
+    "reset_vision_ocr_config",
+    "vision_ocr_context",
+    "_load_vision_ocr_config",
+    "_has_task_vision_ocr_context",
+]

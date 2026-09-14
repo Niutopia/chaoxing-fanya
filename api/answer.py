@@ -19,6 +19,7 @@ from urllib3 import disable_warnings, exceptions
 from api.answer_check import *
 from api.logger import logger
 from api.decode import _ocr_image_to_text, ENABLE_LOCAL_OCR
+from api.vision_ocr import is_vision_ocr_enabled
 
 
 def _strip_json_block(md_str: str) -> str:
@@ -75,7 +76,9 @@ def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
     仅处理作业题目的标题字符串，不影响其他阅读类内容；
     当 OCR 不可用或识别失败时，不修改原始标题。
     """
-    if not ENABLE_LOCAL_OCR:
+    # Web tasks may enable external vision OCR through a task-local context;
+    # do not require the process-wide local-OCR flag in that case.
+    if not ENABLE_LOCAL_OCR and not is_vision_ocr_enabled():
         return
 
     title = q_info.get("title")

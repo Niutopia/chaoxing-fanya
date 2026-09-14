@@ -11,6 +11,7 @@ from .routes.settings import settings
 from .store import SQLiteStore
 from .task_logging import install_task_log_sink
 from .task_manager import TaskManager
+from .study_runner import ChaoxingStudyRunner
 
 
 def _default_chaoxing_factory(*, auth, cookie_update_callback):
@@ -25,12 +26,21 @@ def _default_chaoxing_factory(*, auth, cookie_update_callback):
     )
 
 
-def _default_task_runner(_context):
-    """No-op runner used until the study-engine adapter is composed.
+def _default_cookie_update_callback_factory(store):
+    """Build account-scoped cookie callbacks for study tasks."""
 
-    Task 6 owns lifecycle and isolation.  The actual Chaoxing study runner is
-    injected later, while a no-op keeps the application factory usable in
-    development and in tests that only exercise account/settings APIs.
+    def factory(account_id: str):
+        return lambda cookies: store.save_cookies(str(account_id), cookies)
+
+    return factory
+
+
+def _default_task_runner(_context):
+    """Backward-compatible no-op hook for callers that imported the symbol.
+
+    ``create_app`` now composes :class:`ChaoxingStudyRunner` by default; this
+    legacy function remains available for explicit test/custom integrations
+    that still select it as ``TASK_RUNNER``.
     """
 
     return None
@@ -84,7 +94,15 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
         configured_limit = app.config.get("MAX_ACTIVE_ACCOUNTS")
         if configured_limit is None:
             configured_limit = store.get_runtime_settings().max_active_accounts
-        runner = app.config.get("TASK_RUNNER", _default_task_runner)
+        runner = app.config.get("TASK_RUNNER")
+        if runner is None:
+            runner = ChaoxingStudyRunner(
+                data_dir=app.config["DATA_DIR"],
+                engine_factory=app.config.get("CHAOXING_ENGINE_FACTORY"),
+                cookie_update_callback_factory=_default_cookie_update_callback_factory(
+                    store
+                ),
+            )
         answer_semaphore = app.config.get("ANSWER_SEMAPHORE")
         if answer_semaphore is None:
             get_semaphore = getattr(answer_connection_service, "get_semaphore", None)

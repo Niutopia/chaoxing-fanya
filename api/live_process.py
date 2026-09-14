@@ -1,15 +1,23 @@
 import time
+import threading
 
-from api.config import GlobalConst as gc
 from api.live import Live
 from api.logger import logger
-import time
-import threading
+
+
+class StudyCancelled(RuntimeError):
+    """Raised when a study task reaches a cooperative cancellation point."""
+
 
 class LiveProcessor:
     @staticmethod
-    def run_live(live: Live, speed: float = 1.0):
+    def run_live(
+        live: Live,
+        speed: float = 1.0,
+        cancel_event: threading.Event | None = None,
+    ):
         """循环提交直播时长，直到达到总时长"""
+        _raise_if_cancelled(cancel_event)
         # 获取直播状态（包含总时长）
         live_status = live.get_status()
         if not live_status:
@@ -33,12 +41,14 @@ class LiveProcessor:
 
         # 循环提交时长（每59秒一次，模拟持续观看）
         for i in range(total_minutes):
+            _raise_if_cancelled(cancel_event)
             logger.info(f"直播'{live.name}'已观看{i+1}/{total_minutes}分钟")
             success = live.do_finish()  # 提交当前时长
             if not success:
                 logger.warning(f"第{i+1}分钟时长提交失败，将重试")
                 # 失败重试一次
                 time.sleep(5)
+                _raise_if_cancelled(cancel_event)
                 live.do_finish()
 
             # 根据倍速调整间隔时间
@@ -47,3 +57,18 @@ class LiveProcessor:
 
         logger.success(f"直播'{live.name}'时长刷取完成")
         return True
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    """Raise ``StudyCancelled`` when a live task was asked to stop.
+
+    This helper intentionally lives beside ``LiveProcessor`` so the API
+    module does not need to import the Web package (which would create an
+    import cycle while the CLI imports :mod:`api.live_process`).
+    """
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise StudyCancelled()
+
+
+__all__ = ["LiveProcessor", "StudyCancelled"]
