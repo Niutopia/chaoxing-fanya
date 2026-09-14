@@ -131,7 +131,43 @@ def _answer_connection(value: ResolvedAnswerConnection | Mapping[str, Any] | Non
     raise TypeError("answer must be ResolvedAnswerConnection, mapping, or None")
 
 
-def _secret_values(auth: AccountAuth, answer: Any) -> tuple[str, ...]:
+def _config_secret_values(config: Any) -> list[str]:
+    """Collect secret-bearing values from an account-owned config mapping."""
+
+    values: list[str] = []
+    if isinstance(config, Mapping):
+        for key, value in config.items():
+            key_name = str(key).strip().lower().replace("-", "_")
+            is_secret_key = (
+                key_name in {
+                    "key",
+                    "api_key",
+                    "apikey",
+                    "access_key",
+                    "access_token",
+                    "token",
+                    "secret",
+                    "authorization",
+                }
+                or key_name.endswith(("_key", "_token", "_secret"))
+                or any(marker in key_name for marker in ("api_key", "secret", "token"))
+            )
+            if is_secret_key and not isinstance(value, (Mapping, list, tuple, set)):
+                if value:
+                    values.append(str(value))
+            else:
+                values.extend(_config_secret_values(value))
+    elif isinstance(config, (list, tuple, set)):
+        for item in config:
+            values.extend(_config_secret_values(item))
+    return values
+
+
+def _secret_values(
+    auth: AccountAuth,
+    answer: Any,
+    ocr_config: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
     values: list[str] = []
     password = getattr(auth, "password", None)
     if password:
@@ -142,6 +178,7 @@ def _secret_values(auth: AccountAuth, answer: Any) -> tuple[str, ...]:
     api_key = getattr(answer, "api_key", None)
     if api_key:
         values.append(str(api_key))
+    values.extend(_config_secret_values(ocr_config))
     # Remove duplicates while retaining deterministic replacement order.  Do
     # not discard short values: a cookie/token can technically be one byte,
     # and keeping it out of task logs is more important than preserving prose.
@@ -384,7 +421,11 @@ class TaskManager:
         return record
 
     def _secrets_for(self, record: _TaskRuntime) -> tuple[str, ...]:
-        return _secret_values(record.context.auth, record.context.answer)
+        return _secret_values(
+            record.context.auth,
+            record.context.answer,
+            record.context.preferences.ocr_config,
+        )
 
     def start(
         self,

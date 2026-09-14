@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from collections.abc import Mapping
 from queue import PriorityQueue
 from queue import Empty
+from queue import Queue
 try:
     from queue import ShutDown
 except ImportError:
@@ -413,8 +414,33 @@ class JobProcessor:
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.threads: list[threading.Thread] = []
+        self.retry_thread_handle: threading.Thread | None = None
         self.worker_num = config["jobs"]
         self.config = config
+        self.worker_errors: Queue[BaseException] = Queue()
+        self._worker_error_event = threading.Event()
+        self._worker_stop_event = threading.Event()
+
+    def _record_worker_error(self, error: BaseException) -> None:
+        """Publish a worker failure without logging its raw exception text."""
+
+        if isinstance(error, StudyCancelled):
+            return
+        self.worker_errors.put(error)
+        self._worker_error_event.set()
+        self._worker_stop_event.set()
+
+    def _join_workers(self) -> None:
+        for thread in self.threads:
+            thread.join()
+        if self.retry_thread_handle is not None:
+            self.retry_thread_handle.join()
+
+    def _first_worker_error(self) -> BaseException | None:
+        try:
+            return self.worker_errors.get_nowait()
+        except Empty:
+            return None
 
     def run(self):
         raise_if_cancelled(self.config)
@@ -430,29 +456,35 @@ class JobProcessor:
             self.threads.append(thread)
             thread.start()
 
-        threading.Thread(
+        self.retry_thread_handle = threading.Thread(
             target=_run_worker_with_context,
             args=(self.config, self.retry_thread),
             daemon=True,
-        ).start()
+        )
+        self.retry_thread_handle.start()
 
         # ``Queue.join`` cannot be interrupted by a cancellation event.  Poll
         # the unfinished count instead, draining queued work when stopping so
         # the parent runner can leave only already-running blocking calls to
         # finish at their next safe checkpoint.
         while self.task_queue.unfinished_tasks:
-            if self.config.get("cancel_event") is not None and self.config["cancel_event"].is_set():
-                self._drain_pending_tasks()
-            if not self.task_queue.unfinished_tasks:
+            if self._worker_error_event.is_set():
+                break
+            cancel_event = self.config.get("cancel_event")
+            if cancel_event is not None and cancel_event.is_set():
                 break
             time.sleep(0.05)
 
-        raise_if_cancelled(self.config)
-        cancel_event = self.config.get("cancel_event")
-        if cancel_event is not None:
-            cancel_event.wait(0.5)
-        else:
-            time.sleep(0.5)
+        # Stop and join every worker before draining queued work.  This keeps
+        # Queue accounting deterministic and prevents a daemon worker from
+        # dying silently while the course is reported as complete.
+        self._worker_stop_event.set()
+        self._join_workers()
+        self._drain_pending_tasks()
+
+        worker_error = self._first_worker_error()
+        if worker_error is not None:
+            raise worker_error
         raise_if_cancelled(self.config)
 
     def _drain_pending_tasks(self) -> None:
@@ -479,10 +511,9 @@ class JobProcessor:
                     self.task_queue.task_done()
 
 
-    @log_error
     def worker_thread(self):
         tqdm.set_lock(tqdm.get_lock())
-        while True:
+        while not self._worker_stop_event.is_set():
             try:
                 raise_if_cancelled(self.config)
             except StudyCancelled:
@@ -490,6 +521,8 @@ class JobProcessor:
             try:
                 task = self.task_queue.get(timeout=0.1)
             except Empty:
+                if self._worker_stop_event.wait(0.1):
+                    return
                 if not self.task_queue.unfinished_tasks:
                     return
                 continue
@@ -561,17 +594,19 @@ class JobProcessor:
                 if not task_finished:
                     self.task_queue.task_done()
                 return
-            except BaseException:
-                # Do not strand Queue.join/polling when cancellation or a
-                # network/parser error escapes a chapter worker.
+            except BaseException as exc:
+                # Do not strand queue accounting, and publish the error to
+                # the owning course after all workers have shut down.  Raw
+                # exception text is intentionally not logged here: the task
+                # boundary sanitizes it before exposing failure details.
                 if not task_finished:
                     self.task_queue.task_done()
-                raise
+                self._record_worker_error(exc)
+                return
 
-    @log_error
     def retry_thread(self):
         try:
-            while True:
+            while not self._worker_stop_event.is_set():
                 try:
                     raise_if_cancelled(self.config)
                 except StudyCancelled:
@@ -579,6 +614,8 @@ class JobProcessor:
                 try:
                     task = self.retry_queue.get(timeout=0.1)
                 except Empty:
+                    if self._worker_stop_event.wait(0.1):
+                        return
                     continue
                 moved = False
                 try:
@@ -594,14 +631,19 @@ class JobProcessor:
                         self.task_queue.task_done()
                 cancel_event = self.config.get("cancel_event")
                 if cancel_event is not None:
-                    if cancel_event.wait(1):
+                    if self._worker_stop_event.wait(1):
+                        return
+                    if cancel_event.is_set():
                         raise StudyCancelled()
                 else:
-                    time.sleep(1)
+                    if self._worker_stop_event.wait(1):
+                        return
         except StudyCancelled:
             return
         except ShutDown:
             pass
+        except BaseException as exc:
+            self._record_worker_error(exc)
 
 
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float, config: dict[str, Any] | None = None) -> ChapterResult:

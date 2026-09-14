@@ -22,7 +22,7 @@ from api.live_process import StudyCancelled
 from api.vision_ocr import vision_ocr_context
 
 from .answer_connection import normalize_completion_url
-from .task_manager import StudyRunContext
+from .task_manager import StudyRunContext, _secret_values as _context_secret_values
 
 
 class StudyRunError(RuntimeError):
@@ -189,17 +189,11 @@ class ChaoxingStudyRunner:
 
     @staticmethod
     def _secret_values(context: StudyRunContext) -> tuple[str, ...]:
-        values: list[str] = []
-        password = getattr(context.auth, "password", None)
-        if password:
-            values.append(str(password))
-        cookies = getattr(context.auth, "cookies", {})
-        if isinstance(cookies, Mapping):
-            values.extend(str(value) for value in cookies.values() if value)
-        api_key = getattr(context.answer, "api_key", None)
-        if api_key:
-            values.append(str(api_key))
-        return tuple(dict.fromkeys(values))
+        return _context_secret_values(
+            context.auth,
+            context.answer,
+            context.preferences.ocr_config,
+        )
 
     def _safe_error(self, context: StudyRunContext, error: Any) -> str:
         try:

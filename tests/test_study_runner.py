@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import api.decode as decode
 from api.vision_ocr import _load_vision_ocr_config, vision_ocr_context
+from api.vision_ocr import reset_vision_ocr_config
 from webapp.models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
 from webapp.study_runner import ChaoxingStudyRunner, StudyCancelled, StudyRunError
 from webapp.task_manager import StudyRunContext
@@ -174,6 +176,55 @@ def test_runner_sanitizes_secret_values_from_failure(
     assert "bearer-a" not in rendered
 
 
+def test_runner_sanitizes_ocr_secret_values_from_factory_failure(
+    tmp_path, fake_context, fake_engine_factory
+):
+    fake_context = replace(
+        fake_context,
+        preferences=replace(
+            fake_context.preferences,
+            ocr_config={"provider": "openai", "key": "ocr-secret"},
+        ),
+    )
+    fake_engine_factory.raise_with_message("worker failed with ocr-secret")
+    runner = ChaoxingStudyRunner(data_dir=tmp_path, engine_factory=fake_engine_factory)
+    with pytest.raises(StudyRunError) as captured:
+        runner.run(fake_context)
+    assert "ocr-secret" not in str(captured.value)
+
+
+class _OCRSession:
+    def __init__(self, cookie):
+        self.cookie = cookie
+        self.headers = {}
+        self.seen = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.seen.append((url, dict(headers or {}), timeout, self.cookie))
+        return SimpleNamespace(status_code=200, content=b"image")
+
+
+def test_ocr_download_uses_only_each_account_session(monkeypatch):
+    first = _OCRSession("cookie-account-a")
+    second = _OCRSession("cookie-account-b")
+    monkeypatch.setattr(decode, "ENABLE_LOCAL_OCR", False)
+    monkeypatch.setattr(decode, "vision_ocr", lambda image: "recognized")
+
+    def unexpected_global_session():
+        raise AssertionError("OCR created a global/default session")
+
+    monkeypatch.setattr(decode.requests, "Session", unexpected_global_session)
+    monkeypatch.setattr(decode, "use_cookies", unexpected_global_session)
+    with vision_ocr_context(
+        {"provider": "openai", "api_key": "ocr-key", "endpoint": "http://ocr"}
+    ):
+        assert decode._ocr_image_to_text("https://image-a", session=first) == "recognized"
+        assert decode._ocr_image_to_text("https://image-b", session=second) == "recognized"
+
+    assert [item[3] for item in first.seen] == ["cookie-account-a"]
+    assert [item[3] for item in second.seen] == ["cookie-account-b"]
+
+
 class _OCRContextRunner:
     def run_two(self, first, second):
         values = [None, None]
@@ -203,3 +254,14 @@ def test_parallel_ocr_contexts_do_not_touch_process_environment(ocr_context_runn
     results = ocr_context_runner.run_two({"provider": "openai"}, {"provider": "claude"})
     assert results == ["openai", "claude"]
     assert dict(os.environ) == before
+
+
+def test_empty_task_ocr_context_masks_environment(monkeypatch):
+    monkeypatch.setenv("CHAOXING_VISION_OCR_PROVIDER", "openai")
+    monkeypatch.setenv("CHAOXING_VISION_OCR_KEY", "environment-secret")
+    reset_vision_ocr_config()
+    try:
+        with vision_ocr_context({}):
+            assert _load_vision_ocr_config() is None
+    finally:
+        reset_vision_ocr_config()

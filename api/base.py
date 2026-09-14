@@ -715,7 +715,7 @@ class Chaoxing:
                             if '教师未创建完成该测验' in _resp.text:
                                 raise PermissionError("教师未创建完成该测验")
 
-                            questions = decode_questions_info(_resp.text)
+                            questions = decode_questions_info(_resp.text, session=self.session)
 
                             if _resp.status_code == 200 and questions.get("questions"):
                                 return (_resp, questions)

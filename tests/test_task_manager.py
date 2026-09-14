@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,3 +258,106 @@ def test_run_with_task_context_adds_task_id_to_log_context(task_inputs):
     finally:
         logger.remove(sink_id)
     assert seen == {"task_id": "task-id"}
+
+
+def test_worker_exception_propagates_after_job_processor_shutdown(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "process_chapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("worker-boom")
+        ),
+    )
+    config = {
+        "speed": 1.0,
+        "jobs": 1,
+        "notopen_action": "continue",
+        "task_id": "worker-error-task",
+        "cancel_event": threading.Event(),
+    }
+    processor = main.JobProcessor(
+        SimpleNamespace(),
+        {"title": "course"},
+        [
+            main.ChapterTask(
+                index=0,
+                point={"title": "chapter", "has_finished": False},
+            )
+        ],
+        config,
+    )
+    with pytest.raises(RuntimeError, match="worker-boom"):
+        processor.run()
+
+
+def test_ocr_secret_is_redacted_from_worker_failure_and_logs(
+    monkeypatch, task_inputs, capsys
+):
+    import main
+    from api.logger import logger
+    from webapp.task_logging import install_task_log_sink, remove_task_log_sink
+
+    secret = "ocr-secret"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run(context):
+        entered.set()
+        assert release.wait(timeout=2)
+        config = {
+            "speed": 1.0,
+            "jobs": 1,
+            "notopen_action": "continue",
+            "task_id": context.task_id,
+            "cancel_event": context.cancel_event,
+            "ocr_config": context.preferences.ocr_config,
+        }
+        processor = main.JobProcessor(
+            SimpleNamespace(),
+            {"title": "course"},
+            [
+                main.ChapterTask(
+                    index=0,
+                    point={"title": "chapter", "has_finished": False},
+                )
+            ],
+            config,
+        )
+        processor.run()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"worker failed with {secret}")
+
+    monkeypatch.setattr(main, "process_chapter", fail)
+    values = task_inputs("ocr-account")
+    values["preferences"] = values["preferences"].__class__(
+        **{
+            **values["preferences"].__dict__,
+            "ocr_config": {"provider": "openai", "api_key": secret},
+        }
+    )
+    manager = TaskManager(runner=run, max_active_accounts=1)
+    task = manager.start(**values)
+    assert entered.wait(timeout=1)
+    sink_id = install_task_log_sink(manager)
+    seen = []
+    capture_id = logger.add(
+        lambda message: seen.append(message.record["message"]), enqueue=False
+    )
+    try:
+        release.set()
+        manager.wait(task.id, timeout=2)
+        snapshot = manager.get_snapshot(task.id)
+        logs = manager.get_logs(task.id).items
+    finally:
+        logger.remove(capture_id)
+        remove_task_log_sink(sink_id)
+    captured = capsys.readouterr()
+    assert snapshot.state == "failed"
+    assert secret not in (snapshot.error or "")
+    assert all(secret not in item.message for item in logs)
+    assert all(secret not in item for item in seen)
+    assert secret not in captured.out
+    assert secret not in captured.err

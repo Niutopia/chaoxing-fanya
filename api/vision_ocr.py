@@ -100,7 +100,7 @@ def vision_ocr_context(config: Mapping[str, Any] | None) -> Iterator[None]:
     wrappers explicitly re-enter this context when creating a new thread.
     """
 
-    token = _vision_ocr_context.set(dict(config) if config else None)
+    token = _vision_ocr_context.set(dict(config) if config is not None else None)
     try:
         yield
     finally:

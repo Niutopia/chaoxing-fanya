@@ -237,7 +237,7 @@ def _call_http_ocr(ocr_endpoint: str, image_bytes: bytes, img_url: str) -> str:
     return ""
 
 
-def _ocr_image_to_text(img_url: str) -> str:
+def _ocr_image_to_text(img_url: str, session=None) -> str:
     """可选的 OCR 钩子：将题干中的图片转为接近 LaTeX 的文本。
 
     OCR 识别逻辑：
@@ -264,10 +264,13 @@ def _ocr_image_to_text(img_url: str) -> str:
 
     # 下载图片
     try:
-        # 使用带登录 Cookie 的会话下载图片，避免 403
-        session = requests.Session()
-        session.headers.update(gc.HEADERS)
-        session.cookies.update(use_cookies())
+        # Use the account-owned session when one is supplied.  Web tasks must
+        # never create a fresh session here, because doing so would reload the
+        # process/default cookie jar and could cross account boundaries.
+        if session is None:
+            session = requests.Session()
+            session.headers.update(gc.HEADERS)
+            session.cookies.update(use_cookies())
 
         # 对超星图片域名补充一个简单 Referer，进一步降低 403 概率
         extra_headers = {}
@@ -783,7 +786,7 @@ def _process_work_task(card: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def decode_questions_info(html_content: str) -> Dict[str, Any]:
+def decode_questions_info(html_content: str, *, session=None) -> Dict[str, Any]:
     """
     解析题目信息，提取表单数据和问题列表
     
@@ -808,7 +811,7 @@ def decode_questions_info(html_content: str) -> Dict[str, Any]:
     # 处理所有问题
     questions = []
     for div_tag in soup.find("form").find_all("div", class_="singleQuesId"):
-        question = _process_question(div_tag, font_decoder)
+        question = _process_question(div_tag, font_decoder, session=session)
         if question:
             questions.append(question)
     
@@ -836,7 +839,7 @@ def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
     return form_data
 
 
-def _process_question(div_tag, font_decoder=None) -> Dict[str, Any]:
+def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, Any]:
     """处理单个问题"""
     # 提取问题ID和题目类型
     question_id = div_tag.attrs.get("data", "")
@@ -848,7 +851,7 @@ def _process_question(div_tag, font_decoder=None) -> Dict[str, Any]:
     options_list = div_tag.find("ul").find_all("li") if div_tag.find("ul") else []
     
     # 解析题目和选项
-    q_title = _extract_title(title_div, font_decoder)
+    q_title = _extract_title(title_div, font_decoder, session=session)
     q_options = []
     for li in options_list:
         q_options.append(_extract_choices(li, font_decoder))
@@ -901,7 +904,7 @@ def _get_question_type(type_code: str) -> str:
     return "unknown"
 
 
-def _extract_title(element, font_decoder=None) -> str:
+def _extract_title(element, font_decoder=None, *, session=None) -> str:
     """提取标题内容，支持解码加密字体"""
     if not element:
         return ""
@@ -914,7 +917,7 @@ def _extract_title(element, font_decoder=None) -> str:
         elif item.name == "img":
             img_url = item.get("src", "")
             # 如果启用了本地 OCR，则尝试将图片转换为接近 LaTeX 的文本表达
-            ocr_text = _ocr_image_to_text(img_url)
+            ocr_text = _ocr_image_to_text(img_url, session=session)
             if ocr_text:
                 content.append(f"[公式: {ocr_text}]")
             else:
