@@ -7,30 +7,43 @@ export default {
   theme: {
     extend: {
       colors: {
-        border: "hsl(var(--border))",
-        input: "hsl(var(--input))",
-        ring: "hsl(var(--ring))",
-        background: "hsl(var(--background))",
-        foreground: "hsl(var(--foreground))",
+        canvas: "var(--canvas)",
+        surface: "var(--surface)",
+        sidebar: "var(--sidebar-material)",
+        separator: "var(--separator)",
+        border: "var(--separator)",
+        input: "var(--separator)",
+        ring: "var(--accent-blue)",
+        background: "var(--canvas)",
+        foreground: "var(--label-primary)",
+        label: {
+          primary: "var(--label-primary)",
+          secondary: "var(--label-secondary)",
+          tertiary: "var(--label-tertiary)",
+        },
+        "accent-blue": "rgb(var(--accent-blue-rgb) / <alpha-value>)",
+        success: "rgb(var(--success-rgb) / <alpha-value>)",
+        warning: "rgb(var(--warning-rgb) / <alpha-value>)",
+        danger: "rgb(var(--danger-rgb) / <alpha-value>)",
         primary: {
-          DEFAULT: "hsl(var(--primary))",
-          foreground: "hsl(var(--primary-foreground))",
+          DEFAULT: "var(--accent-blue)",
+          foreground: "#ffffff",
         },
         secondary: {
-          DEFAULT: "hsl(var(--secondary))",
-          foreground: "hsl(var(--secondary-foreground))",
+          DEFAULT: "var(--surface-muted)",
+          foreground: "var(--label-primary)",
         },
         destructive: {
-          DEFAULT: "hsl(var(--destructive))",
-          foreground: "hsl(var(--destructive-foreground))",
+          DEFAULT: "var(--danger)",
+          foreground: "#ffffff",
         },
         muted: {
-          DEFAULT: "hsl(var(--muted))",
-          foreground: "hsl(var(--muted-foreground))",
+          DEFAULT: "var(--surface-muted)",
+          foreground: "var(--label-secondary)",
         },
         accent: {
-          DEFAULT: "hsl(var(--accent))",
-          foreground: "hsl(var(--accent-foreground))",
+          DEFAULT: "var(--surface-muted)",
+          foreground: "var(--label-primary)",
         },
       },
       borderRadius: {
