@@ -1,0 +1,597 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { getAnswerConnection } from '../api/settings'
+import { getPreferences, listCourses, savePreferences } from '../api/accounts'
+import { startTask } from '../api/tasks'
+import Alert from '../components/ui/Alert'
+import Button from '../components/ui/Button'
+import Field from '../components/ui/Field'
+import Input from '../components/ui/Input'
+import { cn } from '../lib/utils'
+
+const DEFAULT_PREFERENCES = {
+  selected_course_ids: [],
+  speed: 1,
+  jobs: 4,
+  notopen_action: 'retry',
+  answer_enabled: false,
+  answer_cover_rate: 0.9,
+  answer_auto_submit: false,
+  notification_config: {},
+  ocr_config: {},
+}
+
+const ACTIVE_TASK_STATES = new Set(['running', 'stopping'])
+
+function unwrap(value, keys = []) {
+  if (value && typeof value === 'object') {
+    for (const key of keys) {
+      if (value[key] !== undefined) return value[key]
+    }
+    if (value.data !== undefined) return value.data
+  }
+  return value
+}
+
+function asCourses(value) {
+  const list = unwrap(value, ['courses'])
+  if (!Array.isArray(list)) return []
+  return list
+    .map((course) => {
+      if (typeof course === 'string') return { courseId: course, title: course }
+      if (!course || typeof course !== 'object') return null
+      const courseId = course.courseId ?? course.course_id ?? course.id
+      const title = course.title ?? course.name ?? course.courseName ?? course.course_name
+      if (courseId == null || title == null) return null
+      return {
+        ...course,
+        courseId: String(courseId),
+        title: String(title),
+      }
+    })
+    .filter(Boolean)
+}
+
+function asPreferences(value) {
+  const source = unwrap(value, ['preferences'])
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return { ...DEFAULT_PREFERENCES }
+  }
+
+  return {
+    ...DEFAULT_PREFERENCES,
+    ...source,
+    selected_course_ids: Array.isArray(source.selected_course_ids)
+      ? source.selected_course_ids.map(String)
+      : DEFAULT_PREFERENCES.selected_course_ids,
+    notification_config: source.notification_config && typeof source.notification_config === 'object'
+      ? source.notification_config
+      : {},
+    ocr_config: source.ocr_config && typeof source.ocr_config === 'object'
+      ? source.ocr_config
+      : {},
+  }
+}
+
+function accountValue(account, snakeCase, camelCase = snakeCase) {
+  return account?.[snakeCase] ?? account?.[camelCase]
+}
+
+function accountIsEnabled(account) {
+  return account ? accountValue(account, 'enabled') !== false : true
+}
+
+function activeTaskFor(accountId, task, tasks) {
+  const candidate = task || (Array.isArray(tasks)
+    ? tasks.find((item) => String(item?.account_id ?? item?.accountId) === String(accountId))
+    : null)
+  return candidate && ACTIVE_TASK_STATES.has(candidate.state) ? candidate : null
+}
+
+function errorMessage(error, fallback) {
+  const message = error?.message
+  return typeof message === 'string' && message.trim() ? message : fallback
+}
+
+function startErrorMessage(error) {
+  switch (error?.code) {
+    case 'account_active':
+      return '该账户已有任务在运行'
+    case 'account_disabled':
+      return '请先启用该账户'
+    case 'courses_required':
+      return '请至少选择一门课程'
+    case 'invalid_preferences':
+      return '请检查学习参数'
+    case 'answer_not_ready':
+    case 'answer_not_tested':
+      return '请先在设置中测试答题连接'
+    case 'task_limit_reached':
+      return '已达到同时运行账户上限，请稍后再试'
+    default:
+      return errorMessage(error, '启动学习任务失败，请重试')
+  }
+}
+
+function numericValue(value, fallback) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : fallback
+}
+
+function preferencePayload(preferences) {
+  return {
+    selected_course_ids: [...preferences.selected_course_ids],
+    speed: numericValue(preferences.speed, DEFAULT_PREFERENCES.speed),
+    jobs: Math.trunc(numericValue(preferences.jobs, DEFAULT_PREFERENCES.jobs)),
+    notopen_action: preferences.notopen_action,
+    answer_enabled: Boolean(preferences.answer_enabled),
+    answer_cover_rate: numericValue(
+      preferences.answer_cover_rate,
+      DEFAULT_PREFERENCES.answer_cover_rate,
+    ),
+    answer_auto_submit: Boolean(preferences.answer_auto_submit),
+    notification_config: preferences.notification_config && typeof preferences.notification_config === 'object'
+      ? preferences.notification_config
+      : {},
+    ocr_config: preferences.ocr_config && typeof preferences.ocr_config === 'object'
+      ? preferences.ocr_config
+      : {},
+  }
+}
+
+function taskIdFrom(value) {
+  const result = unwrap(value, ['task'])
+  if (typeof result === 'string' || typeof result === 'number') return String(result)
+  if (!result || typeof result !== 'object') return ''
+  const id = result.id ?? result.task_id ?? result.taskId
+  return id == null ? '' : String(id)
+}
+
+function answerConnectionReady(connection) {
+  if (!connection) return false
+  if (connection.enabled !== true) return false
+  if (connection.has_api_key === false) return false
+  const status = connection.last_test_status ?? connection.test_status ?? connection.testStatus
+  // Older public settings responses intentionally omit the probe status. In
+  // that case let the server-side start guard decide while still honoring an
+  // explicit failed/untested status from newer responses.
+  if (status === undefined) return true
+  return status === 'success' || connection.tested === true
+}
+
+function preferenceNumber(value, fallback) {
+  return value === undefined || value === null ? fallback : value
+}
+
+function LaunchPage({
+  account,
+  accounts = [],
+  accountId: explicitAccountId,
+  activeTask,
+  task,
+  tasks,
+  className,
+}) {
+  const params = useParams()
+  const navigate = useNavigate()
+  const accountId = explicitAccountId ?? params.accountId ?? account?.id
+  const activeAccount = account || accounts.find((item) => String(item?.id) === String(accountId))
+  const [courses, setCourses] = useState([])
+  const [preferences, setPreferences] = useState({ ...DEFAULT_PREFERENCES })
+  const [answerConnection, setAnswerConnection] = useState(null)
+  const [search, setSearch] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [coursesLoading, setCoursesLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [stale, setStale] = useState(false)
+  const [loadError, setLoadError] = useState('')
+  const [answerError, setAnswerError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const requestId = useRef(0)
+  const hasCoursesRef = useRef(false)
+
+  const loadPage = useCallback(async ({ refresh = false } = {}) => {
+    if (!accountId) {
+      setLoading(false)
+      setCoursesLoading(false)
+      setLoadError('缺少账户信息')
+      return
+    }
+
+    const currentRequest = ++requestId.current
+    if (refresh) {
+      setRefreshing(true)
+    } else {
+      setLoading(true)
+      setCoursesLoading(true)
+      setLoadError('')
+    }
+    setActionError('')
+
+    const coursePromise = refresh
+      ? listCourses(accountId, { refresh: true })
+      : listCourses(accountId)
+    const preferencesPromise = refresh ? null : getPreferences(accountId)
+    const connectionPromise = refresh ? null : getAnswerConnection()
+
+    try {
+      const courseResult = await coursePromise
+      if (currentRequest !== requestId.current) return
+      setCourses(asCourses(courseResult))
+      hasCoursesRef.current = true
+      setStale(false)
+      setLoadError('')
+    } catch (error) {
+      if (currentRequest !== requestId.current) return
+      if (refresh && hasCoursesRef.current) {
+        setStale(true)
+      } else {
+        setLoadError(errorMessage(error, '课程加载失败，请重试'))
+      }
+    } finally {
+      if (currentRequest === requestId.current) {
+        setCoursesLoading(false)
+        setRefreshing(false)
+      }
+    }
+
+    if (!refresh) {
+      const [preferencesResult, connectionResult] = await Promise.allSettled([
+        preferencesPromise,
+        connectionPromise,
+      ])
+      if (currentRequest !== requestId.current) return
+
+      if (preferencesResult.status === 'fulfilled') {
+        setPreferences(asPreferences(preferencesResult.value))
+      } else {
+        setLoadError((current) => current || errorMessage(preferencesResult.reason, '学习参数加载失败，请重试'))
+      }
+
+      if (connectionResult.status === 'fulfilled') {
+        setAnswerConnection(unwrap(connectionResult.value, ['connection', 'answer_connection']))
+      } else {
+        setAnswerError(errorMessage(connectionResult.reason, '答题连接状态加载失败'))
+      }
+      setLoading(false)
+    }
+  }, [accountId])
+
+  useEffect(() => {
+    loadPage()
+    return () => {
+      requestId.current += 1
+    }
+  }, [loadPage])
+
+  const filteredCourses = useMemo(() => {
+    const needle = search.trim().toLocaleLowerCase()
+    if (!needle) return courses
+    return courses.filter((course) => (
+      course.title.toLocaleLowerCase().includes(needle)
+      || course.courseId.toLocaleLowerCase().includes(needle)
+    ))
+  }, [courses, search])
+
+  const selectedIds = Array.isArray(preferences.selected_course_ids)
+    ? preferences.selected_course_ids.map(String)
+    : []
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds.join('|')])
+  const selectedCount = selectedIds.length
+  const enabled = accountIsEnabled(activeAccount)
+  const runningTask = activeTaskFor(accountId, activeTask || task, tasks)
+  const connectionBlocked = Boolean(preferences.answer_enabled)
+    && (answerError || !answerConnectionReady(answerConnection))
+
+  const updatePreference = (field) => (event) => {
+    const nextValue = event.target.type === 'checkbox' ? event.target.checked : event.target.value
+    setPreferences((current) => ({ ...current, [field]: nextValue }))
+    setActionError('')
+  }
+
+  const toggleCourse = (courseId) => {
+    setPreferences((current) => {
+      const currentIds = Array.isArray(current.selected_course_ids)
+        ? current.selected_course_ids.map(String)
+        : []
+      const next = currentIds.includes(String(courseId))
+        ? currentIds.filter((id) => id !== String(courseId))
+        : [...currentIds, String(courseId)]
+      return { ...current, selected_course_ids: next }
+    })
+    setActionError('')
+  }
+
+  const selectAll = () => {
+    const visibleIds = filteredCourses.map((course) => course.courseId)
+    setPreferences((current) => {
+      const existing = Array.isArray(current.selected_course_ids)
+        ? current.selected_course_ids.map(String)
+        : []
+      return {
+        ...current,
+        selected_course_ids: [...new Set([...existing, ...visibleIds])],
+      }
+    })
+    setActionError('')
+  }
+
+  const clearSelection = () => {
+    setPreferences((current) => ({ ...current, selected_course_ids: [] }))
+    setActionError('')
+  }
+
+  const validate = () => {
+    if (!enabled) return '请先启用该账户'
+    if (runningTask) return '该账户已有任务在运行'
+    if (selectedIds.length === 0) return '请至少选择一门课程'
+
+    const speed = numericValue(preferences.speed, Number.NaN)
+    if (!Number.isFinite(speed) || speed < 1 || speed > 2) return '播放速度需在 1 到 2 之间'
+    if (!/^\d+$/.test(String(preferences.jobs)) || Number(preferences.jobs) < 1 || Number(preferences.jobs) > 10) {
+      return '章节并发数需为 1 到 10 的整数'
+    }
+    const coverRate = numericValue(preferences.answer_cover_rate, Number.NaN)
+    if (!Number.isFinite(coverRate) || coverRate < 0 || coverRate > 1) return '答题覆盖率需在 0 到 1 之间'
+    if (connectionBlocked) return '请先在设置中测试答题连接'
+    return ''
+  }
+
+  const handleStart = async () => {
+    if (saving) return
+    const validationError = validate()
+    if (validationError) {
+      setActionError(validationError)
+      return
+    }
+
+    setSaving(true)
+    setActionError('')
+    const payload = preferencePayload(preferences)
+    try {
+      await savePreferences(accountId, payload)
+      const result = await startTask(accountId, { course_ids: [...selectedIds] })
+      const taskId = taskIdFrom(result)
+      if (!taskId) {
+        throw new Error('启动响应缺少任务 ID')
+      }
+      navigate(`/tasks/${encodeURIComponent(taskId)}`)
+    } catch (error) {
+      setActionError(startErrorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading && coursesLoading && courses.length === 0) {
+    return (
+      <section className={cn('mx-auto w-full max-w-6xl px-4 py-8 md:px-8', className)} aria-labelledby="launch-title">
+        <h1 id="launch-title" className="text-xl font-semibold tracking-tight">开始学习</h1>
+        <p className="mt-2 text-sm text-label-secondary" role="status" aria-live="polite">正在加载课程与学习参数…</p>
+      </section>
+    )
+  }
+
+  if (loadError && courses.length === 0) {
+    return (
+      <section className={cn('mx-auto w-full max-w-6xl px-4 py-8 md:px-8', className)} aria-labelledby="launch-title">
+        <h1 id="launch-title" className="text-xl font-semibold tracking-tight">开始学习</h1>
+        <Alert className="mt-5 max-w-xl" variant="danger" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{loadError}</span>
+            <Button type="button" variant="outline" onClick={() => loadPage()}>重试</Button>
+          </div>
+        </Alert>
+      </section>
+    )
+  }
+
+  return (
+    <section className={cn('mx-auto w-full max-w-6xl px-4 py-7 md:px-8 md:py-8', className)} aria-labelledby="launch-title">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-label-secondary">课程工作台</p>
+          <h1 id="launch-title" className="mt-1 truncate text-xl font-semibold tracking-tight">
+            {activeAccount?.name || '开始学习'}
+          </h1>
+          <p className="mt-1 text-sm text-label-secondary">选择课程并确认本次学习任务的参数。</p>
+        </div>
+        <Link
+          to={`/settings${accountId ? `?account=${encodeURIComponent(accountId)}` : ''}`}
+          className="touch-target touch-target-compact inline-flex min-h-9 items-center rounded-md px-2.5 text-sm text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+        >
+          高级设置
+        </Link>
+      </div>
+
+      {loadError ? (
+        <Alert className="mt-5" variant="warning" aria-live="polite">{loadError}</Alert>
+      ) : null}
+      {answerError && !preferences.answer_enabled ? (
+        <Alert className="mt-5" variant="warning" aria-live="polite">{answerError}</Alert>
+      ) : null}
+      {actionError ? (
+        <Alert className="mt-5" variant="danger" aria-live="polite">{actionError}</Alert>
+      ) : null}
+
+      <div className="mt-7 grid items-start gap-6 md:grid-cols-[minmax(0,1fr)_minmax(260px,340px)]">
+        <div className="min-w-0 border-y border-separator bg-surface">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-separator px-4 py-3">
+            <div>
+              <h2 className="font-semibold">课程</h2>
+              <p className="mt-0.5 text-xs text-label-secondary" aria-live="polite">
+                已选择 {selectedCount} 门
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button type="button" size="sm" variant="ghost" onClick={selectAll} disabled={filteredCourses.length === 0}>全选</Button>
+              <Button type="button" size="sm" variant="ghost" onClick={clearSelection} disabled={selectedCount === 0}>清空</Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => loadPage({ refresh: true })} loading={refreshing}>
+                刷新课程
+              </Button>
+            </div>
+          </div>
+
+          <div className="border-b border-separator px-4 py-3">
+            <Input
+              type="search"
+              aria-label="搜索课程"
+              placeholder="搜索课程名称或 ID"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </div>
+
+          {stale ? (
+            <p className="border-b border-separator bg-warning/[0.08] px-4 py-2.5 text-sm text-label-primary" role="status" aria-live="polite">
+              正在显示上次成功加载的课程
+            </p>
+          ) : null}
+
+          {coursesLoading && courses.length === 0 ? (
+            <p className="px-4 py-8 text-sm text-label-secondary" role="status" aria-live="polite">正在加载课程…</p>
+          ) : filteredCourses.length === 0 ? (
+            <p className="px-4 py-8 text-sm text-label-secondary">没有匹配的课程</p>
+          ) : (
+            <ul className="divide-y divide-separator" aria-label="课程列表">
+              {filteredCourses.map((course) => (
+                <li key={course.courseId}>
+                  <label className="touch-target flex min-h-12 cursor-pointer items-center gap-3 px-4 py-2.5 text-sm hover:bg-black/[0.025] focus-within:bg-accent-blue/[0.05]">
+                    <input
+                      type="checkbox"
+                      aria-label={course.title}
+                      className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
+                      checked={selectedSet.has(course.courseId)}
+                      onChange={() => toggleCourse(course.courseId)}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium text-label-primary">{course.title}</span>
+                      <span className="mt-0.5 block truncate text-xs text-label-tertiary">{course.courseId}</span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <aside className="min-w-0 border-y border-separator bg-surface md:sticky md:top-5" aria-labelledby="launch-inspector-title">
+          <div className="border-b border-separator px-4 py-3">
+            <h2 id="launch-inspector-title" className="font-semibold">学习参数</h2>
+            <p className="mt-0.5 text-xs text-label-secondary">这些参数只作用于当前账户。</p>
+          </div>
+          <div className="space-y-5 px-4 py-4">
+            <Field label="播放速度" htmlFor="launch-speed" description="范围 1.0 到 2.0 倍。">
+              <Input
+                id="launch-speed"
+                type="number"
+                inputMode="decimal"
+                min="1"
+                max="2"
+                step="0.1"
+                value={preferenceNumber(preferences.speed, DEFAULT_PREFERENCES.speed)}
+                onChange={updatePreference('speed')}
+              />
+            </Field>
+
+            <Field label="章节并发数" htmlFor="launch-jobs" description="每个账户同时处理的章节数。">
+              <Input
+                id="launch-jobs"
+                type="number"
+                inputMode="numeric"
+                min="1"
+                max="10"
+                step="1"
+                value={preferenceNumber(preferences.jobs, DEFAULT_PREFERENCES.jobs)}
+                onChange={updatePreference('jobs')}
+              />
+            </Field>
+
+            <Field label="未开放章节" htmlFor="launch-notopen-action">
+              <select
+                id="launch-notopen-action"
+                value={preferences.notopen_action}
+                onChange={updatePreference('notopen_action')}
+                className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
+              >
+                <option value="retry">稍后重试</option>
+                <option value="continue">跳过并继续</option>
+              </select>
+            </Field>
+
+            <div className="space-y-3 border-t border-separator pt-4">
+              <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
+                  checked={Boolean(preferences.answer_enabled)}
+                  onChange={updatePreference('answer_enabled')}
+                />
+                <span className="min-w-0">
+                  <span className="block font-medium text-label-primary">启用答题</span>
+                  <span className="mt-0.5 block text-xs text-label-secondary">使用设置中的共享答题连接。</span>
+                </span>
+              </label>
+
+              {preferences.answer_enabled ? (
+                <>
+                  <Field label="答题覆盖率" htmlFor="launch-cover-rate" description="0 到 1 之间的小数。">
+                    <Input
+                      id="launch-cover-rate"
+                      type="number"
+                      inputMode="decimal"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={preferenceNumber(preferences.answer_cover_rate, DEFAULT_PREFERENCES.answer_cover_rate)}
+                      onChange={updatePreference('answer_cover_rate')}
+                    />
+                  </Field>
+                  <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+                    <input
+                      type="checkbox"
+                      className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
+                      checked={Boolean(preferences.answer_auto_submit)}
+                      onChange={updatePreference('answer_auto_submit')}
+                    />
+                    <span className="font-medium text-label-primary">自动提交答案</span>
+                  </label>
+                  {connectionBlocked ? (
+                    <p className="text-xs leading-5 text-danger" role="status" aria-live="polite">
+                      请先在设置中测试答题连接
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+
+            <div className="border-t border-separator pt-4">
+              <Button
+                type="button"
+                className="w-full"
+                onClick={handleStart}
+                loading={saving}
+                disabled={!enabled || Boolean(runningTask) || Boolean(connectionBlocked)}
+              >
+                开始学习
+              </Button>
+              {!enabled ? <p className="mt-2 text-xs text-danger">请先启用该账户</p> : null}
+              {runningTask ? <p className="mt-2 text-xs text-label-secondary">该账户已有任务在运行</p> : null}
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  )
+}
+
+export {
+  DEFAULT_PREFERENCES,
+  asCourses,
+  asPreferences,
+  answerConnectionReady,
+  preferencePayload,
+  startErrorMessage,
+}
+export default LaunchPage
