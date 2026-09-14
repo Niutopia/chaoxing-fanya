@@ -75,6 +75,7 @@ function publicAccount(value) {
  */
 function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) {
   const [form, setForm] = useState(() => formForAccount(account))
+  const [createdProfile, setCreatedProfile] = useState(null)
   const [saving, setSaving] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [error, setError] = useState('')
@@ -83,13 +84,17 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
 
   useEffect(() => {
     if (open) {
+      setCreatedProfile(null)
       setForm(formForAccount(account))
       setError('')
       setSuccess('')
     }
   }, [account, open])
 
-  const isEditing = Boolean(account?.id)
+  // A successfully created profile becomes the editing target immediately.
+  // This prevents a failed verification retry from creating a duplicate row.
+  const activeAccount = account ?? createdProfile
+  const isEditing = Boolean(activeAccount?.id)
   const title = isEditing ? '编辑账户' : '添加账户'
 
   const setField = (field) => (event) => {
@@ -99,11 +104,28 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     if (success) setSuccess('')
   }
 
+  const setAuthMode = (event) => {
+    const authMode = event.target.value
+    setForm((current) => ({
+      ...current,
+      authMode,
+      // A mode switch is a security boundary: discard the inactive value so
+      // it cannot be submitted later or remain visible in the form.
+      password: authMode === 'password' ? current.password : '',
+      cookies: authMode === 'cookies' ? current.cookies : '',
+    }))
+    if (error) setError('')
+    if (success) setSuccess('')
+  }
+
   const validate = ({ requireSecret = false } = {}) => {
     if (!form.name.trim()) return '请输入账户名称'
     if (!form.username.trim()) return '请输入手机号'
-    if (requireSecret && !form.password.trim() && !form.cookies.trim()) {
-      return '请输入密码或 Cookie Header'
+    if (requireSecret) {
+      const activeSecret = form.authMode === 'password' ? form.password : form.cookies
+      if (!activeSecret.trim()) {
+        return form.authMode === 'password' ? '请输入密码' : '请输入 Cookie Header'
+      }
     }
     return ''
   }
@@ -113,16 +135,17 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
       name: form.name.trim(),
       username: form.username.trim(),
     }
-    // An empty replacement must be omitted.  The account API treats an
-    // omitted password as "keep the stored encrypted secret".
-    if (form.password.trim()) values.password = form.password
-    if (form.cookies.trim()) values.cookies = form.cookies.trim()
+    // An empty replacement must be omitted. The account API treats an
+    // omitted password/cookies field as "keep the stored encrypted secret".
+    // Only the active mode may contribute a credential field.
+    if (form.authMode === 'password' && form.password.trim()) values.password = form.password
+    if (form.authMode === 'cookies' && form.cookies.trim()) values.cookies = form.cookies.trim()
     return values
   }
 
   const savedAccount = async () => {
     const values = payload()
-    if (isEditing) return updateAccount(account.id, values)
+    if (isEditing) return updateAccount(activeAccount.id, values)
     return createAccount(values)
   }
 
@@ -130,6 +153,10 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     const safeSaved = publicAccount(saved)
     if (typeof onSaved === 'function' && safeSaved?.id) onSaved(safeSaved)
     return safeSaved
+  }
+
+  const clearSecrets = () => {
+    setForm((current) => ({ ...current, password: '', cookies: '' }))
   }
 
   const handleSubmit = async (event) => {
@@ -146,22 +173,43 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     setSaving(true)
     setError('')
     setSuccess('')
+    let persistedProfile = null
     try {
       const saved = await savedAccount()
       const safeSaved = notifySaved(saved)
+      persistedProfile = safeSaved
+      if (!safeSaved?.id) {
+        clearSecrets()
+        throw new Error('账户保存成功，但缺少账户标识')
+      }
+
       if (!isEditing) {
-        const id = safeSaved?.id
-        if (!id) throw new Error('账户保存成功，但缺少账户标识')
-        const verified = await verifyAccount(id)
-        notifySaved(verified || safeSaved)
-        setSuccess('账户验证成功')
+        // The profile is now persisted even if verification fails. Keep its
+        // id as the next editing target and retry verification only.
+        setCreatedProfile(safeSaved)
+        clearSecrets()
+        try {
+          const verified = await verifyAccount(safeSaved.id)
+          const safeVerified = publicAccount(verified)
+          const nextProfile = safeVerified?.id
+            ? { ...safeSaved, ...safeVerified }
+            : safeSaved
+          setCreatedProfile(nextProfile)
+          notifySaved(nextProfile)
+          setSuccess('账户验证成功')
+        } catch (verificationError) {
+          clearSecrets()
+          setSuccess('')
+          setError(errorMessage(verificationError, '账户验证失败，请重试'))
+        }
       } else {
+        clearSecrets()
         setSuccess('账户已保存')
       }
-      // Do not retain secrets after a successful request.  The stored API
-      // response is metadata-only and is never copied into these controls.
-      setForm((current) => ({ ...current, password: '', cookies: '' }))
     } catch (requestError) {
+      // If persistence already succeeded, do not leave a typed secret in the
+      // form even when the response was malformed or a later operation failed.
+      if (persistedProfile) clearSecrets()
       setError(errorMessage(requestError, '保存账户失败，请重试'))
     } finally {
       setSaving(false)
@@ -181,11 +229,17 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     setError('')
     setSuccess('')
     try {
-      const verified = await verifyAccount(account.id)
-      notifySaved(verified || account)
+      const verified = await verifyAccount(activeAccount.id)
+      const safeVerified = publicAccount(verified)
+      const nextProfile = safeVerified?.id
+        ? { ...activeAccount, ...safeVerified }
+        : activeAccount
+      if (!account) setCreatedProfile(nextProfile)
+      notifySaved(nextProfile)
       setSuccess('账户验证成功')
-      setForm((current) => ({ ...current, password: '', cookies: '' }))
+      clearSecrets()
     } catch (requestError) {
+      clearSecrets()
       setError(errorMessage(requestError, '账户验证失败，请重试'))
     } finally {
       setVerifying(false)
@@ -269,7 +323,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
               <select
                 id="account-auth-mode"
                 value={form.authMode}
-                onChange={setField('authMode')}
+                onChange={setAuthMode}
                 className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               >
                 <option value="password">密码登录</option>
@@ -293,6 +347,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 onChange={setField('password')}
                 autoComplete={isEditing ? 'new-password' : 'current-password'}
                 placeholder={isEditing ? '留空表示不修改' : '输入密码'}
+                disabled={form.authMode !== 'password'}
               />
             </Field>
 
@@ -313,6 +368,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 autoComplete="off"
                 spellCheck="false"
                 placeholder="留空或粘贴 Cookie Header"
+                disabled={form.authMode !== 'cookies'}
                 className="touch-target flex min-h-20 w-full resize-y rounded-md border border-separator bg-surface px-2.5 py-2 text-sm leading-5 text-label-primary outline-none placeholder:text-label-tertiary focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               />
             </Field>

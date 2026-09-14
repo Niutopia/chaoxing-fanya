@@ -45,6 +45,18 @@ function taskStateLabel(state) {
   return TASK_LABELS[state] ?? '未知状态'
 }
 
+/** Keep account identity useful at a glance without exposing a full login. */
+function maskUsername(username) {
+  const value = String(username ?? '').trim()
+  if (!value) return '未设置'
+  if (/^\d{11}$/.test(value)) {
+    return `${value.slice(0, 3)}****${value.slice(-4)}`
+  }
+  if (value.length <= 2) return '••••'
+  const visible = Math.max(1, Math.min(2, Math.floor(value.length / 4)))
+  return `${value.slice(0, visible)}••••${value.slice(-visible)}`
+}
+
 function asArray(value, key) {
   if (Array.isArray(value)) return value
   if (Array.isArray(value?.data)) return value.data
@@ -170,6 +182,7 @@ function AccountRow({ account, task, menuOpen, onMenuToggle, onEdit, onVerify, o
     invalid: '验证失败',
     unverified: '未验证',
   }[verificationStatus] ?? ''
+  const username = accountField(account, 'username')
 
   return (
     <div
@@ -189,7 +202,7 @@ function AccountRow({ account, task, menuOpen, onMenuToggle, onEdit, onVerify, o
           <span className="min-w-0 truncate font-medium text-label-primary">{account.name}</span>
         </div>
         <p className="mt-1 truncate text-xs text-label-secondary">
-          {account.username}
+          <span title="手机号已遮罩">{maskUsername(username)}</span>
           {verificationLabel ? <span className="ml-2">· {verificationLabel}</span> : null}
         </p>
       </div>
@@ -541,5 +554,5 @@ function OverviewPage() {
   )
 }
 
-export { AccountRow, AccountActionsMenu, taskForAccount }
+export { AccountRow, AccountActionsMenu, maskUsername, taskForAccount }
 export default OverviewPage

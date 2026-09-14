@@ -41,6 +41,7 @@ test.each([
   ['stopping', '正在停止'],
   ['failed', '失败'],
   ['completed', '已完成'],
+  ['stopped', '已停止'],
 ])('renders %s account task state', async (state, label) => {
   listAccounts.mockResolvedValue([{ id: 'a', name: '张三', enabled: true }])
   listTasks.mockResolvedValue([
@@ -86,3 +87,19 @@ test('renders disabled accounts as distinct from an idle account', async () => {
   expect(screen.getByText('已停用')).toBeInTheDocument()
 })
 
+test('masks a phone username in the overview while preserving the full value in edit form', async () => {
+  const user = userEvent.setup()
+  listAccounts.mockResolvedValue([
+    { id: 'a', name: '张三', username: '13800000000', enabled: true },
+  ])
+
+  render(<OverviewPage />)
+
+  expect(await screen.findByText('138****0000')).toBeInTheDocument()
+  expect(screen.queryByText('13800000000')).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '编辑账户' }))
+
+  expect(screen.getByLabelText('手机号')).toHaveValue('13800000000')
+})
