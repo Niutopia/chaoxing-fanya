@@ -93,6 +93,30 @@
   }
 }
 
+/* Keep controls comfortable for touch on narrow layouts. The compact class
+   restores the native desktop utility density without shrinking mobile hits. */
+.touch-target {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+@media (min-width: 768px) {
+  .touch-target.touch-target-compact {
+    min-width: 32px;
+    min-height: 32px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}
+
 @supports not (backdrop-filter: blur(1px)) {
   .shell-material {
     background: var(--sidebar-opaque);

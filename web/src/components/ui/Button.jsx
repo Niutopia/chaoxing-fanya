@@ -36,7 +36,7 @@ const Button = React.forwardRef(function Button(
       ref={ref}
       type={type}
       className={cn(
-        'inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:pointer-events-none disabled:opacity-50 motion-reduce:transition-none',
+        'touch-target touch-target-compact inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:pointer-events-none disabled:opacity-50 motion-reduce:transition-none',
         variantStyles[variant] ?? variantStyles.default,
         sizeStyles[size] ?? sizeStyles.default,
         className,

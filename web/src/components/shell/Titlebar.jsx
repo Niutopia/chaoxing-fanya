@@ -21,7 +21,7 @@ const Titlebar = React.forwardRef(function Titlebar(
     >
       <button
         type="button"
-        className="inline-flex size-8 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-1 md:hidden"
+        className="touch-target touch-target-compact inline-flex size-8 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-1 md:hidden"
         aria-label={sidebarOpen ? '关闭侧边栏' : '打开侧边栏'}
         aria-controls="account-sidebar"
         aria-expanded={sidebarOpen}

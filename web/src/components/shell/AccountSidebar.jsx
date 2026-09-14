@@ -7,7 +7,7 @@ import StatusDot, { taskStateLabel } from '../ui/StatusDot'
 
 const navLinkClass = ({ isActive }) =>
   cn(
-    'group flex min-h-9 items-center gap-2 rounded-md px-2.5 text-sm text-label-secondary transition-colors duration-150 hover:bg-black/[0.05] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
+    'touch-target touch-target-compact group flex min-h-9 items-center gap-2 rounded-md px-2.5 text-sm text-label-secondary transition-colors duration-150 hover:bg-black/[0.05] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
     isActive && 'bg-accent-blue/[0.1] font-medium text-accent-blue hover:bg-accent-blue/[0.14] hover:text-accent-blue',
   )
 

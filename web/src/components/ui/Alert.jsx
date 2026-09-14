@@ -64,7 +64,7 @@ const Alert = React.forwardRef(function Alert(
       {onDismiss ? (
         <button
           type="button"
-          className="inline-flex size-6 shrink-0 items-center justify-center rounded text-label-tertiary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          className="touch-target touch-target-compact inline-flex size-6 shrink-0 items-center justify-center rounded text-label-tertiary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
           onClick={onDismiss}
           aria-label="关闭提示"
         >

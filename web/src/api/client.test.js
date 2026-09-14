@@ -47,3 +47,34 @@ test('falls back to a useful message when an API error message is blank', () => 
 
   expect(error.message).toBe('请求失败，请稍后重试')
 })
+
+test('redacts secrets and transport objects from API errors', () => {
+  const password = 'known-password-123'
+  const apiKey = 'known-api-key-456'
+  const error = toApiError({
+    message: `request failed with ${apiKey}`,
+    config: {
+      data: JSON.stringify({ password, api_key: apiKey }),
+      headers: { Authorization: `Bearer ${apiKey}` },
+    },
+    request: { body: password },
+    response: {
+      status: 500,
+      data: {
+        status: false,
+        code: 'answer_unavailable',
+        msg: `upstream rejected ${password}`,
+        nested: { password, api_key: apiKey },
+      },
+    },
+  })
+
+  const serialized = JSON.stringify(error)
+  expect(serialized).not.toContain(password)
+  expect(serialized).not.toContain(apiKey)
+  expect(error).not.toHaveProperty('cause')
+  expect(error).not.toHaveProperty('config')
+  expect(error).not.toHaveProperty('request')
+  expect(error).not.toHaveProperty('response')
+  expect(error.details.nested).toEqual({ password: '[redacted]', api_key: '[redacted]' })
+})
