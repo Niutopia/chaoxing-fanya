@@ -89,6 +89,20 @@ test('blocks start when answering is enabled but connection is untested', async 
   expect(screen.getByRole('button', { name: '开始学习' })).toBeDisabled()
 })
 
+test.each([
+  {},
+  { last_test_status: 'pending' },
+  { last_test_status: 'failed' },
+])('treats missing, unknown, and failed answer status as untested', async (status) => {
+  getPreferences.mockResolvedValue({ selected_course_ids: ['math'], answer_enabled: true })
+  getAnswerConnection.mockResolvedValue({ enabled: true, has_api_key: true, ...status })
+
+  renderPage('/accounts/account-a/launch')
+
+  expect(await screen.findByText('请先在设置中测试答题连接')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '开始学习' })).toBeDisabled()
+})
+
 test('search select-all clear and stale refresh preserve the last course list', async () => {
   const user = userEvent.setup()
   listCourses.mockResolvedValueOnce(courseFixtures).mockRejectedValueOnce(new ApiError('网络错误', 503, 'courses_unavailable'))
@@ -117,6 +131,61 @@ test('saves preferences and navigates after successful start', async () => {
   expect(savePreferences.mock.invocationCallOrder[0]).toBeLessThan(startTask.mock.invocationCallOrder[0])
   expect(startTask).toHaveBeenCalledWith('account-a', { course_ids: ['math'] })
   expect(await screen.findByTestId('location')).toHaveTextContent('/tasks/task-a')
+})
+
+test('sends launch-only preferences without retaining advanced config', async () => {
+  const user = userEvent.setup()
+  startTask.mockResolvedValue({ id: 'task-a' })
+  getPreferences.mockResolvedValue({
+    selected_course_ids: [],
+    speed: 1.5,
+    jobs: 4,
+    answer_enabled: false,
+    notification_config: { token: 'launch-notification-secret' },
+    ocr_config: { api_key: 'launch-ocr-secret', endpoint: 'http://ocr.example.invalid/v1' },
+  })
+
+  renderPage('/accounts/account-a/launch')
+  await user.click(await screen.findByRole('checkbox', { name: '高等数学' }))
+  await user.click(screen.getByRole('button', { name: '开始学习' }))
+
+  const payload = savePreferences.mock.calls[0][1]
+  expect(payload).not.toHaveProperty('notification_config')
+  expect(payload).not.toHaveProperty('ocr_config')
+  expect(JSON.stringify(payload)).not.toContain('launch-notification-secret')
+  expect(JSON.stringify(payload)).not.toContain('launch-ocr-secret')
+})
+
+test('keeps start disabled while preference and connection requests are pending', async () => {
+  const user = userEvent.setup()
+  let resolveCourses
+  let resolvePreferences
+  let resolveConnection
+  listCourses.mockReturnValue(new Promise((resolve) => { resolveCourses = resolve }))
+  getPreferences.mockReturnValue(new Promise((resolve) => { resolvePreferences = resolve }))
+  getAnswerConnection.mockReturnValue(new Promise((resolve) => { resolveConnection = resolve }))
+
+  renderPage('/accounts/account-a/launch')
+  resolveCourses(courseFixtures)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: '高等数学' })).toBeDisabled())
+
+  resolvePreferences({ selected_course_ids: ['math'], answer_enabled: false })
+  await waitFor(() => expect(screen.getByRole('button', { name: '开始学习' })).toBeDisabled())
+  resolveConnection({ enabled: false, last_test_status: 'untested' })
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: '高等数学' })).not.toBeDisabled())
+  expect(screen.getByRole('button', { name: '开始学习' })).not.toBeDisabled()
+  await user.click(screen.getByRole('button', { name: '开始学习' }))
+  expect(savePreferences).toHaveBeenCalled()
+})
+
+test('blocks start and preserves no default preference write when a dependency fails', async () => {
+  getPreferences.mockRejectedValue(new ApiError('参数加载失败', 503, 'preferences_unavailable'))
+  renderPage('/accounts/account-a/launch')
+
+  expect(await screen.findByText('参数加载失败')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '开始学习' })).toBeDisabled()
+  expect(savePreferences).not.toHaveBeenCalled()
+  expect(startTask).not.toHaveBeenCalled()
 })
 
 test.each([

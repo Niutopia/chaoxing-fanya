@@ -17,8 +17,6 @@ const DEFAULT_PREFERENCES = {
   answer_enabled: false,
   answer_cover_rate: 0.9,
   answer_auto_submit: false,
-  notification_config: {},
-  ocr_config: {},
 }
 
 const ACTIVE_TASK_STATES = new Set(['running', 'stopping'])
@@ -60,16 +58,15 @@ function asPreferences(value) {
 
   return {
     ...DEFAULT_PREFERENCES,
-    ...source,
     selected_course_ids: Array.isArray(source.selected_course_ids)
       ? source.selected_course_ids.map(String)
       : DEFAULT_PREFERENCES.selected_course_ids,
-    notification_config: source.notification_config && typeof source.notification_config === 'object'
-      ? source.notification_config
-      : {},
-    ocr_config: source.ocr_config && typeof source.ocr_config === 'object'
-      ? source.ocr_config
-      : {},
+    speed: source.speed ?? DEFAULT_PREFERENCES.speed,
+    jobs: source.jobs ?? DEFAULT_PREFERENCES.jobs,
+    notopen_action: source.notopen_action ?? DEFAULT_PREFERENCES.notopen_action,
+    answer_enabled: source.answer_enabled ?? DEFAULT_PREFERENCES.answer_enabled,
+    answer_cover_rate: source.answer_cover_rate ?? DEFAULT_PREFERENCES.answer_cover_rate,
+    answer_auto_submit: source.answer_auto_submit ?? DEFAULT_PREFERENCES.answer_auto_submit,
   }
 }
 
@@ -130,12 +127,6 @@ function preferencePayload(preferences) {
       DEFAULT_PREFERENCES.answer_cover_rate,
     ),
     answer_auto_submit: Boolean(preferences.answer_auto_submit),
-    notification_config: preferences.notification_config && typeof preferences.notification_config === 'object'
-      ? preferences.notification_config
-      : {},
-    ocr_config: preferences.ocr_config && typeof preferences.ocr_config === 'object'
-      ? preferences.ocr_config
-      : {},
   }
 }
 
@@ -150,13 +141,12 @@ function taskIdFrom(value) {
 function answerConnectionReady(connection) {
   if (!connection) return false
   if (connection.enabled !== true) return false
-  if (connection.has_api_key === false) return false
+  if (connection.has_api_key !== true) return false
   const status = connection.last_test_status ?? connection.test_status ?? connection.testStatus
-  // Older public settings responses intentionally omit the probe status. In
-  // that case let the server-side start guard decide while still honoring an
-  // explicit failed/untested status from newer responses.
-  if (status === undefined) return true
-  return status === 'success' || connection.tested === true
+  // A task may only enable answering after the saved connection has a
+  // successful probe.  Missing/unknown status is intentionally blocked: the
+  // server cannot safely infer that a draft or an older response was tested.
+  return status === 'success'
 }
 
 function preferenceNumber(value, fallback) {
@@ -182,6 +172,7 @@ function LaunchPage({
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [coursesLoading, setCoursesLoading] = useState(true)
+  const [initialReady, setInitialReady] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [stale, setStale] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -195,6 +186,7 @@ function LaunchPage({
     if (!accountId) {
       setLoading(false)
       setCoursesLoading(false)
+      setInitialReady(false)
       setLoadError('缺少账户信息')
       return
     }
@@ -205,7 +197,9 @@ function LaunchPage({
     } else {
       setLoading(true)
       setCoursesLoading(true)
+      setInitialReady(false)
       setLoadError('')
+      setAnswerError('')
     }
     setActionError('')
 
@@ -215,10 +209,12 @@ function LaunchPage({
     const preferencesPromise = refresh ? null : getPreferences(accountId)
     const connectionPromise = refresh ? null : getAnswerConnection()
 
+    let coursesSucceeded = false
     try {
       const courseResult = await coursePromise
       if (currentRequest !== requestId.current) return
       setCourses(asCourses(courseResult))
+      coursesSucceeded = true
       hasCoursesRef.current = true
       setStale(false)
       setLoadError('')
@@ -251,9 +247,15 @@ function LaunchPage({
 
       if (connectionResult.status === 'fulfilled') {
         setAnswerConnection(unwrap(connectionResult.value, ['connection', 'answer_connection']))
+        setAnswerError('')
       } else {
         setAnswerError(errorMessage(connectionResult.reason, '答题连接状态加载失败'))
       }
+      setInitialReady(
+        coursesSucceeded
+        && preferencesResult.status === 'fulfilled'
+        && connectionResult.status === 'fulfilled',
+      )
       setLoading(false)
     }
   }, [accountId])
@@ -323,6 +325,7 @@ function LaunchPage({
   }
 
   const validate = () => {
+    if (!initialReady) return '请等待课程、学习参数和连接加载完成'
     if (!enabled) return '请先启用该账户'
     if (runningTask) return '该账户已有任务在运行'
     if (selectedIds.length === 0) return '请至少选择一门课程'
@@ -406,10 +409,20 @@ function LaunchPage({
       </div>
 
       {loadError ? (
-        <Alert className="mt-5" variant="warning" aria-live="polite">{loadError}</Alert>
+        <Alert className="mt-5" variant="warning" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{loadError}</span>
+            <Button type="button" variant="outline" onClick={() => loadPage()}>重试</Button>
+          </div>
+        </Alert>
       ) : null}
-      {answerError && !preferences.answer_enabled ? (
-        <Alert className="mt-5" variant="warning" aria-live="polite">{answerError}</Alert>
+      {answerError ? (
+        <Alert className="mt-5" variant="warning" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{answerError}</span>
+            <Button type="button" variant="outline" onClick={() => loadPage()}>重试</Button>
+          </div>
+        </Alert>
       ) : null}
       {actionError ? (
         <Alert className="mt-5" variant="danger" aria-live="polite">{actionError}</Alert>
@@ -425,9 +438,9 @@ function LaunchPage({
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <Button type="button" size="sm" variant="ghost" onClick={selectAll} disabled={filteredCourses.length === 0}>全选</Button>
-              <Button type="button" size="sm" variant="ghost" onClick={clearSelection} disabled={selectedCount === 0}>清空</Button>
-              <Button type="button" size="sm" variant="outline" onClick={() => loadPage({ refresh: true })} loading={refreshing}>
+              <Button type="button" size="sm" variant="ghost" onClick={selectAll} disabled={!initialReady || filteredCourses.length === 0}>全选</Button>
+              <Button type="button" size="sm" variant="ghost" onClick={clearSelection} disabled={!initialReady || selectedCount === 0}>清空</Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => loadPage({ refresh: true })} loading={refreshing} disabled={!initialReady}>
                 刷新课程
               </Button>
             </div>
@@ -440,6 +453,7 @@ function LaunchPage({
               placeholder="搜索课程名称或 ID"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
+              disabled={!initialReady}
             />
           </div>
 
@@ -464,6 +478,7 @@ function LaunchPage({
                       className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                       checked={selectedSet.has(course.courseId)}
                       onChange={() => toggleCourse(course.courseId)}
+                      disabled={!initialReady}
                     />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium text-label-primary">{course.title}</span>
@@ -492,6 +507,7 @@ function LaunchPage({
                 step="0.1"
                 value={preferenceNumber(preferences.speed, DEFAULT_PREFERENCES.speed)}
                 onChange={updatePreference('speed')}
+                disabled={!initialReady}
               />
             </Field>
 
@@ -505,6 +521,7 @@ function LaunchPage({
                 step="1"
                 value={preferenceNumber(preferences.jobs, DEFAULT_PREFERENCES.jobs)}
                 onChange={updatePreference('jobs')}
+                disabled={!initialReady}
               />
             </Field>
 
@@ -513,6 +530,7 @@ function LaunchPage({
                 id="launch-notopen-action"
                 value={preferences.notopen_action}
                 onChange={updatePreference('notopen_action')}
+                disabled={!initialReady}
                 className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               >
                 <option value="retry">稍后重试</option>
@@ -527,6 +545,7 @@ function LaunchPage({
                   className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                   checked={Boolean(preferences.answer_enabled)}
                   onChange={updatePreference('answer_enabled')}
+                  disabled={!initialReady}
                 />
                 <span className="min-w-0">
                   <span className="block font-medium text-label-primary">启用答题</span>
@@ -546,6 +565,7 @@ function LaunchPage({
                       step="0.05"
                       value={preferenceNumber(preferences.answer_cover_rate, DEFAULT_PREFERENCES.answer_cover_rate)}
                       onChange={updatePreference('answer_cover_rate')}
+                      disabled={!initialReady}
                     />
                   </Field>
                   <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
@@ -554,6 +574,7 @@ function LaunchPage({
                       className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                       checked={Boolean(preferences.answer_auto_submit)}
                       onChange={updatePreference('answer_auto_submit')}
+                      disabled={!initialReady}
                     />
                     <span className="font-medium text-label-primary">自动提交答案</span>
                   </label>
@@ -572,7 +593,7 @@ function LaunchPage({
                 className="w-full"
                 onClick={handleStart}
                 loading={saving}
-                disabled={!enabled || Boolean(runningTask) || Boolean(connectionBlocked)}
+                disabled={!initialReady || !enabled || Boolean(runningTask) || Boolean(connectionBlocked)}
               >
                 开始学习
               </Button>

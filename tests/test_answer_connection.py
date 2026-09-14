@@ -156,6 +156,35 @@ def test_connection_routes_mask_and_preserve_key(tmp_path: Path):
     assert app.extensions["services"]["store"].resolve_answer_connection().api_key is None
 
 
+def test_connection_route_exposes_only_saved_probe_status(tmp_path: Path):
+    app = create_app({"TESTING": True, "DATA_DIR": tmp_path})
+    client = app.test_client()
+    client.put(
+        "/api/settings/answer-connection",
+        json={
+            "enabled": True,
+            "base_url": "http://localhost:8849/v1",
+            "model": "gemini-3.8-flash-high",
+            "api_key": "answer-status-secret",
+        },
+    )
+
+    untested_response = client.get("/api/settings/answer-connection")
+    untested = untested_response.get_json()["data"]
+    assert untested["last_test_status"] == "untested"
+    assert "last_test_fingerprint" not in untested
+    assert "fingerprint" not in untested
+    assert "answer-status-secret" not in untested_response.get_data(as_text=True)
+
+    app.extensions["services"]["store"].save_answer_test_status(
+        "success", "fingerprint-never-returned"
+    )
+    tested_response = client.get("/api/settings/answer-connection")
+    tested = tested_response.get_json()["data"]
+    assert tested["last_test_status"] == "success"
+    assert "fingerprint-never-returned" not in tested_response.get_data(as_text=True)
+
+
 def test_connection_test_route_uses_draft_key_without_returning_it(tmp_path: Path):
     seen = {}
 

@@ -13,6 +13,16 @@ import {
 } from '../api/settings'
 import SettingsPage from './SettingsPage'
 
+const { getPreferences, savePreferences } = vi.hoisted(() => ({
+  getPreferences: vi.fn(),
+  savePreferences: vi.fn(),
+}))
+
+vi.mock('../api/accounts', () => ({
+  getPreferences,
+  savePreferences,
+}))
+
 vi.mock('../api/settings', () => ({
   clearAnswerKey: vi.fn(),
   getAnswerConnection: vi.fn(),
@@ -50,6 +60,8 @@ beforeEach(() => {
   saveRuntimeSettings.mockResolvedValue({})
   clearAnswerKey.mockResolvedValue({})
   testAnswerConnection.mockResolvedValue({ ok: true, model_found: true })
+  getPreferences.mockResolvedValue({ notification_config: {}, ocr_config: {} })
+  savePreferences.mockResolvedValue({})
 })
 
 test('shows a mask and does not render the saved api key', async () => {
@@ -119,4 +131,73 @@ test('clears the draft key after a successful connection save', async () => {
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   expect(saveAnswerConnection).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'new-secret' }))
   expect(key).toHaveValue('')
+})
+
+test('does not render notification or OCR secrets and uses endpoint for OCR drafts', async () => {
+  const user = userEvent.setup()
+  const notificationUrl = 'https://notify.example.invalid/private-url'
+  const notificationToken = 'notification-settings-secret'
+  const chatId = 'tg-chat-settings-secret'
+  const ocrKey = 'ocr-settings-secret'
+  const nestedNotificationSecret = 'nested-notification-authorization-secret'
+  const nestedOcrSecret = 'nested-ocr-secret'
+  getPreferences.mockResolvedValue({
+    notification_config: {
+      enabled: true,
+      provider: 'telegram',
+      url: notificationUrl,
+      token: notificationToken,
+      tg_chat_id: chatId,
+      has_token: true,
+      has_url: true,
+      has_tg_chat_id: true,
+      nested: { authorization: nestedNotificationSecret },
+    },
+    ocr_config: {
+      enabled: true,
+      provider: 'openai',
+      endpoint: 'http://ocr.example.invalid/v1',
+      api_key: ocrKey,
+      has_api_key: true,
+      nested: { key: nestedOcrSecret, secret: 'nested-ocr-secret-2' },
+    },
+  })
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  expect(await screen.findByText('账号 A')).toBeInTheDocument()
+  expect(document.body.textContent).not.toContain(notificationUrl)
+  expect(document.body.textContent).not.toContain(notificationToken)
+  expect(document.body.textContent).not.toContain(chatId)
+  expect(document.body.textContent).not.toContain(ocrKey)
+  expect(document.body.textContent).not.toContain(nestedNotificationSecret)
+  expect(document.body.textContent).not.toContain(nestedOcrSecret)
+
+  await user.click(screen.getByText('通知'))
+  expect(screen.getByLabelText('通知地址')).toHaveValue('')
+  expect(screen.getByLabelText('通知 Token')).toHaveValue('')
+  expect(screen.getByLabelText('替换 Telegram Chat ID')).toHaveValue('')
+
+  await user.click(screen.getByText('OCR'))
+  expect(screen.getByLabelText('OCR 地址')).toHaveValue('http://ocr.example.invalid/v1')
+  const replacement = screen.getByLabelText('替换 OCR API Key')
+  expect(replacement).toHaveValue('')
+  await user.type(replacement, 'new-ocr-secret')
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+
+  expect(savePreferences).toHaveBeenCalledWith('account-a', expect.objectContaining({
+    ocr_config: expect.objectContaining({ endpoint: 'http://ocr.example.invalid/v1', api_key: 'new-ocr-secret' }),
+  }))
+  const payloadText = JSON.stringify(savePreferences.mock.calls[0][1])
+  expect(payloadText).not.toContain(notificationUrl)
+  expect(payloadText).not.toContain(notificationToken)
+  expect(payloadText).not.toContain(chatId)
+  expect(payloadText).not.toContain(ocrKey)
+  expect(payloadText).not.toContain(nestedNotificationSecret)
+  expect(payloadText).not.toContain(nestedOcrSecret)
+  expect(payloadText).not.toContain('nested-ocr-secret-2')
 })

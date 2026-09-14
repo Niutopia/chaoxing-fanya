@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import re
+from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
@@ -116,7 +118,14 @@ def _account_data(profile) -> dict[str, Any]:
 
 
 def _preferences_data(preferences: AccountPreferences) -> dict[str, Any]:
-    """Serialize preferences without relying on dataclass implementation details."""
+    """Serialize preferences without returning account-owned secrets.
+
+    Account notification and OCR settings are consumed by workers, so their
+    stored values still need to remain available on the server.  They must
+    never be sent back through this public endpoint, though: return only
+    ordinary configuration values plus presence/mask metadata for fields that
+    can contain credentials or private destinations.
+    """
 
     return {
         "selected_course_ids": list(preferences.selected_course_ids),
@@ -126,9 +135,150 @@ def _preferences_data(preferences: AccountPreferences) -> dict[str, Any]:
         "answer_enabled": preferences.answer_enabled,
         "answer_cover_rate": preferences.answer_cover_rate,
         "answer_auto_submit": preferences.answer_auto_submit,
-        "notification_config": dict(preferences.notification_config),
-        "ocr_config": dict(preferences.ocr_config),
+        "notification_config": _safe_config(
+            preferences.notification_config, notification=True
+        ),
+        "ocr_config": _safe_config(preferences.ocr_config),
     }
+
+
+_CONFIG_MASK = "Configured (••••)"
+
+
+def _config_key(key: Any) -> str:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key).strip())
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _config_compact_key(key: Any) -> str:
+    return _config_key(key).replace("_", "")
+
+
+def _is_config_metadata_key(key: Any) -> bool:
+    normalized = _config_key(key)
+    return (
+        normalized.startswith("has_")
+        or normalized.endswith("_mask")
+        or normalized.endswith("_configured")
+    )
+
+
+def _is_sensitive_config_key(key: Any, *, notification: bool = False) -> bool:
+    """Recognize credential and private-destination aliases in config maps."""
+
+    compact = _config_compact_key(key)
+    if not compact:
+        return False
+
+    # Keep this deliberately provider-agnostic.  Integrations frequently use
+    # ``key``/``apikey``/``authorization`` aliases, including nested maps.
+    if (
+        compact == "key"
+        or any(
+            marker in compact
+            for marker in (
+                "apikey",
+                "accesstoken",
+                "accesskey",
+                "token",
+                "secret",
+                "authorization",
+                "password",
+                "credential",
+                "cookie",
+                "privatekey",
+            )
+        )
+    ):
+        return True
+
+    if notification and any(
+        marker in compact
+        for marker in ("url", "uri", "endpoint", "webhook", "chatid", "chat")
+    ):
+        return True
+    return False
+
+
+def _masked_config_value(value: Any) -> tuple[bool, str | None]:
+    """Return presence/mask metadata without retaining the source value."""
+
+    if value is None:
+        return False, None
+    if isinstance(value, Mapping):
+        present = bool(value)
+    elif isinstance(value, (list, tuple, set)):
+        present = bool(value)
+    else:
+        present = bool(str(value).strip())
+    return present, _CONFIG_MASK if present else None
+
+
+def _safe_config(value: Any, *, notification: bool = False) -> dict[str, Any]:
+    """Deeply redact secret-bearing config values for a public response."""
+
+    if not isinstance(value, Mapping):
+        return {}
+
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        # A previous public response may be submitted by an API client.  Do
+        # not persist its derived metadata as if it were provider config.
+        if _is_config_metadata_key(key):
+            continue
+        if _is_sensitive_config_key(key, notification=notification):
+            present, mask = _masked_config_value(item)
+            normalized = _config_key(key)
+            result[f"has_{normalized}"] = present
+            result[f"{normalized}_mask"] = mask
+            continue
+        if isinstance(item, Mapping):
+            result[str(key)] = _safe_config(item, notification=notification)
+        elif isinstance(item, list):
+            result[str(key)] = [
+                _safe_config(entry, notification=notification)
+                if isinstance(entry, Mapping)
+                else entry
+                for entry in item
+            ]
+        elif isinstance(item, (str, int, float, bool)) or item is None:
+            result[str(key)] = item
+    return result
+
+
+def _merge_config(
+    current: Any, incoming: Any, *, notification: bool = False
+) -> dict[str, Any]:
+    """Merge editable config while preserving blank secret replacements.
+
+    The worker needs the raw server-side values, while the settings UI only
+    sends a non-blank replacement when the user intentionally changes a
+    secret.  Omitted and blank sensitive fields therefore leave the stored
+    value untouched.  Non-secret fields retain normal partial-update
+    semantics, including nested provider maps.
+    """
+
+    if not isinstance(incoming, Mapping):
+        raise ValueError("invalid preference config")
+    result: dict[str, Any] = (
+        deepcopy(dict(current)) if isinstance(current, Mapping) else {}
+    )
+    for raw_key, item in incoming.items():
+        key = str(raw_key)
+        if _is_config_metadata_key(key):
+            continue
+        if isinstance(item, Mapping):
+            result[key] = _merge_config(
+                result.get(key), item, notification=notification
+            )
+            continue
+        if _is_sensitive_config_key(key, notification=notification):
+            if item is None or (
+                isinstance(item, str) and not item.strip()
+            ):
+                continue
+        result[key] = item
+    return result
 
 
 def _json_mapping() -> Mapping[str, Any] | None:
@@ -224,8 +374,33 @@ def _preferences_payload(
     if unknown:
         raise ValueError("invalid preference fields")
 
-    baseline = _preferences_data(current or AccountPreferences())
-    baseline.update(payload)
+    current = current or AccountPreferences()
+    # Build the baseline from the server-side model rather than the public
+    # serializer above.  The latter intentionally contains only masks, and
+    # feeding it back into persistence would discard the real worker config.
+    baseline: dict[str, Any] = {
+        field: deepcopy(getattr(current, field))
+        for field in (
+            "selected_course_ids",
+            "speed",
+            "jobs",
+            "notopen_action",
+            "answer_enabled",
+            "answer_cover_rate",
+            "answer_auto_submit",
+        )
+    }
+    baseline["notification_config"] = deepcopy(current.notification_config)
+    baseline["ocr_config"] = deepcopy(current.ocr_config)
+    for field, value in payload.items():
+        if field == "notification_config":
+            baseline[field] = _merge_config(
+                current.notification_config, value, notification=True
+            )
+        elif field == "ocr_config":
+            baseline[field] = _merge_config(current.ocr_config, value)
+        else:
+            baseline[field] = value
 
     selected = baseline["selected_course_ids"]
     if not isinstance(selected, list) or not all(
@@ -454,6 +629,7 @@ def get_preferences(account_id: str):
 
 
 @accounts.put("/<account_id>/preferences")
+@accounts.patch("/<account_id>/preferences")
 def put_preferences(account_id: str):
     store = _services()["store"]
     payload = _json_mapping()

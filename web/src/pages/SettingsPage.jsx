@@ -30,8 +30,6 @@ const DEFAULT_RUNTIME = {
   max_active_accounts: 3,
 }
 
-const SECRET_KEY_PATTERN = /(?:api[-_]?key|token|secret|password|credential|authorization|cookie|private[-_]?key)/i
-
 function unwrap(value, keys = []) {
   if (value && typeof value === 'object') {
     for (const key of keys) {
@@ -56,17 +54,29 @@ function stringValue(value, fallback = '') {
   return typeof value === 'string' ? value : value == null ? fallback : String(value)
 }
 
+function safeMask(value, configured) {
+  if (!configured) return null
+  if (typeof value === 'string' && /(?:•|\*{2,})/.test(value)) return value
+  return 'Configured (••••)'
+}
+
 function normalizeConnection(value) {
   const source = unwrap(value, ['connection', 'answer_connection'])
   if (!source || typeof source !== 'object' || Array.isArray(source)) {
     return { ...DEFAULT_CONNECTION }
   }
   return {
-    ...DEFAULT_CONNECTION,
-    ...source,
+    // Keep the public connection shape explicit.  In particular, never
+    // spread an API response into React state where an accidental api_key
+    // field could survive a render or be copied into a later payload.
     enabled: source.enabled === true,
     base_url: stringValue(source.base_url, DEFAULT_CONNECTION.base_url),
     model: stringValue(source.model, DEFAULT_CONNECTION.model),
+    has_api_key: source.has_api_key === true,
+    api_key_mask: safeMask(source.api_key_mask, source.has_api_key === true),
+    last_test_status: typeof source.last_test_status === 'string'
+      ? source.last_test_status
+      : 'untested',
     timeout_seconds: numberValue(source.timeout_seconds, DEFAULT_CONNECTION.timeout_seconds),
     max_retries: numberValue(source.max_retries, DEFAULT_CONNECTION.max_retries),
     max_concurrency: numberValue(source.max_concurrency, DEFAULT_CONNECTION.max_concurrency),
@@ -79,8 +89,6 @@ function normalizeRuntime(value) {
     return { ...DEFAULT_RUNTIME }
   }
   return {
-    ...DEFAULT_RUNTIME,
-    ...source,
     max_active_accounts: numberValue(
       source.max_active_accounts ?? source.max_concurrent_accounts,
       DEFAULT_RUNTIME.max_active_accounts,
@@ -88,16 +96,71 @@ function normalizeRuntime(value) {
   }
 }
 
+const CONFIG_MASK = 'Configured (••••)'
+
+function configKey(key) {
+  return String(key).trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+}
+
+function compactConfigKey(key) {
+  return configKey(key).replace(/_/g, '')
+}
+
+function isConfigMetadataKey(key) {
+  const normalized = configKey(key)
+  return normalized.startsWith('has_')
+    || normalized.endsWith('_mask')
+    || normalized.endsWith('_configured')
+}
+
+function isSensitiveConfigKey(key, { notification = false } = {}) {
+  const compact = compactConfigKey(key)
+  if (!compact) return false
+  if (
+    compact === 'key'
+    || ['apikey', 'accesstoken', 'accesskey', 'token', 'secret', 'authorization', 'password', 'credential', 'cookie', 'privatekey']
+      .some((marker) => compact.includes(marker))
+  ) return true
+  return notification && ['url', 'uri', 'endpoint', 'webhook', 'chatid', 'chat'].some((marker) => compact.includes(marker))
+}
+
+function configValuePresent(value) {
+  if (value == null) return false
+  if (typeof value === 'string') return value.trim().length > 0
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value).length > 0
+  return Boolean(value)
+}
+
 /** Keep editable account configuration free of values that may be secrets. */
-function safeConfig(value) {
+function safeConfig(value, options = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
   return Object.entries(value).reduce((result, [key, item]) => {
-    if (SECRET_KEY_PATTERN.test(key)) {
-      if (item != null && String(item).trim()) result[`${key}_configured`] = true
+    if (isConfigMetadataKey(key)) {
+      // Metadata is already safe and is useful for showing “configured” copy.
+      const normalized = configKey(key)
+      if (normalized.startsWith('has_')) {
+        result[key] = item === true
+      } else if (normalized.endsWith('_mask') || normalized.endsWith('_configured')) {
+        result[key] = item ? CONFIG_MASK : null
+      }
+      return result
+    }
+    if (isSensitiveConfigKey(key, options)) {
+      const normalized = configKey(key)
+      const present = configValuePresent(item)
+      result[`has_${normalized}`] = present
+      result[`${normalized}_mask`] = present ? CONFIG_MASK : null
       return result
     }
     if (item && typeof item === 'object' && !Array.isArray(item)) {
-      result[key] = safeConfig(item)
+      result[key] = safeConfig(item, options)
+    } else if (Array.isArray(item)) {
+      result[key] = item.map((entry) => (
+        entry && typeof entry === 'object' && !Array.isArray(entry)
+          ? safeConfig(entry, options)
+          : entry
+      ))
     } else if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') {
       result[key] = item
     }
@@ -107,9 +170,19 @@ function safeConfig(value) {
 
 function configuredSecret(value, names = []) {
   if (!value || typeof value !== 'object') return false
+  const wanted = names.map((name) => compactConfigKey(name))
   return Object.entries(value).some(([key, item]) => {
-    if (!names.length || names.some((name) => key.toLowerCase().includes(name))) {
-      return SECRET_KEY_PATTERN.test(key) && item != null && String(item).trim()
+    const normalized = compactConfigKey(key)
+    if (normalized.startsWith('has') && item === true) {
+      const candidate = normalized.slice(3)
+      return !wanted.length || wanted.some((name) => candidate.includes(name))
+    }
+    if (normalized.endsWith('configured') && item === true) {
+      const candidate = normalized.slice(0, -10)
+      return !wanted.length || wanted.some((name) => candidate.includes(name))
+    }
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      return configuredSecret(item, names)
     }
     return false
   })
@@ -155,10 +228,51 @@ function validateRuntime(runtime, connection) {
   return ''
 }
 
+function editableConfig(value, options = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.entries(value).reduce((result, [key, item]) => {
+    if (isConfigMetadataKey(key)) return result
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      result[key] = editableConfig(item, options)
+    } else if (Array.isArray(item)) {
+      result[key] = item.map((entry) => (
+        entry && typeof entry === 'object' && !Array.isArray(entry)
+          ? editableConfig(entry, options)
+          : entry
+      ))
+    } else if (!isSensitiveConfigKey(key, options) && (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean')) {
+      result[key] = item
+    }
+    return result
+  }, {})
+}
+
 function preferenceConfigPayload(notification, ocr, originalNotification, originalOcr) {
+  const notificationPayload = {
+    ...editableConfig(originalNotification, { notification: true }),
+    enabled: Boolean(notification.enabled),
+    provider: stringValue(notification.provider).trim(),
+  }
+  const notificationUrl = stringValue(notification.url).trim()
+  const notificationToken = stringValue(notification.token).trim()
+  const notificationChatId = stringValue(notification.tg_chat_id).trim()
+  if (notificationUrl) notificationPayload.url = notificationUrl
+  if (notificationToken) notificationPayload.token = notificationToken
+  if (notificationChatId) notificationPayload.tg_chat_id = notificationChatId
+
+  const ocrPayload = {
+    ...editableConfig(originalOcr),
+    enabled: Boolean(ocr.enabled),
+    provider: stringValue(ocr.provider).trim(),
+    endpoint: stringValue(ocr.endpoint).trim(),
+    model: stringValue(ocr.model).trim(),
+  }
+  const ocrKey = stringValue(ocr.api_key).trim()
+  if (ocrKey) ocrPayload.api_key = ocrKey
+
   return {
-    notification_config: { ...originalNotification, ...notification },
-    ocr_config: { ...originalOcr, ...ocr },
+    notification_config: notificationPayload,
+    ocr_config: ocrPayload,
   }
 }
 
@@ -171,8 +285,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const [connection, setConnection] = useState({ ...DEFAULT_CONNECTION })
   const [apiKey, setApiKey] = useState('')
   const [runtime, setRuntime] = useState({ ...DEFAULT_RUNTIME })
-  const [notification, setNotification] = useState({ enabled: false, provider: '', url: '', token: '' })
-  const [ocr, setOcr] = useState({ enabled: false, provider: '', base_url: '', model: '', api_key: '' })
+  const [notification, setNotification] = useState({ enabled: false, provider: '', url: '', token: '', tg_chat_id: '' })
+  const [ocr, setOcr] = useState({ enabled: false, provider: '', endpoint: '', model: '', api_key: '' })
   const originalNotificationRef = useRef({})
   const originalOcrRef = useRef({})
   const requestId = useRef(0)
@@ -223,20 +337,25 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     if (selectedAccountId && accountResult) {
       if (accountResult.status === 'fulfilled') {
         const source = unwrap(accountResult.value, ['preferences']) || {}
-        const notificationSource = safeConfig(source.notification_config)
+        const notificationSource = safeConfig(source.notification_config, { notification: true })
         const ocrSource = safeConfig(source.ocr_config)
         originalNotificationRef.current = notificationSource
         originalOcrRef.current = ocrSource
         setNotification({
           enabled: notificationSource.enabled === true,
           provider: stringValue(notificationSource.provider),
-          url: stringValue(notificationSource.url ?? notificationSource.endpoint),
+          // Notification destinations are replacement-only inputs.  The
+          // response carries only has_*/mask metadata, never the saved URL.
+          url: '',
           token: '',
+          tg_chat_id: '',
         })
         setOcr({
           enabled: ocrSource.enabled === true,
           provider: stringValue(ocrSource.provider),
-          base_url: stringValue(ocrSource.base_url ?? ocrSource.endpoint),
+          // ``endpoint`` is the runtime's canonical OCR field.  Accept the
+          // legacy base_url shape only as a read compatibility bridge.
+          endpoint: stringValue(ocrSource.endpoint ?? ocrSource.base_url),
           model: stringValue(ocrSource.model),
           api_key: '',
         })
@@ -375,15 +494,15 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       if (savedConnection) setConnection((current) => ({ ...current, ...normalizeConnection(savedConnection) }))
       if (selectedAccountId) {
         const accountPayload = preferenceConfigPayload(
-          { ...notification, ...(notification.token.trim() ? { token: notification.token.trim() } : {}) },
-          { ...ocr, ...(ocr.api_key.trim() ? { api_key: ocr.api_key.trim() } : {}) },
+          notification,
+          ocr,
           originalNotificationRef.current,
           originalOcrRef.current,
         )
         await savePreferences(selectedAccountId, accountPayload)
-        originalNotificationRef.current = safeConfig(accountPayload.notification_config)
+        originalNotificationRef.current = safeConfig(accountPayload.notification_config, { notification: true })
         originalOcrRef.current = safeConfig(accountPayload.ocr_config)
-        setNotification((current) => ({ ...current, token: '' }))
+        setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
         setOcr((current) => ({ ...current, api_key: '' }))
       }
       setApiKey('')
@@ -551,6 +670,9 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
             <Field label="通知 Token" htmlFor="notification-token" description={configuredSecret(originalNotificationRef.current, ['token']) ? '已有 Token；留空表示保留' : '可选'}>
               <Input id="notification-token" type="password" value={notification.token} onChange={updateAccountConfig(setNotification, 'token')} disabled={!selectedAccountId} autoComplete="new-password" />
             </Field>
+            <Field label="替换 Telegram Chat ID" htmlFor="notification-chat-id" description={configuredSecret(originalNotificationRef.current, ['chat_id', 'tg_chat_id']) ? '已有 Chat ID；留空表示保留' : '可选'}>
+              <Input id="notification-chat-id" type="password" value={notification.tg_chat_id} onChange={updateAccountConfig(setNotification, 'tg_chat_id')} disabled={!selectedAccountId} autoComplete="new-password" />
+            </Field>
           </div>
         </details>
 
@@ -568,8 +690,8 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
             <Field label="OCR 提供方" htmlFor="ocr-provider">
               <Input id="ocr-provider" value={ocr.provider} onChange={updateAccountConfig(setOcr, 'provider')} disabled={!selectedAccountId} placeholder="例如：openai" />
             </Field>
-            <Field label="OCR 地址" htmlFor="ocr-base-url">
-              <Input id="ocr-base-url" value={ocr.base_url} onChange={updateAccountConfig(setOcr, 'base_url')} disabled={!selectedAccountId} placeholder="https://…" />
+            <Field label="OCR 地址" htmlFor="ocr-endpoint">
+              <Input id="ocr-endpoint" value={ocr.endpoint} onChange={updateAccountConfig(setOcr, 'endpoint')} disabled={!selectedAccountId} placeholder="https://…" />
             </Field>
             <Field label="OCR 模型" htmlFor="ocr-model">
               <Input id="ocr-model" value={ocr.model} onChange={updateAccountConfig(setOcr, 'model')} disabled={!selectedAccountId} />

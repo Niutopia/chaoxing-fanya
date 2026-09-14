@@ -134,7 +134,22 @@ def _connection_data(connection: AnswerConnection) -> dict[str, Any]:
         "timeout_seconds": connection.timeout_seconds,
         "max_retries": connection.max_retries,
         "max_concurrency": connection.max_concurrency,
+        # Probe metadata is safe to expose only as a coarse readiness state.
+        # The fingerprint remains server-side so it cannot become a client
+        # identifier or accidentally be logged with a credential.
+        "last_test_status": "untested",
     }
+    getter = getattr(_services().get("store"), "get_answer_test_status", None)
+    if callable(getter):
+        try:
+            metadata = getter()
+        except Exception:
+            metadata = None
+        if isinstance(metadata, Mapping) and metadata.get("status") in {
+            "success",
+            "failed",
+        }:
+            data["last_test_status"] = metadata["status"]
     if connection.has_api_key:
         # The public model intentionally exposes only presence.  A stable,
         # short mask helps the settings UI distinguish a configured key while

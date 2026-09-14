@@ -17,6 +17,7 @@ from webapp.account_service import (
     CourseRetrievalError,
 )
 from webapp.crypto import SecretBox
+from webapp.models import AccountPreferences
 from webapp.store import SQLiteStore
 
 
@@ -197,6 +198,104 @@ def test_preferences_do_not_cross_accounts(client, account_ids):
         ]
         == []
     )
+
+
+def test_preferences_response_redacts_nested_notification_and_ocr_secrets(
+    client, store, saved_account
+):
+    notification_url = "https://notify.example.invalid/provider-secret"
+    notification_token = "notification-token-secret"
+    notification_chat = "telegram-chat-secret"
+    ocr_key = "ocr-api-key-secret"
+    ocr_authorization = "Bearer ocr-authorization-secret"
+    store.save_preferences(
+        saved_account.id,
+        AccountPreferences(
+            notification_config={
+                "provider": "telegram",
+                "url": notification_url,
+                "token": notification_token,
+                "tg_chat_id": notification_chat,
+                "nested": {"authorization": ocr_authorization},
+            },
+            ocr_config={
+                "provider": "openai",
+                "endpoint": "http://ocr.example.invalid/v1",
+                "api_key": ocr_key,
+                "nested": {"secret": "nested-ocr-secret"},
+            },
+        ),
+    )
+
+    response = client.get(f"/api/accounts/{saved_account.id}/preferences")
+    body = response.get_json()
+    body_text = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    for secret in (
+        notification_url,
+        notification_token,
+        notification_chat,
+        ocr_key,
+        ocr_authorization,
+        "nested-ocr-secret",
+    ):
+        assert secret not in body_text
+    assert body["data"]["notification_config"]["has_token"] is True
+    assert body["data"]["notification_config"]["has_url"] is True
+    assert body["data"]["notification_config"]["has_tg_chat_id"] is True
+    assert body["data"]["ocr_config"]["has_api_key"] is True
+    assert body["data"]["ocr_config"]["endpoint"] == "http://ocr.example.invalid/v1"
+    assert "fingerprint" not in body["data"]
+
+
+def test_partial_preferences_preserve_omitted_and_blank_advanced_secrets(
+    client, store, saved_account
+):
+    notification_url = "https://notify.example.invalid/provider-secret"
+    notification_token = "notification-token-secret"
+    notification_chat = "telegram-chat-secret"
+    ocr_key = "ocr-api-key-secret"
+    store.save_preferences(
+        saved_account.id,
+        AccountPreferences(
+            selected_course_ids=["saved"],
+            notification_config={
+                "provider": "telegram",
+                "url": notification_url,
+                "token": notification_token,
+                "tg_chat_id": notification_chat,
+            },
+            ocr_config={
+                "provider": "openai",
+                "endpoint": "http://ocr.example.invalid/v1",
+                "api_key": ocr_key,
+            },
+        ),
+    )
+
+    launch_only = client.patch(
+        f"/api/accounts/{saved_account.id}/preferences",
+        json={"selected_course_ids": ["new-course"]},
+    )
+    assert launch_only.status_code == 200
+
+    blank_secret_update = client.put(
+        f"/api/accounts/{saved_account.id}/preferences",
+        json={
+            "notification_config": {"provider": "telegram", "url": "", "token": "", "tg_chat_id": ""},
+            "ocr_config": {"endpoint": "http://ocr.example.invalid/v2", "api_key": ""},
+        },
+    )
+    assert blank_secret_update.status_code == 200
+
+    stored = store.get_preferences(saved_account.id)
+    assert stored.selected_course_ids == ["new-course"]
+    assert stored.notification_config["url"] == notification_url
+    assert stored.notification_config["token"] == notification_token
+    assert stored.notification_config["tg_chat_id"] == notification_chat
+    assert stored.ocr_config["endpoint"] == "http://ocr.example.invalid/v2"
+    assert stored.ocr_config["api_key"] == ocr_key
 
 
 def test_patch_without_password_preserves_secret(client, store, saved_account):

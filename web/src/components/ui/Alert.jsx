@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertCircle, CheckCircle2, Info, TriangleAlert, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, CheckCircle2, Info, X } from 'lucide-react'
 import { cn } from '../../lib/utils'
 
 const variantStyles = {
@@ -15,7 +15,7 @@ const variantStyles = {
   },
   warning: {
     container: 'border-warning/35 bg-warning/[0.08] text-label-primary',
-    icon: TriangleAlert,
+    icon: AlertTriangle,
     iconClass: 'text-warning',
   },
   danger: {
