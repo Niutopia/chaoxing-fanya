@@ -149,9 +149,9 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     return createAccount(values)
   }
 
-  const notifySaved = (saved) => {
+  const notifySaved = (saved, meta = {}) => {
     const safeSaved = publicAccount(saved)
-    if (typeof onSaved === 'function' && safeSaved?.id) onSaved(safeSaved)
+    if (typeof onSaved === 'function' && safeSaved?.id) onSaved(safeSaved, meta)
     return safeSaved
   }
 
@@ -176,7 +176,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     let persistedProfile = null
     try {
       const saved = await savedAccount()
-      const safeSaved = notifySaved(saved)
+      const safeSaved = notifySaved(saved, { persisted: true, verified: isEditing })
       persistedProfile = safeSaved
       if (!safeSaved?.id) {
         clearSecrets()
@@ -195,7 +195,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
             ? { ...safeSaved, ...safeVerified }
             : safeSaved
           setCreatedProfile(nextProfile)
-          notifySaved(nextProfile)
+          notifySaved(nextProfile, { persisted: true, verified: true })
           setSuccess('账户验证成功')
         } catch (verificationError) {
           clearSecrets()
@@ -235,7 +235,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
         ? { ...activeAccount, ...safeVerified }
         : activeAccount
       if (!account) setCreatedProfile(nextProfile)
-      notifySaved(nextProfile)
+      notifySaved(nextProfile, { persisted: true, verified: true })
       setSuccess('账户验证成功')
       clearSecrets()
     } catch (requestError) {

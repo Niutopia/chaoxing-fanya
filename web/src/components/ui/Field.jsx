@@ -1,6 +1,5 @@
 import React, { cloneElement, isValidElement, useId } from 'react'
 import { cn } from '../../lib/utils'
-import Label from './Label'
 
 const Field = React.forwardRef(function Field(
   {
@@ -38,10 +37,10 @@ const Field = React.forwardRef(function Field(
   return (
     <div ref={ref} className={cn('space-y-1.5', className)} {...props}>
       {label ? (
-        <Label htmlFor={inputId} className="text-label-primary">
+        <label htmlFor={inputId} className="text-sm font-medium text-label-primary">
           {label}
           {required ? <span className="ml-1 text-danger" aria-hidden="true">*</span> : null}
-        </Label>
+        </label>
       ) : null}
       {description || hint ? (
         <p id={descriptionId} className="text-xs leading-4 text-label-secondary">{description || hint}</p>

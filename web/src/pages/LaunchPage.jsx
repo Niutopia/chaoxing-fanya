@@ -160,6 +160,7 @@ function LaunchPage({
   activeTask,
   task,
   tasks,
+  onTaskCreated,
   className,
 }) {
   const params = useParams()
@@ -359,6 +360,7 @@ function LaunchPage({
       if (!taskId) {
         throw new Error('启动响应缺少任务 ID')
       }
+      onTaskCreated?.(result)
       navigate(`/tasks/${encodeURIComponent(taskId)}`)
     } catch (error) {
       setActionError(startErrorMessage(error))

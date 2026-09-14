@@ -300,7 +300,16 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
   )
 }
 
-function OverviewPage() {
+function OverviewPage({
+  accounts: suppliedAccounts,
+  tasks: suppliedTasks,
+  loading: suppliedLoading,
+  error: suppliedError,
+  onRefresh,
+  onAccountsChange,
+  onTasksChange,
+  onAccountSaved: reportAccountSaved,
+}) {
   const [accounts, setAccounts] = useState([])
   const [tasks, setTasks] = useState([])
   const [loading, setLoading] = useState(true)
@@ -315,6 +324,19 @@ function OverviewPage() {
   const [actionMessage, setActionMessage] = useState('')
   const emptyActionRef = useRef(null)
   const requestIdRef = useRef(0)
+  const controlledData = suppliedAccounts !== undefined
+    || suppliedTasks !== undefined
+    || suppliedLoading !== undefined
+    || suppliedError !== undefined
+
+  const visibleAccounts = suppliedAccounts !== undefined
+    ? (Array.isArray(suppliedAccounts) ? suppliedAccounts.map(publicAccount).filter((account) => account?.id) : [])
+    : accounts
+  const visibleTasks = suppliedTasks !== undefined
+    ? (Array.isArray(suppliedTasks) ? suppliedTasks : [])
+    : tasks
+  const visibleLoading = suppliedLoading !== undefined ? Boolean(suppliedLoading) : loading
+  const visibleError = suppliedError !== undefined ? String(suppliedError || '') : error
 
   const loadData = useCallback(async () => {
     const requestId = ++requestIdRef.current
@@ -333,16 +355,25 @@ function OverviewPage() {
     }
   }, [])
 
+  const refreshData = typeof onRefresh === 'function' ? onRefresh : loadData
+
   useEffect(() => {
-    loadData()
+    if (!controlledData) loadData()
     return () => {
       requestIdRef.current += 1
     }
-  }, [loadData])
+  }, [controlledData, loadData])
 
   useEffect(() => {
-    if (!loading && !error && accounts.length === 0) emptyActionRef.current?.focus()
-  }, [accounts.length, error, loading])
+    if (suppliedAccounts !== undefined) {
+      setAccounts(Array.isArray(suppliedAccounts) ? suppliedAccounts.map(publicAccount).filter((account) => account?.id) : [])
+    }
+    if (suppliedTasks !== undefined) setTasks(Array.isArray(suppliedTasks) ? suppliedTasks : [])
+  }, [suppliedAccounts, suppliedTasks])
+
+  useEffect(() => {
+    if (!visibleLoading && !visibleError && visibleAccounts.length === 0) emptyActionRef.current?.focus()
+  }, [visibleAccounts.length, visibleError, visibleLoading])
 
   const openAddDialog = () => {
     setMenuAccountId(null)
@@ -368,9 +399,13 @@ function OverviewPage() {
     if (!safeSaved?.id) return
     setAccounts((current) => {
       const index = current.findIndex((item) => String(item.id) === String(safeSaved.id))
-      if (index < 0) return [...current, safeSaved]
-      return current.map((item, itemIndex) => (itemIndex === index ? mergedAccount(item, safeSaved) : item))
+      const next = index < 0
+        ? [...current, safeSaved]
+        : current.map((item, itemIndex) => (itemIndex === index ? mergedAccount(item, safeSaved) : item))
+      onAccountsChange?.(next)
+      return next
     })
+    reportAccountSaved?.(safeSaved)
     setActionMessage('账户已更新')
   }
 
@@ -381,9 +416,13 @@ function OverviewPage() {
     try {
       const verified = await verifyAccount(account.id)
       if (verified?.id) {
-        setAccounts((current) => current.map((item) => (
-          String(item.id) === String(verified.id) ? mergedAccount(item, verified) : item
-        )))
+        setAccounts((current) => {
+          const next = current.map((item) => (
+            String(item.id) === String(verified.id) ? mergedAccount(item, verified) : item
+          ))
+          onAccountsChange?.(next)
+          return next
+        })
       }
       setActionMessage('账户验证成功')
     } catch (requestError) {
@@ -400,11 +439,15 @@ function OverviewPage() {
     const nextEnabled = accountField(account, 'enabled') === false
     try {
       const updated = await setAccountEnabled(account.id, nextEnabled)
-      setAccounts((current) => current.map((item) => (
-        String(item.id) === String(account.id)
-          ? mergedAccount(item, updated || { enabled: nextEnabled })
-          : item
-      )))
+      setAccounts((current) => {
+        const next = current.map((item) => (
+          String(item.id) === String(account.id)
+            ? mergedAccount(item, updated || { enabled: nextEnabled })
+            : item
+        ))
+        onAccountsChange?.(next)
+        return next
+      })
       setActionMessage(nextEnabled ? '账户已启用' : '账户已停用')
     } catch (requestError) {
       setActionMessage(requestMessage(requestError, '账户状态更新失败，请重试'))
@@ -432,8 +475,16 @@ function OverviewPage() {
     setConfirmError('')
     try {
       await deleteAccount(confirmAccount.id)
-      setAccounts((current) => current.filter((item) => String(item.id) !== String(confirmAccount.id)))
-      setTasks((current) => current.filter((item) => String(accountIdOf(item)) !== String(confirmAccount.id)))
+      setAccounts((current) => {
+        const next = current.filter((item) => String(item.id) !== String(confirmAccount.id))
+        onAccountsChange?.(next)
+        return next
+      })
+      setTasks((current) => {
+        const next = current.filter((item) => String(accountIdOf(item)) !== String(confirmAccount.id))
+        onTasksChange?.(next)
+        return next
+      })
       setConfirmAccount(null)
       setActionMessage('账户已删除')
     } catch (requestError) {
@@ -448,7 +499,7 @@ function OverviewPage() {
     }
   }
 
-  if (loading) {
+  if (visibleLoading) {
     return (
       <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
         <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
@@ -457,14 +508,14 @@ function OverviewPage() {
     )
   }
 
-  if (error) {
+  if (visibleError) {
     return (
       <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
         <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
         <Alert className="mt-5 max-w-xl" variant="danger" aria-live="polite">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <span>{error}</span>
-            <Button type="button" variant="outline" onClick={loadData}>重试</Button>
+            <span>{visibleError}</span>
+            <Button type="button" variant="outline" onClick={refreshData}>重试</Button>
           </div>
         </Alert>
       </section>
@@ -493,7 +544,7 @@ function OverviewPage() {
           </Alert>
         ) : null}
 
-        {accounts.length === 0 ? (
+        {visibleAccounts.length === 0 ? (
           <div className="mt-8 border-y border-separator bg-surface px-5 py-12 text-center">
             <h2 className="text-base font-semibold">还没有账户</h2>
             <p className="mx-auto mt-2 max-w-sm text-sm leading-5 text-label-secondary">
@@ -511,11 +562,11 @@ function OverviewPage() {
               <div role="columnheader">进度</div>
               <div role="columnheader" aria-label="操作" />
             </div>
-            {accounts.map((account) => (
+            {visibleAccounts.map((account) => (
               <AccountRow
                 key={account.id}
                 account={account}
-                task={taskForAccount(tasks, account.id)}
+                task={taskForAccount(visibleTasks, account.id)}
                 menuOpen={String(menuAccountId) === String(account.id)}
                 onMenuToggle={() => setMenuAccountId((current) => (
                   String(current) === String(account.id) ? null : account.id
