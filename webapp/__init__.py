@@ -102,12 +102,24 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
             configured_limit = store.get_runtime_settings().max_active_accounts
         runner = app.config.get("TASK_RUNNER")
         if runner is None:
+            runner_docker_value = getattr(
+                answer_connection_service,
+                "running_in_docker",
+                app.config.get("RUNNING_IN_DOCKER", False),
+            )
+            runner_running_in_docker = (
+                runner_docker_value
+                if isinstance(runner_docker_value, bool)
+                else str(runner_docker_value).strip().lower()
+                in {"1", "true", "yes", "y", "on"}
+            )
             runner = ChaoxingStudyRunner(
                 data_dir=app.config["DATA_DIR"],
                 engine_factory=app.config.get("CHAOXING_ENGINE_FACTORY"),
                 cookie_update_callback_factory=_default_cookie_update_callback_factory(
                     store
                 ),
+                running_in_docker=runner_running_in_docker,
             )
         answer_semaphore = app.config.get("ANSWER_SEMAPHORE")
         if answer_semaphore is None:

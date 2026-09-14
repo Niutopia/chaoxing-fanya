@@ -124,6 +124,7 @@ def _answer_connection(value: ResolvedAnswerConnection | Mapping[str, Any] | Non
             max_retries=value.max_retries,
             max_concurrency=value.max_concurrency,
             api_key=value.api_key,
+            outbound_base_url=value.outbound_base_url,
         )
     if isinstance(value, Mapping):
         return ResolvedAnswerConnection(**_copy(dict(value)))

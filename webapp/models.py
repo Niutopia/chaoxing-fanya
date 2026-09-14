@@ -70,10 +70,15 @@ class ResolvedAnswerConnection(AnswerConnection):
 
     The separate type prevents a public settings read from accidentally
     carrying plaintext and keeps ``AnswerConnection``'s serialized shape
-    secret-free.  Its representation and comparisons also omit the key.
+    secret-free.  Its representation and comparisons also omit the key and
+    the task-only outbound URL.
     """
 
     api_key: str | None = field(default=None, repr=False, compare=False)
+    # ``base_url`` remains the exact user-visible/stored value.  The task
+    # admission boundary may attach this derived value for outbound use only;
+    # it is never persisted or returned by a public settings serializer.
+    outbound_base_url: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

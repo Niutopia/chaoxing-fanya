@@ -17,7 +17,8 @@ from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
 
-from ..models import AccountAuth, AccountPreferences
+from ..answer_connection import outbound_url
+from ..models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
 from ..task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
@@ -265,7 +266,23 @@ def _saved_answer_connection() -> Any:
     resolver = getattr(store, "resolve_answer_connection", None)
     if not callable(resolver):
         return None
-    return resolver()
+    connection = resolver()
+    if not isinstance(connection, ResolvedAnswerConnection):
+        return connection
+    service = _answer_service()
+    docker_value = getattr(service, "running_in_docker", False)
+    running_in_docker = (
+        docker_value
+        if isinstance(docker_value, bool)
+        else str(docker_value).strip().lower()
+        in {"1", "true", "yes", "y", "on"}
+    )
+    return replace(
+        connection,
+        # Keep ``base_url`` untouched for UI/public settings and derive a
+        # task-only request target at the outbound boundary.
+        outbound_base_url=outbound_url(connection.base_url, running_in_docker),
+    )
 
 
 def _answer_service() -> Any:

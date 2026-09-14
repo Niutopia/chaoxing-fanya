@@ -21,7 +21,7 @@ from api.cookies import account_cookie_path, save_cookie_file
 from api.live_process import StudyCancelled
 from api.vision_ocr import vision_ocr_context
 
-from .answer_connection import normalize_completion_url
+from .answer_connection import normalize_completion_url, outbound_url
 from .task_manager import StudyRunContext, _secret_values as _context_secret_values
 
 
@@ -182,10 +182,17 @@ class ChaoxingStudyRunner:
             [str], Callable[[Mapping[str, str]], None]
         ]
         | None = None,
+        running_in_docker: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.engine_factory = engine_factory or _default_engine_factory
         self.cookie_update_callback_factory = cookie_update_callback_factory
+        self.running_in_docker = (
+            running_in_docker
+            if isinstance(running_in_docker, bool)
+            else str(running_in_docker).strip().lower()
+            in {"1", "true", "yes", "y", "on"}
+        )
 
     @staticmethod
     def _secret_values(context: StudyRunContext) -> tuple[str, ...]:
@@ -245,15 +252,19 @@ class ChaoxingStudyRunner:
             callback = partial(save_cookie_file, path=cookie_path)
         return session, callback
 
-    @staticmethod
-    def _answer_config(context: StudyRunContext) -> dict[str, Any]:
+    def _answer_config(self, context: StudyRunContext) -> dict[str, Any]:
         preferences = context.preferences
         answer = context.answer
         base_url = ""
         if answer is not None:
             base_value = getattr(answer, "outbound_base_url", None)
             if base_value is None:
-                base_value = getattr(answer, "base_url", "")
+                configured_base_url = getattr(answer, "base_url", "")
+                base_value = (
+                    outbound_url(configured_base_url, self.running_in_docker)
+                    if configured_base_url
+                    else ""
+                )
             base_url = str(base_value or "")
         endpoint = normalize_completion_url(base_url) if base_url else ""
         return {

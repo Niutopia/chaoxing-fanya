@@ -163,6 +163,42 @@ def test_runner_propagates_account_and_answer_context(
     assert call.tiku_config["cache_file"].endswith("answer-cache.json")
 
 
+@pytest.mark.parametrize(
+    ("base_url", "expected_endpoint"),
+    [
+        (
+            "http://localhost:8849/v1",
+            "http://host.docker.internal:8849/v1/chat/completions",
+        ),
+        (
+            "http://127.0.0.1:8849/v1",
+            "http://host.docker.internal:8849/v1/chat/completions",
+        ),
+        (
+            "http://192.168.1.8:8849/v1",
+            "http://192.168.1.8:8849/v1/chat/completions",
+        ),
+    ],
+)
+def test_runner_builds_docker_aware_ai_endpoint_without_rewriting_saved_url(
+    tmp_path, fake_context, fake_engine_factory, base_url, expected_endpoint
+):
+    context = replace(
+        fake_context,
+        answer=replace(fake_context.answer, base_url=base_url),
+    )
+    runner = ChaoxingStudyRunner(
+        data_dir=tmp_path,
+        engine_factory=fake_engine_factory,
+        running_in_docker=True,
+    )
+
+    runner.run(context)
+
+    assert fake_engine_factory.last_call.tiku_config["endpoint"] == expected_endpoint
+    assert context.answer.base_url == base_url
+
+
 def test_runner_sanitizes_secret_values_from_failure(
     tmp_path, fake_context, fake_engine_factory
 ):

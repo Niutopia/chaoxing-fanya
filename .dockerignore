@@ -74,3 +74,14 @@ cache.json
 **/*.sqlite3
 saves
 **/saves
+
+# Volume backups must never be sent in the build context.  The exact default
+# filename is covered alongside the general archive patterns for renamed or
+# nested copies.
+chaoxing-data-backup.tgz
+*.tgz
+**/*.tgz
+*.tar.gz
+**/*.tar.gz
+*.tar
+**/*.tar

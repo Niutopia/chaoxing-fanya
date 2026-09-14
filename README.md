@@ -74,19 +74,22 @@ docker compose ps
 curl -fsS http://127.0.0.1:5001/api/health
 docker compose logs -f web
 docker compose stop web
-docker run --rm -v chaoxing-fanya_chaoxing-data:/source -v "$PWD":/backup alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
+backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-backup.XXXXXX")"
+docker run --rm -v chaoxing-fanya_chaoxing-data:/source -v "$backup_dir":/backup alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
+echo "Backup written to $backup_dir/chaoxing-data-backup.tgz"
 ```
 
 Enter the answer API key once in Settings using the password-style Replace API
 Key field, then save the connection through the Web UI. The key is encrypted
 in the local `chaoxing-data` volume and is not placed in `.env`, source files,
 the Dockerfile, the Compose file, the image build context, or image layers.
-`.env.example` contains only non-secret overrides. The volume preserves
+Configure account limits and answer settings in Web Settings; `.env.example`
+contains deployment guidance only. The volume preserves
 accounts, preferences, and answer-connection state across container restarts.
 
 To stop the Web service without removing its data, run `docker compose stop web`.
-To back up the named volume, use the `docker run` command above; it writes
-`chaoxing-data-backup.tgz` in the current directory.
+To back up the named volume, use the commands above; they write
+`chaoxing-data-backup.tgz` under a temporary directory outside the repository.
 
 **便携打包**
 ```bash
@@ -112,7 +115,7 @@ python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|conti
   - 外部大模型（推荐）：
     ```bash
     export CHAOXING_VISION_OCR_PROVIDER=openai
-    export CHAOXING_VISION_OCR_KEY=<your-vision-key>
+    export CHAOXING_VISION_OCR_KEY="YOUR_VISION_KEY"
     export CHAOXING_VISION_OCR_MODEL=gpt-4o
     # 可选：CHAOXING_VISION_OCR_ENDPOINT, CHAOXING_VISION_OCR_PROMPT
     ```
@@ -135,7 +138,7 @@ chaoxing/
 ├── main.py                     # 命令行入口
 ├── start.bat                   # Windows 一键启动
 ├── clean_and_build_portable.bat
-├── config_template.ini         # 配置模板
+├── config.ini.example          # 配置模板
 ├── api/                        # 后端接口
 ├── web/                        # 前端（React + Vite + TailwindCSS）
 └── resource/                   # 静态资源、模型等
@@ -143,10 +146,10 @@ chaoxing/
 
 ## 常见问题
 
-- 端口被占用：`netstat -ano | findstr :5000` / `:3000`，结束占用进程后重试
+- Docker 端口被占用：确认宿主机 `127.0.0.1:5001` 未被占用；容器内 Web 服务监听 `0.0.0.0:5000`
 - 依赖安装失败：后端 `pip install -r requirements.txt --force-reinstall`；前端删除 `node_modules` 与锁文件后重新 `npm install`
-- 浏览器未自动打开：手动访问 `http://localhost:3000`，查看启动脚本输出
-- Docker 配置未生效：确认挂载路径正确，或在容器内检查 `/config/config.ini`
+- Web 页面未自动打开：手动访问 `http://127.0.0.1:5001`，查看 `docker compose ps` 与健康检查输出
+- Docker 设置未生效：打开 Web 设置页面确认配置，并检查持久化数据是否挂载到 `/app/data`
 
 ## 致谢
 
