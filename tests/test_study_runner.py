@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 import api.decode as decode
+import api.answer as answer
+import api.base as base
+from api.answer import AI
+from api.base import Account, Chaoxing, StudyResult
 from api.vision_ocr import _load_vision_ocr_config, vision_ocr_context
 from api.vision_ocr import reset_vision_ocr_config
 from webapp.models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
@@ -265,3 +269,134 @@ def test_empty_task_ocr_context_masks_environment(monkeypatch):
             assert _load_vision_ocr_config() is None
     finally:
         reset_vision_ocr_config()
+
+
+class _MemoryAnswerCache:
+    def __init__(self):
+        self.values = {}
+
+    def get_cache(self, question):
+        return self.values.get(question)
+
+    def add_cache(self, question, value):
+        self.values[question] = value
+
+
+class _NestedAnswerAI(AI):
+    def __init__(self):
+        super().__init__()
+        self._cache = _MemoryAnswerCache()
+        self.titles = []
+
+    def _query(self, q_info):
+        self.titles.append(q_info["title"])
+        return "A"
+
+
+class _AnswerSession:
+    def __init__(self, cookie):
+        self.cookie = cookie
+        self.headers = {}
+        self.image_cookies = []
+
+    def get(self, url, **_kwargs):
+        if "mooc-ans/api/work" in url:
+            return SimpleNamespace(status_code=200, text="work html")
+        if "p.ananas.chaoxing.com" in url:
+            self.image_cookies.append(self.cookie)
+            return SimpleNamespace(status_code=200, content=b"image")
+        raise AssertionError(f"unexpected account request: {url}")
+
+    def post(self, _url, **_kwargs):
+        return SimpleNamespace(
+            status_code=200,
+            text="ok",
+            json=lambda: {"status": True, "msg": "saved"},
+        )
+
+
+def _nested_questions():
+    return {
+        "questions": [
+            {
+                "id": "q1",
+                "title": '<img src="https://p.ananas.chaoxing.com/formula-a.png">',
+                "options": "A. first\nB. second",
+                "type": "single",
+                "answerField": {"answerq1": "", "answertypeq1": "0"},
+            },
+            {
+                "id": "q2",
+                "title": '<img src="https://p.ananas.chaoxing.com/formula-b.png">',
+                "options": "A. first\nB. second",
+                "type": "single",
+                "answerField": {"answerq2": "", "answertypeq2": "0"},
+            },
+        ]
+    }
+
+
+def _run_nested_answer(session, ocr_config):
+    tiku = _NestedAnswerAI()
+    chaoxing = Chaoxing(
+        Account("answer-user", "answer-password"),
+        tiku=tiku,
+        session=session,
+        task_id="nested-answer-task",
+        ocr_config=ocr_config,
+        ai_concurrency=2,
+    )
+    with vision_ocr_context(ocr_config):
+        result = chaoxing.study_work(
+            {"courseId": "course", "clazzId": "clazz"},
+            {"jobid": "work-1", "enc": "enc"},
+            {"knowledgeid": "knowledge", "ktoken": "token", "cpi": "cpi"},
+        )
+    return result, tiku
+
+
+def test_nested_ai_answer_ocr_uses_each_account_session(monkeypatch):
+    monkeypatch.setattr(base, "decode_questions_info", lambda *_args, **_kwargs: _nested_questions())
+    monkeypatch.setattr(decode, "requests", SimpleNamespace(Session=lambda: (_ for _ in ()).throw(
+        AssertionError("nested OCR created a default session")
+    )))
+    monkeypatch.setattr(decode, "is_vision_ocr_enabled", lambda: True)
+    monkeypatch.setattr(answer, "is_vision_ocr_enabled", lambda: True)
+    monkeypatch.setattr(decode, "vision_ocr", lambda _image: "formula")
+
+    first = _AnswerSession("cookie-account-a")
+    second = _AnswerSession("cookie-account-b")
+    first_result, _ = _run_nested_answer(
+        first, {"provider": "openai", "api_key": "task-a-key", "endpoint": "http://ocr"}
+    )
+    second_result, _ = _run_nested_answer(
+        second, {"provider": "openai", "api_key": "task-b-key", "endpoint": "http://ocr"}
+    )
+
+    assert first_result is StudyResult.SUCCESS
+    assert second_result is StudyResult.SUCCESS
+    assert first.image_cookies == ["cookie-account-a", "cookie-account-a"]
+    assert second.image_cookies == ["cookie-account-b", "cookie-account-b"]
+
+
+def test_nested_ai_answer_workers_reenter_empty_ocr_context(monkeypatch):
+    monkeypatch.setenv("CHAOXING_VISION_OCR_PROVIDER", "openai")
+    monkeypatch.setenv("CHAOXING_VISION_OCR_KEY", "environment-secret")
+    reset_vision_ocr_config()
+    monkeypatch.setattr(base, "decode_questions_info", lambda *_args, **_kwargs: _nested_questions())
+    ocr_calls = []
+
+    def fake_ocr(src, **_kwargs):
+        ocr_calls.append(src)
+        return "environment-ocr"
+
+    monkeypatch.setattr(answer, "_ocr_image_to_text", fake_ocr)
+    session = _AnswerSession("cookie-account-empty")
+    try:
+        result, tiku = _run_nested_answer(session, {})
+    finally:
+        reset_vision_ocr_config()
+
+    assert result is StudyResult.SUCCESS
+    assert ocr_calls == []
+    assert all("environment-ocr" not in title for title in tiku.titles)

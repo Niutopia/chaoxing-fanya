@@ -70,7 +70,7 @@ __all__ = ["CacheDAO", "Tiku", "TikuYanxi", "TikuLike", "TikuAdapter", "AI", "Si
 _IMG_TAG_PATTERN = re.compile(r'<img[^>]*src=["\'](.*?)["\'][^>]*>', re.IGNORECASE)
 
 
-def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
+def _apply_ocr_to_title_if_needed(q_info: dict, *, session=None) -> None:
     """在题目标题中检测图片链接，并在本地 OCR 启用时用识别文本替换图片标签。
 
     仅处理作业题目的标题字符串，不影响其他阅读类内容；
@@ -93,7 +93,12 @@ def _apply_ocr_to_title_if_needed(q_info: dict) -> None:
 
         text = ""
         try:
-            text = _ocr_image_to_text(src) or ""
+            if session is None:
+                # Preserve the legacy one-argument hook for direct callers
+                # and third-party test doubles that do not own a session.
+                text = _ocr_image_to_text(src) or ""
+            else:
+                text = _ocr_image_to_text(src, session=session) or ""
         except Exception as exc:
             logger.debug(f"题目图片 OCR 调用异常: {exc}")
 
@@ -247,6 +252,10 @@ class Tiku:
         self._api = None
         self._conf = None
         self._cache: Optional[CacheDAO] = None
+        # Chaoxing attaches its account-owned HTTP session after constructing
+        # the configured provider.  Keeping this optional preserves direct
+        # CLI/test Tiku usage and its legacy OCR fallback.
+        self.session = None
 
     @property
     def name(self):
@@ -347,7 +356,10 @@ class Tiku:
         logger.debug(f"原始标题：{q_info['title']}")
 
         # 检测并处理题目中的图片链接：使用本地 OCR 将公式图片转为文本
-        _apply_ocr_to_title_if_needed(q_info)
+        if self.session is None:
+            _apply_ocr_to_title_if_needed(q_info)
+        else:
+            _apply_ocr_to_title_if_needed(q_info, session=self.session)
 
         q_info['title'] = sub(r'^\d+', '', q_info['title'])
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])

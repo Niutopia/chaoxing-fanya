@@ -276,6 +276,11 @@ def init_chaoxing(
             initial_cookies = load_cookie_file(cookie_path)
             cookie_update_callback = partial(save_cookie_file, path=cookie_path)
         session = build_session(initial_cookies)
+    task_values = {
+        key: common_config[key]
+        for key in ("task_id", "ocr_config")
+        if key in common_config
+    }
     chaoxing = Chaoxing(
         account=account,
         tiku=tiku,
@@ -283,6 +288,7 @@ def init_chaoxing(
         ai_concurrency=ai_concurrency,
         session=session,
         cookie_update_callback=cookie_update_callback,
+        **task_values,
     )
     
     return chaoxing

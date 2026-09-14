@@ -149,6 +149,15 @@ def _has_task_vision_ocr_context() -> bool:
     return _vision_ocr_context.get() is not None
 
 
+def _capture_vision_ocr_context() -> tuple[bool, Optional[Dict[str, Any]]]:
+    """Capture the current task OCR binding for a newly-created worker."""
+
+    config = _vision_ocr_context.get()
+    if config is None:
+        return False, None
+    return True, dict(config)
+
+
 def _load_vision_ocr_config() -> Optional[Dict[str, str]]:
     """从环境变量加载视觉 OCR 配置"""
     global _VISION_OCR_ENABLED, _VISION_OCR_CONFIG
@@ -389,4 +398,5 @@ __all__ = [
     "vision_ocr_context",
     "_load_vision_ocr_config",
     "_has_task_vision_ocr_context",
+    "_capture_vision_ocr_context",
 ]

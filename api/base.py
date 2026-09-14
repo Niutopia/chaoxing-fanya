@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import functools
+from contextlib import nullcontext
 import random
 import re
 import threading
@@ -27,6 +28,10 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api.vision_ocr import (
+    _capture_vision_ocr_context,
+    vision_ocr_context,
+)
 
 
 def get_timestamp():
@@ -107,6 +112,10 @@ class Chaoxing:
         self.cipher = AESCipher()
         self.tiku = tiku
         self.session = session if session is not None else build_session()
+        if self.tiku is not None:
+            # Answer-time OCR runs after the question parser and therefore
+            # needs the same account-owned session as the Chaoxing client.
+            self.tiku.session = self.session
         self.cookie_update_callback = cookie_update_callback
         self.kwargs = kwargs
         self.rollback_times = 0
@@ -867,6 +876,19 @@ class Chaoxing:
         if isinstance(self.tiku, AI):
             lock = threading.Lock()
 
+            ocr_context_bound, ocr_config = _capture_vision_ocr_context()
+            if not ocr_context_bound and "ocr_config" in self.kwargs:
+                # Direct/legacy integrations may construct Chaoxing with task
+                # metadata but without entering the outer worker context.
+                ocr_context_bound = True
+                configured_ocr = self.kwargs.get("ocr_config")
+                ocr_config = (
+                    dict(configured_ocr)
+                    if configured_ocr is not None
+                    else None
+                )
+            task_id = self.kwargs.get("task_id")
+
             def inc_found_concurrent():
                 nonlocal found_answers
                 with lock:
@@ -879,9 +901,24 @@ class Chaoxing:
                 ai_concurrency = 3
             ai_concurrency = max(1, ai_concurrency)
 
+            def _handle_question_in_context(q):
+                def invoke():
+                    ocr_scope = (
+                        vision_ocr_context(ocr_config)
+                        if ocr_context_bound
+                        else nullcontext()
+                    )
+                    with ocr_scope:
+                        return _handle_question(q, inc_found_concurrent)
+
+                if task_id:
+                    with logger.contextualize(task_id=str(task_id)):
+                        return invoke()
+                return invoke()
+
             with ThreadPoolExecutor(max_workers=ai_concurrency) as executor:
                 for q in questions["questions"]:
-                    executor.submit(_handle_question, q, inc_found_concurrent)
+                    executor.submit(_handle_question_in_context, q)
 
             # 等待线程池中的任务全部结束
             executor.shutdown(wait=True)
