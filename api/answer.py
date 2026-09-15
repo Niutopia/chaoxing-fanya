@@ -491,17 +491,12 @@ class Tiku:
                     self.name,
                 )
 
-                # 对 AI / 硅基流动等大模型题库更宽松：只要有非空答案就直接使用并写入缓存，
-                # 不再依赖 check_answer 的严格类型判断，避免丢弃诸如“输入/输出”、“Babbage machine”这种正常答案
+                # AI/SiliconFlow results are provider-shaped and are not
+                # canonical until the base layer validates and maps them for
+                # the actual question controls.  Never persist a raw model
+                # response here; the mapped layer owns those writes.
                 from api.answer import AI, SiliconFlow  # type: ignore
-                # Choice answers are mapped against the page's actual option
-                # labels by Chaoxing.study_work.  Do not persist an AI raw
-                # body/label here: it could become a permanently repair-only
-                # cache hit on the next work.
-                is_choice_answer = q_info.get("type") in {"single", "multiple"}
                 if isinstance(self, (AI, SiliconFlow)):
-                    if not is_choice_answer:
-                        cache_dao.add_cache(q_info['title'], answer)
                     return answer
 
                 if check_answer(answer, q_info['type'], self):
@@ -558,6 +553,13 @@ class Tiku:
         if not answer:
             logger.warning("判断题答案为空，保持未覆盖")
             return None
+        # AI/SiliconFlow canonical cache entries are always lower-case
+        # ``true``/``false`` and must remain usable even when a caller's
+        # configured synonym lists omit those internal labels.
+        if answer.casefold() == "true":
+            return True
+        if answer.casefold() == "false":
+            return False
         if answer in self.true_list:
             return True
         elif answer in self.false_list:
@@ -1431,6 +1433,30 @@ class SiliconFlow(Tiku):
             "response_format": {"type": "text"},
         }
         last_error = None
+        preserve_empty = q_type == "completion"
+
+        def render_plain_content(content) -> Optional[str]:
+            """Return successful non-JSON content without consuming retries."""
+
+            text = "" if content is None else str(content)
+            if not text.strip():
+                return None
+            if repair:
+                # A repair response is passed to the strict base-layer label
+                # resolver, which rejects explanatory text.
+                return text.strip()
+            if preserve_empty:
+                parts = _ensure_answer_list(text, preserve_empty=True)
+                return "\n".join(parts) if parts else None
+            return text.strip()
+
+        def response_text(response) -> str:
+            try:
+                value = getattr(response, "text", "")
+            except Exception:
+                return ""
+            return "" if value is None else str(value)
+
         for attempt in range(1, attempt_limit + 1):
             self._raise_if_cancelled()
             sem = self._request_semaphore
@@ -1452,25 +1478,34 @@ class SiliconFlow(Tiku):
                     raise RuntimeError(
                         f"硅基流动API请求失败（HTTP {response.status_code}）"
                     )
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                preserve_empty = q_type == "completion"
+                try:
+                    result = response.json()
+                except (TypeError, ValueError):
+                    # A successful HTTP response can still contain a plain
+                    # language body.  It is a provider result, not a
+                    # transport failure, so do not spend max_retries on it.
+                    return render_plain_content(response_text(response))
+                try:
+                    content = result['choices'][0]['message']['content']
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    return render_plain_content(response_text(response))
+
                 try:
                     parsed = json.loads(_strip_json_block(content))
                     answer_value = parsed.get('Answer') or parsed.get('answer')
-                except json.JSONDecodeError:
-                    if repair and str(content or '').strip():
-                        # The repair path is deliberately permissive only for
-                        # a later strict label resolver, which accepts a pure
-                        # legal label while rejecting explanations.
-                        return str(content).strip()
-                    raise
+                except (AttributeError, TypeError, ValueError):
+                    return render_plain_content(content)
                 answers = _ensure_answer_list(
                     answer_value,
                     preserve_empty=preserve_empty,
                 )
                 if not answers:
-                    raise ValueError("硅基流动返回答案为空")
+                    # A valid response envelope with an empty/missing answer
+                    # is also a format miss, not a reason to repeat a
+                    # successful request.  The base layer will keep it
+                    # uncovered (and may issue its one bounded repair for a
+                    # choice question only when there is content to repair).
+                    return None
                 rendered = "\n".join(answers)
                 return rendered if preserve_empty else rendered.strip()
             except StudyCancelled:

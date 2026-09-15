@@ -404,6 +404,43 @@ def test_siliconflow_repair_makes_one_request_even_when_max_retries_is_zero(
     assert "仅返回JSON" in client.calls[0]["json"]["messages"][0]["content"]
 
 
+def test_siliconflow_plain_text_choice_uses_one_initial_request_and_one_repair(
+    monkeypatch,
+):
+    client = _SiliconChoiceSession(
+        [
+            "I think B because of the wording",
+            '{"Answer": ["B"]}',
+        ]
+    )
+    provider = _silicon_provider(client, max_retries=5)
+    question = _choice_question()
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 2
+    assert question["answerSourceq1"] == "cover"
+    assert session.posts[0]["answerq1"] == "B"
+    assert client.calls[0]["timeout"] == 1
+    assert "选择题答案格式修复" in client.calls[1]["json"]["messages"][0]["content"]
+
+
+def test_siliconflow_natural_language_label_is_mapped_without_format_retry(
+    monkeypatch,
+):
+    client = _SiliconChoiceSession(["答案是 B。"])
+    provider = _silicon_provider(client, max_retries=5)
+    question = _choice_question()
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 1
+    assert question["answerSourceq1"] == "cover"
+    assert session.posts[0]["answerq1"] == "B"
+
+
 def test_ai_repair_makes_one_request_even_when_max_retries_is_zero(monkeypatch):
     cache = _MemoryCache()
     question = _choice_question()
@@ -454,6 +491,134 @@ def test_ai_unknown_judgement_explanation_is_uncovered_without_randomization(
     assert question["answerSourceq1"] == "uncovered"
     assert session.posts[0]["pyFlag"] == "1"
     assert session.posts[0]["answerq1"] == ""
+
+
+def test_unknown_judgement_cache_is_cleared_and_second_run_queries_provider(
+    monkeypatch,
+):
+    question = _choice_question()
+    question.update(
+        {
+            "title": "synthetic judgement cache question",
+            "options": "",
+            "type": "judgement",
+        }
+    )
+    question["answerField"]["answertypeq1"] = "1"
+    cache = _MemoryCache()
+    cache.values[question["title"]] = "provider explanation"
+    client = _ChoiceClient(['{"Answer": ["正确"]}'])
+    provider = _ai_provider(client)
+    provider._cache = cache
+    provider.true_list = ["正确"]
+    provider.false_list = ["错误"]
+
+    first_outcome, first_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert first_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 0
+    assert first_session.posts[0]["answerq1"] == ""
+    assert question["title"] not in cache.values
+
+    second_outcome, second_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert second_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 1
+    assert second_session.posts[0]["answerq1"] == "true"
+    assert cache.values[question["title"]] == "true"
+
+    third_outcome, third_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert third_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 1
+    assert third_session.posts[0]["answerq1"] == "true"
+
+
+def test_partial_completion_is_not_cached_and_canonical_fill_hits_on_next_run(
+    monkeypatch,
+):
+    question = {
+        "id": "q1",
+        "title": "synthetic completion cache question",
+        "options": "",
+        "type": "completion",
+        "expectedBlankCount": 3,
+        "answerField": {
+            "answerq11": "",
+            "answerq12": "",
+            "answerq13": "",
+            "answertypeq1": "2",
+        },
+    }
+    client = _ChoiceClient(
+        [
+            '{"Answer": ["alpha", "", "gamma"]}',
+            '{"Answer": ["alpha", "beta", "gamma"]}',
+        ]
+    )
+    provider = _ai_provider(client)
+    cache = provider._cache
+
+    first_outcome, first_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert first_outcome is StudyResult.SUCCESS
+    assert first_session.posts[0]["pyFlag"] == "1"
+    assert len(client.calls) == 1
+    assert question["title"] not in cache.values
+
+    second_outcome, second_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert second_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 2
+    assert second_session.posts[0]["answerq11"] == "alpha"
+    assert second_session.posts[0]["answerq12"] == "beta"
+    assert second_session.posts[0]["answerq13"] == "gamma"
+    assert cache.values[question["title"]] == "alpha\nbeta\ngamma"
+
+    third_outcome, third_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert third_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 2
+    assert third_session.posts[0]["answerq11"] == "alpha"
+    assert third_session.posts[0]["answerq12"] == "beta"
+    assert third_session.posts[0]["answerq13"] == "gamma"
+
+
+def test_partial_completion_cache_is_cleared_before_retrying_provider(
+    monkeypatch,
+):
+    question = {
+        "id": "q1",
+        "title": "synthetic stale completion question",
+        "options": "",
+        "type": "completion",
+        "expectedBlankCount": 3,
+        "answerField": {
+            "answerq11": "",
+            "answerq12": "",
+            "answerq13": "",
+            "answertypeq1": "2",
+        },
+    }
+    cache = _MemoryCache()
+    cache.values[question["title"]] = "alpha\n\ngamma"
+    client = _ChoiceClient(['{"Answer": ["alpha", "beta", "gamma"]}'])
+    provider = _ai_provider(client)
+    provider._cache = cache
+
+    first_outcome, first_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert first_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 0
+    assert first_session.posts[0]["pyFlag"] == "1"
+    assert question["title"] not in cache.values
+
+    second_outcome, second_session = _run_ai_work(monkeypatch, provider, question)
+
+    assert second_outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 1
+    assert second_session.posts[0]["answerq12"] == "beta"
+    assert cache.values[question["title"]] == "alpha\nbeta\ngamma"
 
 
 def test_cache_remove_expected_is_compare_and_delete(tmp_path):
@@ -510,6 +675,104 @@ def test_stale_repair_cleanup_does_not_delete_concurrent_canonical(
     assert session.posts[0]["pyFlag"] == "1"
     assert session.posts[0]["answerq1"] == ""
     assert cache.get_cache(question["title"]) == "B"
+
+
+def test_legacy_cache_cleanup_skips_non_atomic_expected_fallback_during_race(
+    monkeypatch,
+):
+    """A legacy cache must not get/read/remove around a concurrent write."""
+
+    class _LegacyRaceCache:
+        def __init__(self):
+            self.values = {}
+            self.read_count = 0
+            self.cleanup_get = threading.Event()
+            self.allow_cleanup = threading.Event()
+
+        def get_cache(self, question):
+            self.read_count += 1
+            # The first read is Tiku.query's cache lookup and the second is
+            # the base-layer observation.  A third read is the unsafe
+            # get-then-remove fallback present in the old implementation.
+            if self.read_count == 3:
+                snapshot = self.values.get(question)
+                self.cleanup_get.set()
+                assert self.allow_cleanup.wait(2)
+                return snapshot
+            return self.values.get(question)
+
+        def remove_cache(self, question):
+            self.values.pop(question, None)
+
+    question = _choice_question()
+    cache = _LegacyRaceCache()
+    cache.values[question["title"]] = "bad cached answer"
+
+    class _StaleRepairAI(AI):
+        def repair_choice_answer(self, _question, _previous_answer=None):
+            return "still invalid"
+
+    provider = _StaleRepairAI()
+    provider._cache = cache
+    provider.true_list = ["正确"]
+    provider.false_list = ["错误"]
+
+    result = {}
+
+    def run_work():
+        result["value"] = _run_ai_work(monkeypatch, provider, question)
+
+    def write_canonical_between_get_and_remove():
+        # On the old fallback this event is the barrier after its stale get
+        # and before remove_cache(question).  On the fixed path no fallback
+        # read occurs; the bounded wait still lets the test finish safely.
+        cache.cleanup_get.wait(1)
+        cache.values[question["title"]] = "B"
+        cache.allow_cleanup.set()
+
+    writer = threading.Thread(target=write_canonical_between_get_and_remove)
+    worker = threading.Thread(target=run_work)
+    writer.start()
+    worker.start()
+    worker.join(timeout=3)
+    writer.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert result["value"][0] is StudyResult.SUCCESS
+    assert question["answerSourceq1"] == "uncovered"
+    assert cache.values[question["title"]] == "B"
+
+
+def test_legacy_add_only_cache_skips_expected_cleanup_without_overwrite(
+    monkeypatch,
+):
+    class _LegacyAddOnlyCache:
+        def __init__(self):
+            self.values = {}
+
+        def get_cache(self, question):
+            return self.values.get(question)
+
+        def add_cache(self, question, answer):
+            self.values[question] = answer
+
+    question = _choice_question()
+    cache = _LegacyAddOnlyCache()
+    cache.values[question["title"]] = "bad cached answer"
+
+    class _StaleRepairAI(AI):
+        def repair_choice_answer(self, _question, _previous_answer=None):
+            return "still invalid"
+
+    provider = _StaleRepairAI()
+    provider._cache = cache
+    provider.true_list = ["正确"]
+    provider.false_list = ["错误"]
+
+    outcome, _ = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert cache.values[question["title"]] == "bad cached answer"
 
 
 def test_failed_repair_marks_uncovered_saves_blank_and_never_randomizes(monkeypatch):

@@ -415,6 +415,40 @@ def test_public_query_non_completion_still_strips_provider_result():
     assert provider.query({"title": "synthetic", "type": "single"}) == "alpha"
 
 
+@pytest.mark.parametrize("provider_cls", [AI, SiliconFlow])
+@pytest.mark.parametrize(
+    ("question_type", "result"),
+    [
+        ("single", "B"),
+        ("multiple", "AC"),
+        ("judgement", "provider explanation"),
+        ("completion", "alpha\nbeta"),
+    ],
+)
+def test_ai_queries_never_cache_raw_provider_results(
+    provider_cls, question_type, result
+):
+    provider = provider_cls()
+    cache = _NoopCache(None)
+    provider._cache = cache
+    provider._query = lambda _question: result
+
+    assert provider.query({"title": "synthetic", "type": question_type}) == result
+    assert cache.added == []
+
+
+def test_non_ai_query_keeps_historical_raw_cache_write():
+    provider = TikuLike()
+    cache = _NoopCache(None)
+    provider._cache = cache
+    provider._query = lambda _question: "B"
+
+    assert provider.query(
+        {"title": "synthetic", "type": "single"}
+    ) == "B"
+    assert cache.added == [("synthetic", "B")]
+
+
 def test_ai_plain_text_completion_fallback_keeps_middle_and_tail_blank():
     provider = AI()
     provider.endpoint = "http://answer.invalid"

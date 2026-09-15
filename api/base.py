@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
 from contextlib import nullcontext
+import inspect
 import json
 import random
 import re
@@ -946,59 +947,6 @@ class Chaoxing:
             return StudyResult.SUCCESS
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
-        def random_answer(options: str, q_type: str) -> str:
-            """Return a type-aware fallback without depending on question scope."""
-
-            if q_type == "judgement":
-                answer = "true" if random.choice([True, False]) else "false"
-                logger.info("判断题未匹配答案，使用随机策略（答案内容已省略）")
-                return answer
-            if q_type == "completion":
-                # There is no meaningful random fill-in text.  An empty value
-                # keeps coverage accounting honest and lets the caller save
-                # the known answers only.
-                return ""
-
-            entries = option_entries(options)
-            labels = [entry.label for entry in entries if entry.label]
-            if not labels:
-                return ""
-
-            if q_type == "multiple":
-                available_options = len(labels)
-                if available_options <= 1:
-                    select_count = available_options
-                else:
-                    max_possible = min(4, available_options)
-                    min_possible = min(2, available_options)
-                    weights_map = {
-                        2: [1.0],
-                        3: [0.3, 0.7],
-                        4: [0.1, 0.5, 0.4],
-                        5: [0.1, 0.4, 0.3, 0.2],
-                    }
-                    weights = weights_map.get(max_possible, [0.3, 0.4, 0.3])
-                    possible_counts = list(range(min_possible, max_possible + 1))
-                    weights = weights[: len(possible_counts)]
-                    weights_sum = sum(weights)
-                    if weights_sum > 0:
-                        weights = [weight / weights_sum for weight in weights]
-                    select_count = random.choices(
-                        possible_counts, weights=weights, k=1
-                    )[0]
-                selected = random.sample(labels, select_count) if select_count else []
-                answer = "".join(label for label in labels if label in selected)
-            elif q_type == "single":
-                answer = random.choice(labels)
-            else:
-                return ""
-
-            logger.info(
-                "选择题未匹配答案，使用随机策略（题型={}，答案内容已省略）",
-                q_type,
-            )
-            return answer
-
         def multi_cut(answer: str):
             """
             将多选题答案字符串按特定字符进行切割, 并返回切割后的答案列表
@@ -1154,7 +1102,7 @@ class Chaoxing:
         def _update_choice_cache(
             q, answer: Optional[str], *, expected=_CACHE_EXPECTED_UNSET
         ) -> None:
-            """Keep only canonical labels for AI/SiliconFlow choices."""
+            """Keep only canonical AI/SiliconFlow answers in the cache."""
 
             if not isinstance(self.tiku, (AI, SiliconFlow)):
                 return
@@ -1162,38 +1110,55 @@ class Chaoxing:
             question = q.get("title")
             if cache is None or not question:
                 return
+
+            def invoke_expected(method, *args) -> bool:
+                """Call an explicitly expected-aware cache API, if present."""
+
+                try:
+                    parameter = inspect.signature(method).parameters.get("expected")
+                except (TypeError, ValueError):
+                    return False
+                if parameter is None:
+                    return False
+                try:
+                    if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                        method(*args, expected)
+                    else:
+                        method(*args, expected=expected)
+                except Exception:
+                    raise
+                return True
+
             try:
                 if answer is None:
                     remove = getattr(cache, "remove_cache", None)
                     if callable(remove):
                         if expected is _CACHE_EXPECTED_UNSET:
                             remove(question)
+                        elif invoke_expected(remove, question):
+                            return
                         else:
-                            try:
-                                remove(question, expected=expected)
-                            except TypeError:
-                                # Keep compatibility with older in-memory
-                                # doubles while retaining a best-effort
-                                # compare before their unconditional removal.
-                                current = getattr(cache, "get_cache", lambda _q: None)(
-                                    question
-                                )
-                                if current == expected:
-                                    remove(question)
+                            # A legacy remove_cache(question) cannot safely
+                            # emulate compare-and-delete.  Do not read and
+                            # then call its unconditional remover.
+                            return
                         return
                     replace = getattr(cache, "replace_cache", None)
                     if callable(replace):
                         if expected is _CACHE_EXPECTED_UNSET:
                             replace(question, None)
+                        elif invoke_expected(replace, question, None):
+                            return
                         else:
-                            current = getattr(cache, "get_cache", lambda _q: None)(
-                                question
-                            )
-                            if current == expected:
-                                replace(question, None)
+                            # The same rule applies to a legacy replacement
+                            # API: an observed value is never a license for a
+                            # later unconditional overwrite.
+                            return
                         return
                     # Legacy test doubles/custom DAOs may only expose add_cache;
                     # an empty value is treated as a miss by Tiku.query.
+                    if expected is not _CACHE_EXPECTED_UNSET:
+                        return
                     add = getattr(cache, "add_cache", None)
                     if callable(add):
                         add(question, "")
@@ -1211,7 +1176,7 @@ class Chaoxing:
                 # a failed work submission.
                 logger.warning("选择题缓存更新失败（缓存内容已省略）")
 
-        def _choice_cache_value(q, result):
+        def _cache_value_for_result(q, result):
             """Return the exact cached value only when it is this result.
 
             A provider result can outlive a concurrent canonical cache write.
@@ -1239,11 +1204,16 @@ class Chaoxing:
                 pass
             return _CACHE_EXPECTED_UNSET
 
+        def _choice_cache_value(q, result):
+            """Backward-compatible name for choice cache observations."""
+
+            return _cache_value_for_result(q, result)
+
         def _resolve_provider_choice(q, result) -> tuple[str, str]:
             """Resolve a provider answer, allowing one AI format repair."""
 
             multiple = q.get("type") == "multiple"
-            cached_bad = _choice_cache_value(q, result)
+            cached_bad = _cache_value_for_result(q, result)
             answer = _resolve_choice_answer(
                 result, q.get("options", ""), multiple=multiple
             )
@@ -1313,6 +1283,7 @@ class Chaoxing:
             _raise_if_cancelled(cancel_event)
             answer = ""
             parts = []
+            observed_cache = _CACHE_EXPECTED_UNSET
             if not res:
                 answer = ""
                 q[f'answerSource{q["id"]}'] = "uncovered"
@@ -1325,6 +1296,7 @@ class Chaoxing:
                         q[f'answerSource{q["id"]}'] = "uncovered"
                         _mark_uncovered(q, mapping_reason or "choice_unmapped")
                 elif q["type"] == "judgement":
+                    observed_cache = _cache_value_for_result(q, res)
                     selected = self.tiku.judgement_select(res)
                     answer = (
                         "true"
@@ -1333,10 +1305,15 @@ class Chaoxing:
                         if selected is False
                         else ""
                     )
+                    if answer:
+                        _update_choice_cache(q, answer)
+                    elif observed_cache is not _CACHE_EXPECTED_UNSET:
+                        _update_choice_cache(q, None, expected=observed_cache)
                 elif q["type"] == "completion":
                     # Keep blank positions: indexed Chaoxing fields are
                     # positional, and ``splitlines`` would discard a tail
                     # blank.  Semicolons and slashes remain ordinary text.
+                    observed_cache = _cache_value_for_result(q, res)
                     parts = _completion_parts(res)
                     answer = "\n".join(parts)
                 else:
@@ -1364,6 +1341,8 @@ class Chaoxing:
                     if value is not None
                 ]
                 if limits and len(parts) > min(limits):
+                    if observed_cache is not _CACHE_EXPECTED_UNSET:
+                        _update_choice_cache(q, None, expected=observed_cache)
                     raise _CompletionMappingError(
                         "completion answer count exceeds form capacity"
                     )
@@ -1381,6 +1360,8 @@ class Chaoxing:
                     # Even an all-empty completion is an incomplete answer;
                     # save its cleared positional fields rather than submit.
                     has_partial_completion = True
+                    if observed_cache is not _CACHE_EXPECTED_UNSET:
+                        _update_choice_cache(q, None, expected=observed_cache)
             else:
                 if q["type"] == "completion":
                     answer_key = f'answer{q["id"]}'
@@ -1434,8 +1415,13 @@ class Chaoxing:
                     q[f'answerSource{q["id"]}'] = source
                     if source == "cover":
                         inc_found()
+                        _update_choice_cache(q, answer)
                     else:
                         has_partial_completion = True
+                        if observed_cache is not _CACHE_EXPECTED_UNSET:
+                            _update_choice_cache(
+                                q, None, expected=observed_cache
+                            )
                 else:
                     logger.info(
                         "题库答案处理完成（题型={}，答案内容已省略）",
