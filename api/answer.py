@@ -21,6 +21,11 @@ from api.logger import logger
 from api.decode import _ocr_image_to_text, ENABLE_LOCAL_OCR
 from api.vision_ocr import is_vision_ocr_enabled
 from api.live_process import StudyCancelled
+from api.option_parser import (
+    labeled_option_lines as _shared_labeled_option_lines,
+    option_lines as _shared_option_lines,
+    strip_option_prefix as _shared_strip_option_prefix,
+)
 
 
 def _strip_json_block(md_str: str) -> str:
@@ -43,78 +48,19 @@ def _ensure_answer_list(value) -> list[str]:
 
 
 def _prepare_option_lines(options) -> list[str]:
-    if not options:
-        return []
-    if isinstance(options, str):
-        raw = options.splitlines()
-    elif isinstance(options, (list, tuple, set)):
-        raw = options
-    else:
-        raw = [str(options)]
-    cleaned = []
-    for item in raw:
-        item_str = str(item).strip()
-        if item_str:
-            cleaned.append(item_str)
-    return cleaned
-
-
-_OPTION_LABEL_PREFIX_RE = re.compile(
-    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)"
-    r"(?:\s*[\.．,，、:：\)）]\s*|(\s+))"
-)
+    return _shared_option_lines(options)
 
 
 def _clean_option_prefix(option: str) -> str:
     """Remove an explicit option prefix without trimming ordinary words."""
 
-    text = str(option or "").strip()
-    match = _OPTION_LABEL_PREFIX_RE.match(text)
-    if not match:
-        return text
-    # A whitespace-only separator is accepted for conventional uppercase
-    # labels (A, B, ... AA), but not for ordinary words such as ``cat dog``.
-    if match.group(2) and (
-        not match.group(1).isupper() or len(match.group(1)) > 2
-    ):
-        return text
-    return text[match.end():].strip()
-
-
-def _option_label_for_index(index: int) -> str:
-    """Return Excel-style A-Z, AA... labels for a zero-based index."""
-
-    number = index + 1
-    label = ""
-    while number:
-        number, remainder = divmod(number - 1, 26)
-        label = chr(ord("A") + remainder) + label
-    return label
+    return _shared_strip_option_prefix(option)
 
 
 def _labeled_option_lines(options) -> tuple[list[str], list[str]]:
     """Preserve existing option labels or generate stable A-Z labels."""
 
-    raw_lines = _prepare_option_lines(options)
-    labeled_lines: list[str] = []
-    labels: list[str] = []
-    used_labels: set[str] = set()
-    for index, raw_line in enumerate(raw_lines):
-        match = _OPTION_LABEL_PREFIX_RE.match(raw_line)
-        if match and match.group(2) and (
-            not match.group(1).isupper() or len(match.group(1)) > 2
-        ):
-            match = None
-        label = match.group(1).upper() if match else ""
-        if not label or label in used_labels:
-            label = _option_label_for_index(index)
-            while label in used_labels:
-                label = _option_label_for_index(len(labels))
-        used_labels.add(label)
-        text = _clean_option_prefix(raw_line)
-        labeled_lines.append(f"{label}. {text}" if text else f"{label}.")
-        labels.append(label)
-    return labeled_lines, labels
+    return _shared_labeled_option_lines(options)
 
 
 def _with_choice_label_instruction(prompt: str, q_type: str, labels: list[str]) -> str:

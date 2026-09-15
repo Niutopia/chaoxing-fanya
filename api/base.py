@@ -29,117 +29,17 @@ from api.decode import (
 )
 from api.exceptions import MaxRetryExceeded
 from api.live_process import StudyCancelled
+from api.option_parser import (
+    answer_parts,
+    label_from_token,
+    normalize_choice_text,
+    option_entries,
+    option_lines as _option_lines,
+)
 from api.vision_ocr import (
     _capture_vision_ocr_context,
     vision_ocr_context,
 )
-
-
-_OPTION_PREFIX_RE = re.compile(
-    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)"
-    r"(?:\s*[\.．,，、:：\)）]\s*|(\s+))"
-)
-_OPTION_LABEL_RE = re.compile(
-    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)\s*"
-    r"(?:[\.．,，、:：\)）]\s*)?(?:[\]\)】]\s*)?$"
-)
-_TEXT_PUNCTUATION_RE = re.compile(r"[，。！？；：,.!?;:()（）\[\]【】\"“”‘’\-_\/\\|]")
-
-
-def _option_label_for_index(index: int) -> str:
-    """Return Excel-style A-Z, AA... labels for a zero-based index."""
-
-    number = index + 1
-    label = ""
-    while number:
-        number, remainder = divmod(number - 1, 26)
-        label = chr(ord("A") + remainder) + label
-    return label
-
-
-def _option_lines(options) -> list[str]:
-    """Return non-empty option lines without changing their display order."""
-
-    if not options:
-        return []
-    if isinstance(options, str):
-        raw_options = options.splitlines()
-    elif isinstance(options, (list, tuple)):
-        raw_options = options
-    else:
-        raw_options = [options]
-    return [str(option).strip() for option in raw_options if str(option).strip()]
-
-
-def _strip_explicit_option_prefix(value) -> str:
-    """Strip only a real option prefix, never the first letter of a word."""
-
-    text = str(value or "").strip()
-    match = _OPTION_PREFIX_RE.match(text)
-    if not match:
-        return text
-    # A whitespace-only separator is accepted for conventional uppercase
-    # labels (A, B, ... AA), but not for ordinary words such as ``cat dog``.
-    if match.group(2) and (
-        not match.group(1).isupper() or len(match.group(1)) > 2
-    ):
-        return text
-    return text[match.end():].strip()
-
-
-def _normalise_choice_text(value, *, strip_prefix: bool = True) -> str:
-    """Normalise answer/option text while retaining Chinese characters."""
-
-    text = str(value or "").strip()
-    if strip_prefix:
-        text = _strip_explicit_option_prefix(text)
-    text = text.casefold()
-    text = re.sub(r"\s+", "", text)
-    return _TEXT_PUNCTUATION_RE.sub("", text)
-
-
-def _option_entries(options):
-    """Return ``(label, display_text, normalised_text)`` option entries."""
-
-    entries = []
-    for index, option in enumerate(_option_lines(options)):
-        match = _OPTION_PREFIX_RE.match(option)
-        if match and match.group(2) and (
-            not match.group(1).isupper() or len(match.group(1)) > 2
-        ):
-            match = None
-        label = match.group(1).upper() if match else ""
-        if not label:
-            # A malformed/label-less form can still be handled safely by
-            # assigning the conventional A-Z (then AA...) label by DOM order.
-            label = _option_label_for_index(index)
-        text = _strip_explicit_option_prefix(option)
-        entries.append((label, text, _normalise_choice_text(text, strip_prefix=False)))
-    return entries
-
-
-def _label_from_token(value, valid_labels):
-    """Return a legal option label for a standalone token, if present."""
-
-    match = _OPTION_LABEL_RE.fullmatch(str(value or "").strip())
-    if not match:
-        return ""
-    label = match.group(1).upper()
-    return label if label in valid_labels else ""
-
-
-def _answer_parts(value) -> list[str]:
-    if isinstance(value, (list, tuple)):
-        return [str(part).strip() for part in value]
-    text = str(value or "").strip()
-    if not text:
-        return []
-    if re.search(r"[\n\r,，、|;；/]", text):
-        return [part.strip() for part in re.split(r"[\n\r,，、|;；/]+", text) if part.strip()]
-    # A whitespace-separated list is a label list only when every token is a
-    # standalone label.  Ordinary option text is kept as one complete value.
-    whitespace_parts = text.split()
-    return whitespace_parts if len(whitespace_parts) > 1 else [text]
 
 
 def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
@@ -149,56 +49,85 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
     providers such as TikuLike return option text rather than option letters.
     """
 
-    entries = _option_entries(options)
-    valid_labels = {label for label, _, _ in entries if label}
+    entries = option_entries(options)
+    valid_labels = {entry.label for entry in entries if entry.label}
     if not entries or not valid_labels:
         return ""
 
     raw_text = str(result or "").strip()
-    parts = _answer_parts(result)
+    parts = answer_parts(result)
+    nonempty_parts = [part for part in parts if str(part).strip()]
+    is_collection = isinstance(result, (list, tuple, set, frozenset))
 
-    # A single-character token or a delimited list is unambiguously a label
-    # answer.  This covers AI responses such as ["A", "C"] after joining.
-    if not multiple:
-        label = _label_from_token(raw_text, valid_labels)
+    def ordered_unique(labels) -> str:
+        wanted = set(labels)
+        return "".join(entry.label for entry in entries if entry.label in wanted)
+
+    def text_candidates(value) -> list[str]:
+        normalized = normalize_choice_text(value)
+        if not normalized:
+            return []
+        return [
+            entry.label
+            for entry in entries
+            if entry.normalized_text == normalized
+        ]
+
+    # A single value can be either a strict label or complete option text.
+    # Multiple requested values are never silently truncated for single-choice
+    # questions.
+    if len(nonempty_parts) == 1:
+        label = label_from_token(nonempty_parts[0], valid_labels)
         if label:
             return label
-    else:
-        label_parts = [_label_from_token(part, valid_labels) for part in parts]
-        if parts and all(label_parts):
-            return "".join(sorted(set(label_parts)))
-
-    # Prefer complete, normalised option-text matching.  This is deliberately
-    # exact rather than an arbitrary substring/subsequence search so a short
-    # answer cannot match several unrelated options.
-    if not isinstance(result, (list, tuple)):
-        whole_text = _normalise_choice_text(raw_text)
-        whole_matches = [
-            label for label, _, text in entries if label and text == whole_text
+    elif multiple and nonempty_parts:
+        label_parts = [
+            label_from_token(part, valid_labels) for part in nonempty_parts
         ]
+        if all(label_parts):
+            return ordered_unique(label_parts)
+    elif not multiple and nonempty_parts:
+        # A multi-token sequence made entirely of labels cannot represent a
+        # single answer, even if an option's literal text happens to resemble
+        # the same compact sequence.
+        label_parts = [
+            label_from_token(part, valid_labels) for part in nonempty_parts
+        ]
+        if all(label_parts):
+            return ""
+
+    # Prefer complete normalized text before splitting ordinary phrases into
+    # segments (for example, an option whose text is "New York").
+    if not is_collection:
+        whole_matches = text_candidates(raw_text)
         if len(whole_matches) == 1:
             return whole_matches[0]
 
-    matched = []
-    for part in parts:
-        normalised = _normalise_choice_text(part)
-        if not normalised:
-            continue
-        candidates = [label for label, _, text in entries if label and text == normalised]
-        if len(candidates) == 1:
-            matched.append(candidates[0])
-    if matched:
-        unique = sorted(set(matched))
-        return "".join(unique) if multiple else unique[0]
+    # Compact multi-choice labels are accepted only when every character is a
+    # valid single-letter label.  Exact multi-letter labels such as AA were
+    # handled above by label_from_token and therefore take precedence.
+    if multiple and not is_collection and re.fullmatch(r"[A-Za-z]{2,}", raw_text):
+        compact = raw_text.upper()
+        single_labels = {label for label in valid_labels if len(label) == 1}
+        if all(label in single_labels for label in compact):
+            return ordered_unique(compact)
 
-    # Preserve compatibility with compact uppercase forms such as "ACD",
-    # but only after text matching and only when every character is a real
-    # label.  Lowercase/ordinary words therefore never become letters.
-    if multiple and re.fullmatch(r"[A-Z]{2,}", raw_text):
-        compact = list(raw_text)
-        if all(label in valid_labels for label in compact):
-            return "".join(sorted(set(compact)))
-    return ""
+    if not nonempty_parts:
+        return ""
+
+    matched = []
+    for part in nonempty_parts:
+        label = label_from_token(part, valid_labels)
+        candidates = [label] if label else text_candidates(part)
+        # Every non-empty segment must identify exactly one option.  This
+        # prevents a useful-looking partial result from hiding bad data.
+        if len(candidates) != 1:
+            return ""
+        matched.append(candidates[0])
+
+    if not multiple and len(matched) != 1:
+        return ""
+    return ordered_unique(matched)
 
 
 def get_timestamp():
@@ -782,8 +711,8 @@ class Chaoxing:
                 # the known answers only.
                 return ""
 
-            entries = _option_entries(options)
-            labels = [label for label, _, _ in entries if label]
+            entries = option_entries(options)
+            labels = [entry.label for entry in entries if entry.label]
             if not labels:
                 return ""
 
@@ -810,7 +739,7 @@ class Chaoxing:
                         possible_counts, weights=weights, k=1
                     )[0]
                 selected = random.sample(labels, select_count) if select_count else []
-                answer = "".join(sorted(selected))
+                answer = "".join(label for label in labels if label in selected)
             elif q_type == "single":
                 answer = random.choice(labels)
             else:
@@ -985,7 +914,7 @@ class Chaoxing:
                     answer = "true" if self.tiku.judgement_select(res) else "false"
                 elif q["type"] == "completion":
                     # 填空题 / 完成题：直接使用题库返回的文本；如果是列表则拼接，避免答案被清空
-                    if isinstance(res, list):
+                    if isinstance(res, (list, tuple)):
                         # 保留空字符串的位置，避免后续 indexed 字段发生错位
                         parts = [str(part).strip() for part in res]
                         answer = "\n".join(parts)
@@ -1000,7 +929,14 @@ class Chaoxing:
                     # 其他类型直接使用答案 （目前仅知有简答题，待补充处理）
                     answer = res
 
-                if not answer:  # 检查 answer 是否为空
+                has_answer = bool(answer)
+                if q["type"] == "completion":
+                    # Newline-joined empty blanks ("\n") are not a covered
+                    # answer.  Keep their positions for indexed form fields,
+                    # but use the existing random/save path.
+                    has_answer = any(str(part).strip() for part in parts)
+
+                if not has_answer:  # 检查 answer 是否为空
                     logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
                     answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
                     q[f'answerSource{q["id"]}'] = "random"
