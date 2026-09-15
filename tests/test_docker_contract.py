@@ -253,6 +253,49 @@ def _assert_batch_error_guard_after(lines, command_index, label):
     return guard_end
 
 
+def _restore_failure_block(restore, marker, label):
+    """Return one restore branch's direct ``else`` block.
+
+    The restore examples intentionally use simple, non-nested shell ``if``
+    statements.  Walk that one statement to its matching ``fi`` instead of
+    searching for a later ``else``/``fi`` pair in the whole restore section.
+    """
+    marker_offset = restore.index(marker)
+    lines = restore.splitlines()
+    start_line = restore.count("\n", 0, marker_offset)
+    assert lines[start_line].lstrip().startswith("if "), label
+
+    then_line = next(
+        (
+            index
+            for index in range(start_line, len(lines))
+            if re.search(r";\s*then\s*$", lines[index].strip(), re.IGNORECASE)
+        ),
+        None,
+    )
+    assert then_line is not None, label
+
+    depth = 1
+    else_line = None
+    fi_line = None
+    for index in range(then_line + 1, len(lines)):
+        stripped = lines[index].strip()
+        if re.match(r"^if\b", stripped, re.IGNORECASE):
+            depth += 1
+        elif re.fullmatch(r"fi", stripped, re.IGNORECASE):
+            depth -= 1
+            if depth == 0:
+                fi_line = index
+                break
+        elif depth == 1 and re.fullmatch(r"else", stripped, re.IGNORECASE):
+            assert else_line is None, label
+            else_line = index
+
+    assert else_line is not None and fi_line is not None, label
+    assert else_line < fi_line, label
+    return "\n".join(lines[else_line : fi_line + 1])
+
+
 def _assert_pip_zipapp_contract(name):
     script = Path(name).read_text()
     lowered = script.lower()
@@ -298,12 +341,8 @@ def _assert_pip_zipapp_contract(name):
         if re.search(r"Invoke-WebRequest", line, re.IGNORECASE)
         and re.search(r"PIP_BOOTSTRAP_URL", line, re.IGNORECASE)
     )
-    download_failure = next(
-        index
-        for index in range(download_index + 1, install_index)
-        if re.fullmatch(r"if\s+errorlevel\s+1\s*\(", lines[index].strip(), re.IGNORECASE)
-    )
-    assert download_index < download_failure < install_index
+    download_end = _assert_batch_error_guard_after(lines, download_index, name)
+    assert download_end < install_index
     _assert_batch_error_guard_after(lines, install_index, name)
 
 
@@ -431,15 +470,7 @@ def test_restore_has_explicit_failure_rollback_after_second_backup():
         ),
     )
     for branch_name, marker in failure_branches:
-        branch_start = restore.index(marker)
-        then_end = restore.index("; then", branch_start) + len("; then")
-        else_match = re.search(r"(?m)^else\s*$", restore[then_end:])
-        assert else_match is not None, branch_name
-        else_start = then_end + else_match.start()
-        fi_match = re.search(r"(?m)^fi\s*$", restore[else_start:])
-        assert fi_match is not None, branch_name
-        branch_end = else_start + fi_match.end()
-        failure_block = restore[else_start:branch_end]
+        failure_block = _restore_failure_block(restore, marker, branch_name)
         assert re.search(r"(?m)^\s*fail_after_backup\b", failure_block), branch_name
 
     rollback = restore[rollback_definition:replace]
