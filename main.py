@@ -110,6 +110,11 @@ def _notify_callback(
     # Course-level terminal callbacks run in the owning course thread after
     # ``JobProcessor.run`` has joined/observed its workers.  Only callbacks
     # that can be emitted by a chapter worker need the late-worker gate.
+    failed_job_notification = (
+        name == "job_done_callback"
+        and bool(args)
+        and args[-1] == "failed"
+    )
     if name in {
         "chapter_start_callback",
         "chapter_status_callback",
@@ -118,7 +123,7 @@ def _notify_callback(
         "job_start_callback",
         "job_done_callback",
         "video_progress_callback",
-    }:
+    } and not failed_job_notification:
         if _worker_callback_stop_requested(config):
             raise StudyCancelled()
     callback = config.get(name)
@@ -689,8 +694,22 @@ class JobProcessor:
             if not callable(callback):
                 continue
 
-            def guarded_callback(*args: Any, _callback=callback, **kwargs: Any):
-                if (
+            def guarded_callback(
+                *args: Any,
+                _callback=callback,
+                _name=name,
+                **kwargs: Any,
+            ):
+                # A real job failure is published and closes the gate before
+                # its terminal ``failed`` notification is attempted.  Keep
+                # that one notification best-effort even though all other
+                # worker callbacks must reject late updates.
+                failed_job_notification = (
+                    _name == "job_done_callback"
+                    and bool(args)
+                    and args[-1] == "failed"
+                )
+                if not failed_job_notification and (
                     self._worker_stop_event.is_set()
                     or self._cancel_requested()
                 ):
@@ -1043,12 +1062,50 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     job_results:list[StudyResult]=[]
     video_progress_callback = config.get("video_progress_callback") if config else None
     executor = ThreadPoolExecutor(max_workers=5)
+    # Executor futures publish their exception only after the worker returns.
+    # A failed job can therefore close the processor gate while the Future is
+    # still pending from the owner's perspective.  Keep a small, thread-safe
+    # first-failure channel so the owner can stop waiting for a non-cooperative
+    # predecessor and never has to infer failure by scanning sibling futures.
+    job_error_lock = threading.Lock()
+    job_error_event = threading.Event()
+    job_errors: list[BaseException] = []
+
+    def publish_job_error(error: BaseException) -> None:
+        if isinstance(error, StudyCancelled):
+            return
+        with job_error_lock:
+            if job_errors:
+                return
+            job_errors.append(error)
+            job_error_event.set()
+            # Publish the real error before closing the callback gate.  Any
+            # worker that observes the gate can then read a stable first error.
+            _request_worker_stop(config)
+
+    def read_job_error() -> BaseException | None:
+        if not job_error_event.is_set():
+            return None
+        with job_error_lock:
+            return job_errors[0] if job_errors else None
+
+    def raise_if_job_stopped() -> None:
+        # A real worker error always outranks external/cooperative cancel.
+        job_error = read_job_error()
+        if job_error is not None:
+            raise job_error
+        raise_if_cancelled(config)
+        stop_event = config.get("_worker_stop_event") if config else None
+        stop_is_set = getattr(stop_event, "is_set", None)
+        if callable(stop_is_set) and stop_is_set():
+            raise StudyCancelled()
+
     try:
         def process_one_job(job):
             # Each executor worker starts with a fresh context, so both task
             # logging and task-local OCR settings must be re-entered here.
-            _notify_callback(config, "job_start_callback", course, point, job)
             try:
+                _notify_callback(config, "job_start_callback", course, point, job)
                 result = _run_worker_with_context(
                     config,
                     process_job,
@@ -1060,13 +1117,25 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                     progress_callback=video_progress_callback,
                     config=config,
                 )
+                _notify_callback(config, "job_done_callback", course, point, job, result)
             except StudyCancelled:
+                # Another worker may have published a real failure before
+                # this cooperative cancellation reached the Future.  Do not
+                # let that later Future's StudyCancelled hide the first error.
+                job_error = read_job_error()
                 _request_worker_stop(config)
+                if job_error is not None:
+                    raise job_error
                 raise
-            except BaseException:
+            except BaseException as error:
+                # This publication must precede both the stop transition and
+                # failed notification.  The owner can then abandon a blocked
+                # predecessor even while this worker is still in its callback.
+                publish_job_error(error)
                 try:
-                    # Preserve the failed terminal callback before closing the
-                    # worker gate; the callback itself is a worker boundary.
+                    # Failure reporting is best-effort and deliberately runs
+                    # after the gate closes, so it can never permit late
+                    # progress or mask the original exception.
                     _notify_callback(
                         config,
                         "job_done_callback",
@@ -1075,10 +1144,9 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                         job,
                         "failed",
                     )
-                finally:
-                    _request_worker_stop(config)
+                except BaseException:
+                    logger.debug("失败任务监控回调失败（异常内容已省略）")
                 raise
-            _notify_callback(config, "job_done_callback", course, point, job, result)
             return result
 
         # ThreadPoolExecutor workers do not inherit contextvars.  Capture a
@@ -1090,35 +1158,31 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         ]
         for future in futures:
             while True:
-                raise_if_cancelled(config)
+                raise_if_job_stopped()
                 try:
                     job_results.append(future.result(timeout=0.1))
                     break
                 except FutureTimeoutError:
                     # ``Future.result()`` must remain interruptible while a
                     # provider/transport is blocked.  The next bounded poll
-                    # observes cancellation and unwinds the chapter.
+                    # observes cancellation or an internal sibling failure and
+                    # unwinds the chapter.
+                    raise_if_job_stopped()
                     continue
                 except BaseException as error:
-                    # Close the processor-local callback gate before sibling
-                    # executor jobs can publish progress after this failure.
-                    _request_worker_stop(config)
-                    # A sibling may have already failed while this future was
-                    # still blocked.  Do not let the gate's StudyCancelled
-                    # from that sibling hide an already-completed real error.
-                    cancel_event = config.get("cancel_event") if config else None
-                    cancel_is_set = getattr(cancel_event, "is_set", None)
-                    cancellation_requested = callable(cancel_is_set) and cancel_is_set()
-                    if isinstance(error, StudyCancelled) and not cancellation_requested:
-                        for sibling in futures:
-                            if sibling is future or not sibling.done() or sibling.cancelled():
-                                continue
-                            sibling_error = sibling.exception()
-                            if sibling_error is not None and not isinstance(
-                                sibling_error, StudyCancelled
-                            ):
-                                raise sibling_error
+                    # The internal first-error channel is authoritative even
+                    # while the publishing worker has not completed its
+                    # Future.  External cancellation wins only when there is
+                    # no published real error.
+                    job_error = read_job_error()
+                    if job_error is not None:
+                        raise job_error
+                    if isinstance(error, StudyCancelled):
+                        raise_if_job_stopped()
                     raise
+        # A sibling can finish between the final Future result and the loop's
+        # next boundary; check the channel before interpreting the aggregate.
+        raise_if_job_stopped()
     finally:
         cancel_event = config.get("cancel_event") if config else None
         is_cancelled = getattr(cancel_event, "is_set", None)
@@ -1126,12 +1190,21 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         stop_event = config.get("_worker_stop_event") if config else None
         stop_is_set = getattr(stop_event, "is_set", None)
         worker_stop_requested = callable(stop_is_set) and stop_is_set()
+        job_failure_published = read_job_error() is not None
         # A running Python thread cannot be killed safely.  On cancellation,
         # stop waiting for executor workers and cancel only work not yet
         # started; JobProcessor's stop event gates late callbacks/retries.
         executor.shutdown(
-            wait=not (cancellation_requested or worker_stop_requested),
-            cancel_futures=cancellation_requested or worker_stop_requested,
+            wait=not (
+                cancellation_requested
+                or worker_stop_requested
+                or job_failure_published
+            ),
+            cancel_futures=(
+                cancellation_requested
+                or worker_stop_requested
+                or job_failure_published
+            ),
         )
     
     for result in job_results:
