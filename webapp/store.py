@@ -1,4 +1,4 @@
-"""Short-lived SQLite persistence for accounts and web settings."""
+"""SQLite persistence for accounts, web settings, and task-monitor history."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import math
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -97,6 +98,29 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS secrets (
     key TEXT PRIMARY KEY,
     value_token TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS web_tasks (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    started_at REAL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS web_tasks_started_at_idx
+    ON web_tasks(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS web_task_logs (
+    task_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    PRIMARY KEY (task_id, sequence),
+    FOREIGN KEY (task_id) REFERENCES web_tasks(id) ON DELETE CASCADE
 );
 """
 
@@ -1098,3 +1122,141 @@ class SQLiteStore:
                 ),
             )
         return resolved
+
+    def save_web_task(
+        self,
+        snapshot: Mapping[str, Any],
+        details: Mapping[str, Any],
+    ) -> None:
+        """Upsert one credential-free task monitor record.
+
+        Task credentials remain in the encrypted account tables.  This table
+        stores only the same public snapshot/details already returned by the
+        task API, so a restart can restore the monitor without retaining a
+        decrypted password, cookie, or answer-service key.
+        """
+
+        task_id = str(snapshot.get("id", "")).strip()
+        account_id = str(snapshot.get("account_id", "")).strip()
+        if not task_id or not account_id:
+            raise ValueError("task id and account id are required")
+        started_at = snapshot.get("started_at")
+        if started_at is not None:
+            started_at = float(started_at)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO web_tasks
+                    (id, account_id, snapshot_json, details_json, started_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    details_json = excluded.details_json,
+                    started_at = excluded.started_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    account_id,
+                    _json_dump(dict(snapshot)),
+                    _json_dump(dict(details)),
+                    started_at,
+                    _utc_now(),
+                ),
+            )
+
+    def save_web_task_log(
+        self,
+        task_id: str,
+        entry: Mapping[str, Any],
+        *,
+        capacity: int,
+    ) -> None:
+        """Append one task log and retain only the bounded newest entries."""
+
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("capacity must be a positive integer")
+        sequence = int(entry["sequence"])
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO web_task_logs
+                    (task_id, sequence, level, message, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, sequence) DO UPDATE SET
+                    level = excluded.level,
+                    message = excluded.message,
+                    timestamp = excluded.timestamp
+                """,
+                (
+                    str(task_id),
+                    sequence,
+                    str(entry.get("level", "info")),
+                    str(entry.get("message", "")),
+                    float(entry.get("timestamp", time.time())),
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM web_task_logs
+                WHERE task_id = ? AND sequence NOT IN (
+                    SELECT sequence FROM web_task_logs
+                    WHERE task_id = ?
+                    ORDER BY sequence DESC
+                    LIMIT ?
+                )
+                """,
+                (str(task_id), str(task_id), capacity),
+            )
+
+    def load_web_tasks(self, *, limit: int) -> list[dict[str, Any]]:
+        """Load newest persisted monitor records with their bounded logs."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, snapshot_json, details_json
+                FROM web_tasks
+                ORDER BY COALESCE(started_at, 0) DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            records: list[dict[str, Any]] = []
+            for row in rows:
+                snapshot = _json_load(row["snapshot_json"], {})
+                details = _json_load(row["details_json"], {})
+                if not isinstance(snapshot, Mapping) or not isinstance(details, Mapping):
+                    continue
+                log_rows = connection.execute(
+                    """
+                    SELECT sequence, level, message, timestamp
+                    FROM web_task_logs
+                    WHERE task_id = ?
+                    ORDER BY sequence ASC
+                    """,
+                    (row["id"],),
+                ).fetchall()
+                records.append(
+                    {
+                        "snapshot": dict(snapshot),
+                        "details": dict(details),
+                        "logs": [dict(item) for item in log_rows],
+                    }
+                )
+            return records
+
+    def delete_web_tasks(self, task_ids: list[str] | tuple[str, ...]) -> None:
+        """Delete exact task records selected by the bounded manager."""
+
+        ids = [str(task_id) for task_id in task_ids if str(task_id).strip()]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection() as connection:
+            connection.execute(
+                f"DELETE FROM web_tasks WHERE id IN ({placeholders})",
+                ids,
+            )

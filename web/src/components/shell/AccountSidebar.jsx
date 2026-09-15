@@ -11,8 +11,26 @@ const navLinkClass = ({ isActive }) =>
     isActive && 'bg-accent-blue/[0.1] font-medium text-accent-blue hover:bg-accent-blue/[0.14] hover:text-accent-blue',
   )
 
+const ACTIVE_TASK_STATES = new Set(['running', 'stopping'])
+
+function taskAccountId(task) {
+  return task?.account_id ?? task?.accountId
+}
+
+function taskTimestamp(task) {
+  const value = Number(task?.started_at ?? task?.startedAt ?? task?.finished_at ?? task?.finishedAt)
+  return Number.isFinite(value) ? value : 0
+}
+
 function taskForAccount(tasks, accountId) {
-  return tasks.find((task) => String(task.account_id ?? task.accountId) === String(accountId))
+  return (Array.isArray(tasks) ? tasks : [])
+    .filter((task) => task && typeof task === 'object')
+    .filter((task) => String(taskAccountId(task)) === String(accountId))
+    .sort((left, right) => {
+      const leftActive = ACTIVE_TASK_STATES.has(left?.state) ? 1 : 0
+      const rightActive = ACTIVE_TASK_STATES.has(right?.state) ? 1 : 0
+      return rightActive - leftActive || taskTimestamp(right) - taskTimestamp(left)
+    })[0]
 }
 
 const AccountSidebar = React.forwardRef(function AccountSidebar(
@@ -31,7 +49,7 @@ const AccountSidebar = React.forwardRef(function AccountSidebar(
       id="account-sidebar"
       aria-label="账户导航"
       className={cn(
-        'shell-material w-full shrink-0 flex-col border-r border-separator md:flex md:w-[220px]',
+        'shell-material w-full shrink-0 flex-col border-r border-separator md:flex md:h-full md:w-[220px]',
         className,
       )}
     >
@@ -94,5 +112,5 @@ const AccountSidebar = React.forwardRef(function AccountSidebar(
 
 AccountSidebar.displayName = 'AccountSidebar'
 
-export { AccountSidebar }
+export { AccountSidebar, taskForAccount }
 export default AccountSidebar

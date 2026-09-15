@@ -25,6 +25,7 @@ class FakeSession:
     def __init__(self, post_response=None, get_responses=None, post_cookies=None):
         self.cookies = RequestsCookieJar()
         self.requested_urls = []
+        self.requested_kwargs = []
         self.posted_urls = []
         self.post_response = post_response or FakeResponse()
         self.get_responses = list(get_responses or [])
@@ -37,6 +38,7 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.requested_urls.append(url)
+        self.requested_kwargs.append(kwargs)
         if self.get_responses:
             return self.get_responses.pop(0)
         return FakeResponse()
@@ -66,12 +68,32 @@ def test_live_uses_the_session_owned_by_its_account(fake_session):
     )
     live.do_finish()
     assert fake_session.requested_urls[0].startswith("https://zhibo.chaoxing.com/")
+    assert fake_session.requested_kwargs[0]["params"]["isStart"] == "0"
+
+    live.do_finish()
+    assert fake_session.requested_kwargs[1]["params"]["isStart"] == "1"
+
+
+def test_live_marks_an_at_fail_retry_as_a_continuation():
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(text="@fail"), FakeResponse(text="@fail")]
+    )
+    live = Live(
+        attachment={"property": {"streamName": "s", "vdoid": "v"}},
+        defaults={"userid": "u"},
+        course_id="c",
+        session=fake_session,
+    )
+
+    assert live.do_finish() is False
+    assert live.do_finish() is False
+    assert [item["params"]["isStart"] for item in fake_session.requested_kwargs] == ["0", "1"]
 
 
 def test_live_get_status_uses_the_explicit_session():
     fake_session = FakeSession(get_responses=[FakeResponse(text='{"duration": 42}')])
     live = Live(
-        attachment={"property": {"liveId": "live-1", "_jobid": "job-1"}},
+        attachment={"jobid": "job-1", "property": {"liveId": "live-1"}},
         defaults={
             "userid": "u",
             "clazzId": "clazz",
@@ -82,7 +104,69 @@ def test_live_get_status_uses_the_explicit_session():
     )
 
     assert live.get_status() == {"duration": 42}
-    assert fake_session.requested_urls[0].startswith("https://mooc1.chaoxing.com/ananas/live/liveinfo?")
+    assert fake_session.requested_urls[0] == "https://mooc1.chaoxing.com/ananas/live/liveinfo"
+    assert fake_session.requested_kwargs[0]["params"]["jobid"] == "job-1"
+
+
+def test_live_get_status_rejects_a_missing_job_id_without_network_io():
+    fake_session = FakeSession()
+    live = Live(
+        attachment={"property": {"liveId": "live-1"}},
+        defaults={
+            "userid": "u",
+            "clazzId": "clazz",
+            "knowledgeid": "knowledge",
+        },
+        course_id="c",
+        session=fake_session,
+    )
+
+    assert live.get_status() is None
+    assert fake_session.requested_urls == []
+
+
+def test_live_prepare_builds_account_scoped_watch_context():
+    fake_session = FakeSession()
+    live = Live(
+        attachment={
+            "jobid": "job-1",
+            "liveSetEnc": "live-enc",
+            "authEnc": "auth-enc",
+            "liveDragEnc": "drag-enc",
+            "liveSwDsEnc": "swds-enc",
+            "isNotDrag": "0",
+            "property": {"liveId": "live-1", "rt": "0.9"},
+        },
+        defaults={
+            "userid": "u",
+            "clazzId": "clazz",
+            "knowledgeid": "knowledge",
+        },
+        course_id="course",
+        session=fake_session,
+    )
+
+    assert live.prepare() is True
+    assert fake_session.requested_urls == ["https://zhibo.chaoxing.com/live-1"]
+    assert fake_session.requested_kwargs[0]["params"] == {
+        "courseId": "course",
+        "classId": "clazz",
+        "knowledgeId": "knowledge",
+        "jobId": "job-1",
+        "userId": "u",
+        "rt": "0.9",
+        "livesetenc": "live-enc",
+        "isjob": "true",
+        "watchingInCourse": "1",
+        "customPara1": "clazz_course",
+        "customPara2": "auth-enc",
+        "isNotDrag": "0",
+        "jobfs": "0",
+        "livedragenc": "drag-enc",
+        "sw": "1",
+        "ds": "1",
+        "liveswdsenc": "swds-enc",
+    }
 
 
 def test_password_login_uses_supplied_session_and_cookie_callback():

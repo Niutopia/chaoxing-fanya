@@ -1,5 +1,6 @@
-import time
+import math
 import threading
+import time
 
 from api.live import Live
 from api.logger import logger
@@ -24,44 +25,94 @@ class LiveProcessor:
             logger.error("直播状态获取失败，无法继续")
             return False
 
-        # 解析直播总时长（单位：秒）
+        # 解析直播总时长与服务器已记录的进度。
         try:
-            duration = live_status.get("temp", {}).get("data", {}).get("duration", 0)
-            if not duration:
-                logger.warning("无法获取直播总时长，默认按30分钟处理")
-                duration = 30 * 60  # 默认30分钟
+            data = live_status.get("temp", {}).get("data", {})
+            duration = float(data.get("duration", 0))
+            watched_minutes = float(data.get("timeLongValue", 0))
+            percent = float(data.get("percentValue", 0))
+            if (
+                not math.isfinite(duration)
+                or not math.isfinite(watched_minutes)
+                or not math.isfinite(percent)
+            ):
+                raise ValueError
+            watched_seconds = max(0.0, watched_minutes) * 60
+            percent = max(0.0, percent)
+            live_status_code = data.get("liveStatus")
+            if duration <= 0:
+                logger.error("服务器未返回有效直播时长，已停止该任务")
+                return False
+            if live_status_code is not None:
+                status_code = int(live_status_code)
+                # 0 means the live session has not started.  In-progress,
+                # ended, and replay states are all valid inputs; a replay
+                # explicitly marked as non-reviewable is the exception.
+                if status_code == 0:
+                    logger.error("该直播尚未开始，无法提交观看进度")
+                    return False
+                if status_code == 4 and str(data.get("ifReview", "")).lower() in {
+                    "1",
+                    "true",
+                }:
+                    logger.error("该直播不允许回看，无法提交观看进度")
+                    return False
+            if percent >= 90 or watched_seconds >= duration:
+                logger.info(f"直播'{live.name}'观看进度已达标，无需重复学习")
+                return True
         except StudyCancelled:
             raise
-        except Exception:
-            logger.error("解析直播时长失败")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            logger.error("直播状态数据异常，已停止该任务")
             return False
 
-        # 根据播放速度调整所需时间
-        adjusted_duration = duration / speed
-        total_minutes = (int(adjusted_duration) + 59) // 60  # 转换为分钟（向上取整）
-        logger.info(f"开始刷取直播'{live.name}'，总时长{total_minutes}分钟（已根据倍速调整）")
+        try:
+            speed = float(speed)
+            if not math.isfinite(speed) or speed <= 0:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            logger.error("直播播放速度无效")
+            return False
 
-        # 循环提交时长（每59秒一次，模拟持续观看）
-        for i in range(total_minutes):
+        _raise_if_cancelled(cancel_event)
+        if not live.prepare():
+            return False
+
+        remaining_duration = max(0.0, duration - watched_seconds)
+        adjusted_duration = remaining_duration / speed
+        report_interval = 30.0 / speed
+        # The player reports at t=0 and once more when the simulated playhead
+        # reaches the end.  Thus a positive remainder needs the initial
+        # heartbeat plus ceil(remainder / 30s) progress heartbeats.  The
+        # final report is required even when the remainder is an exact
+        # multiple of 30 seconds.
+        total_reports = math.ceil(adjusted_duration / report_interval) + 1
+        logger.info(
+            f"开始刷取直播'{live.name}'，剩余约{math.ceil(adjusted_duration / 60)}分钟"
+        )
+
+        # 官方页面按30秒心跳。第一次为启动信号，后续为持续观看。
+        for index in range(total_reports):
             _raise_if_cancelled(cancel_event)
-            logger.info(f"直播'{live.name}'已观看{i+1}/{total_minutes}分钟")
-            success = live.do_finish()  # 提交当前时长
+            logger.info(f"直播'{live.name}'正在上报进度 {index + 1}/{total_reports}")
+            success = live.do_finish()
             if not success:
-                logger.warning(f"第{i+1}分钟时长提交失败，将重试")
-                # 失败重试一次
+                logger.warning(f"第{index + 1}次直播进度上报失败，5秒后重试")
                 if cancel_event is not None and cancel_event.wait(5):
                     raise StudyCancelled()
                 elif cancel_event is None:
                     time.sleep(5)
                 _raise_if_cancelled(cancel_event)
-                live.do_finish()
+                if not live.do_finish():
+                    logger.error("直播进度连续上报失败，本次直播任务已停止")
+                    return False
 
-            # 根据倍速调整间隔时间
-            sleep_time = 59 / speed
-            if cancel_event is not None and cancel_event.wait(sleep_time):
+            if index == total_reports - 1:
+                break
+            if cancel_event is not None and cancel_event.wait(report_interval):
                 raise StudyCancelled()
             elif cancel_event is None:
-                time.sleep(sleep_time)
+                time.sleep(report_interval)
 
         logger.success(f"直播'{live.name}'时长刷取完成")
         return True

@@ -33,6 +33,25 @@ test('marks shell controls as mobile-safe touch targets', () => {
   expect(screen.getByRole('button', { name: '添加账户' })).toHaveClass('touch-target')
 })
 
+test('keeps the desktop shell bounded while the main region owns scrolling', () => {
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <AppShell accounts={[]} tasks={[]} onAddAccount={() => {}} />
+    </MemoryRouter>,
+  )
+
+  const shell = document.querySelector('.app-shell')
+  const middle = screen.getByRole('complementary', { name: '账户导航' }).parentElement
+  const main = screen.getByRole('main', { name: '主要内容' })
+
+  expect(shell).toHaveClass('md:h-dvh', 'md:overflow-hidden')
+  expect(screen.getByRole('banner')).toHaveClass('shrink-0')
+  expect(middle).toHaveClass('min-h-0')
+  expect(screen.getByRole('complementary', { name: '账户导航' })).toHaveClass('md:h-full')
+  expect(main).toHaveClass('md:h-full', 'md:overflow-y-auto', 'md:overscroll-contain')
+  expect(main).toHaveAttribute('tabindex', '-1')
+})
+
 test('opens the account dialog when no external add handler is supplied', async () => {
   const user = userEvent.setup()
 

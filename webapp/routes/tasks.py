@@ -1,9 +1,10 @@
 """Task start, monitoring, log, and cancellation endpoints.
 
-Task state intentionally lives in the process-local :class:`TaskManager`.
+Live execution remains process-local, while credential-free monitor records
+are mirrored to SQLite so an application restart does not erase task history.
 Routes resolve account credentials and the shared answer connection only for
-the short startup hand-off; all HTTP serializers below operate on the
-credential-free task value objects returned by the manager.
+the short startup hand-off; all HTTP serializers below operate on the public
+task value objects returned by the manager.
 """
 
 from __future__ import annotations

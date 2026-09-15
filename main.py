@@ -535,6 +535,7 @@ def process_job(
             )
             
             live_error: list[BaseException] = []
+            live_result: list[bool] = []
 
             # Exceptions raised in a worker thread do not propagate to the
             # joining caller by themselves.  Capture them so cancellation is
@@ -542,12 +543,16 @@ def process_job(
             # an ordinary failed live job.
             def run_live_and_capture():
                 try:
-                    _run_worker_with_context(
-                        config,
-                        LiveProcessor.run_live,
-                        live,
-                        speed,
-                        cancel_event=config.get("cancel_event") if config else None,
+                    live_result.append(
+                        bool(
+                            _run_worker_with_context(
+                                config,
+                                LiveProcessor.run_live,
+                                live,
+                                speed,
+                                cancel_event=config.get("cancel_event") if config else None,
+                            )
+                        )
                     )
                 except BaseException as exc:
                     live_error.append(exc)
@@ -558,7 +563,7 @@ def process_job(
             if live_error:
                 raise live_error[0]
             raise_if_cancelled(config)
-            return StudyResult.SUCCESS
+            return StudyResult.SUCCESS if live_result == [True] else StudyResult.ERROR
         except StudyCancelled:
             raise
         except Exception as e:

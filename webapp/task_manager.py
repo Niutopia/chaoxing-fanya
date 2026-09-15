@@ -1,10 +1,11 @@
-"""Process-local task admission, state, progress, and log storage.
+"""Process-local task execution with optional monitor persistence.
 
-The Web application deliberately keeps task state in memory.  A task owns its
-own cancellation event, reporter, details, and bounded log buffer, while a
-manager-wide semaphore limits the number of account tasks that may run at one
-time.  No credential-bearing value is ever included in a public snapshot,
-details object, or log entry.
+A task owns its own cancellation event, reporter, details, and bounded log
+buffer, while a manager-wide semaphore limits the number of account tasks that
+may run at one time.  A persistence adapter can mirror the public monitor
+values to durable storage; only credential-free snapshots, details, and logs
+cross that boundary.  No credential-bearing value is ever included in a
+public snapshot, details object, or log entry.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from .models import (
 
 DEFAULT_LOG_CAPACITY = 5_000
 DEFAULT_TERMINAL_TASK_CAPACITY = 100
+_RESTART_INTERRUPTION_ERROR = "服务重启导致任务中断，超星进度保留，可重新开始继续"
 _UNSET = object()
 
 
@@ -74,6 +76,23 @@ def _copy(value: Any) -> Any:
         if isinstance(value, tuple):
             return tuple(_copy(item) for item in value)
         return value
+
+
+def _json_compatible(value: Any) -> Any:
+    """Detach public monitor values into the store's JSON-compatible shape."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_compatible(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, set):
+        return [_json_compatible(item) for item in sorted(value, key=str)]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _account_preferences(value: AccountPreferences | Mapping[str, Any]) -> AccountPreferences:
@@ -301,6 +320,19 @@ def _timestamp(value: Any = None) -> float:
         return time.time()
 
 
+def _optional_timestamp(value: Any) -> float | None:
+    """Coerce a persisted timestamp without inventing one for missing data."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 @dataclass(frozen=True, repr=False)
 class StudyRunContext:
     """Immutable task inputs handed to the study runner.
@@ -436,6 +468,7 @@ class TaskManager:
         answer_semaphore: threading.Semaphore | None = None,
         log_capacity: int = DEFAULT_LOG_CAPACITY,
         terminal_task_capacity: int = DEFAULT_TERMINAL_TASK_CAPACITY,
+        persistence: Any | None = None,
     ) -> None:
         if (
             isinstance(max_active_accounts, bool)
@@ -460,12 +493,14 @@ class TaskManager:
         self.answer_semaphore = answer_semaphore
         self.log_capacity = log_capacity
         self.terminal_task_capacity = terminal_task_capacity
+        self.persistence = persistence
         self._lock = threading.RLock()
         # Keep this name public-ish: account routes use the manager as their
         # active-task guard, and diagnostics benefit from a simple mapping.
         self.active_by_account: dict[str, str] = {}
         self._tasks: dict[str, _TaskRuntime] = {}
         self._active_slots = threading.BoundedSemaphore(max_active_accounts)
+        self._restore_persisted_tasks()
 
     @property
     def lock(self) -> threading.RLock:
@@ -476,6 +511,306 @@ class TaskManager:
     @property
     def semaphore(self) -> threading.BoundedSemaphore:
         return self._active_slots
+
+    @staticmethod
+    def _snapshot_mapping(snapshot: TaskSnapshot) -> dict[str, Any]:
+        """Return only the public fields that may cross the store boundary."""
+
+        return {
+            "id": str(snapshot.id),
+            "account_id": str(snapshot.account_id),
+            "state": snapshot.state,
+            "progress": _json_compatible(_copy(snapshot.progress)),
+            "total": _json_compatible(_copy(snapshot.total)),
+            "current_course": _json_compatible(_copy(snapshot.current_course)),
+            "current_chapter": _json_compatible(_copy(snapshot.current_chapter)),
+            "current_task": _json_compatible(_copy(snapshot.current_task)),
+            "error": _json_compatible(_copy(snapshot.error)),
+            "started_at": _json_compatible(_copy(snapshot.started_at)),
+            "finished_at": _json_compatible(_copy(snapshot.finished_at)),
+            "stats": _json_compatible(_copy(snapshot.stats)),
+        }
+
+    @staticmethod
+    def _details_mapping(details: TaskDetails) -> dict[str, Any]:
+        """Return a detached, credential-free task-details mapping."""
+
+        return {
+            "courses": _json_compatible(_copy(details.courses)),
+            "active_jobs": _json_compatible(_copy(details.active_jobs)),
+            "counts": _json_compatible(_copy(details.counts)),
+        }
+
+    @staticmethod
+    def _log_mapping(entry: TaskLogEntry) -> dict[str, Any]:
+        return {
+            "sequence": int(entry.sequence),
+            "level": str(entry.level),
+            "message": str(entry.message),
+            "timestamp": float(entry.timestamp),
+        }
+
+    def _persist_record_locked(self, record: _TaskRuntime) -> None:
+        """Best-effort persistence of one public snapshot/details pair.
+
+        Persistence is deliberately an adapter rather than a hard dependency
+        so the process-local manager remains useful in command-line and test
+        integrations.  A storage outage must not make a worker fail while it
+        is reporting progress, and the adapter receives freshly allocated
+        public mappings on every call.
+        """
+
+        try:
+            saver = getattr(self.persistence, "save_web_task", None)
+            if not callable(saver):
+                return
+            saver(
+                self._snapshot_mapping(record.snapshot),
+                self._details_mapping(record.details),
+            )
+        except Exception:
+            # Monitoring persistence is best effort.  In particular, an
+            # injected store may not have an account row for a direct unit
+            # test, while the in-memory task should still run normally.
+            return
+
+    def _persist_log_locked(self, task_id: str, entry: TaskLogEntry) -> None:
+        try:
+            saver = getattr(self.persistence, "save_web_task_log", None)
+            if not callable(saver):
+                return
+            saver(
+                str(task_id),
+                self._log_mapping(entry),
+                capacity=self.log_capacity,
+            )
+        except Exception:
+            return
+
+    def _delete_persisted_tasks(self, task_ids: list[str]) -> None:
+        if not task_ids:
+            return
+        try:
+            deleter = getattr(self.persistence, "delete_web_tasks", None)
+            if callable(deleter):
+                deleter(list(task_ids))
+        except Exception:
+            return
+
+    @staticmethod
+    def _restore_details(value: Any) -> TaskDetails:
+        if not isinstance(value, Mapping):
+            value = {}
+        courses = value.get("courses", [])
+        if not isinstance(courses, list):
+            courses = list(courses) if isinstance(courses, (tuple, set)) else []
+        active_jobs = value.get("active_jobs", {})
+        if not isinstance(active_jobs, Mapping):
+            active_jobs = {}
+        counts = value.get("counts", {})
+        if not isinstance(counts, Mapping):
+            counts = {}
+        return TaskDetails(
+            courses=_copy(courses),
+            active_jobs=_copy(dict(active_jobs)),
+            counts=_copy(dict(counts)),
+        )
+
+    def _restore_logs(self, value: Any) -> tuple[deque[TaskLogEntry], int]:
+        if not isinstance(value, (list, tuple)):
+            value = []
+        by_sequence: dict[int, TaskLogEntry] = {}
+        for raw_entry in value:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            try:
+                sequence = int(raw_entry.get("sequence"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if sequence < 1:
+                continue
+            timestamp = _optional_timestamp(raw_entry.get("timestamp"))
+            if timestamp is None:
+                timestamp = time.time()
+            level = raw_entry.get("level", "info")
+            message = raw_entry.get("message", "")
+            by_sequence[sequence] = TaskLogEntry(
+                sequence=sequence,
+                level=_redact_text(level, ()).lower(),
+                message=_redact_text(message, ()),
+                timestamp=timestamp,
+            )
+        ordered = sorted(by_sequence.values(), key=lambda item: item.sequence)
+        next_sequence = max(by_sequence, default=0)
+        if len(ordered) > self.log_capacity:
+            ordered = ordered[-self.log_capacity :]
+        return deque(ordered, maxlen=self.log_capacity), next_sequence
+
+    def _restore_record(
+        self,
+        payload: Any,
+    ) -> tuple[_TaskRuntime, bool] | None:
+        """Build a terminal runtime from a persistence adapter response.
+
+        A restored runtime has no worker thread and an empty credential
+        context.  The second return value indicates that an interrupted task
+        was converted from ``running``/``stopping`` to ``failed`` and should
+        be written back in its normalized form.
+        """
+
+        if not isinstance(payload, Mapping):
+            return None
+        raw_snapshot = payload.get("snapshot")
+        if not isinstance(raw_snapshot, Mapping):
+            return None
+        task_id = str(raw_snapshot.get("id", "")).strip()
+        account_id = str(raw_snapshot.get("account_id", "")).strip()
+        if not task_id or not account_id:
+            return None
+        state = raw_snapshot.get("state")
+        if not isinstance(state, str) or state not in {
+            "running",
+            "stopping",
+            "completed",
+            "failed",
+            "stopped",
+        }:
+            return None
+        interrupted = state in {"running", "stopping"}
+        if interrupted:
+            state = "failed"
+        stats = raw_snapshot.get("stats", {})
+        if not isinstance(stats, Mapping):
+            stats = {}
+        error = raw_snapshot.get("error")
+        if interrupted:
+            error = _RESTART_INTERRUPTION_ERROR
+        elif error is not None:
+            error = _redact_text(error, ())
+        started_at = _optional_timestamp(raw_snapshot.get("started_at"))
+        finished_at = _optional_timestamp(raw_snapshot.get("finished_at"))
+        if interrupted and finished_at is None:
+            finished_at = time.time()
+        snapshot = TaskSnapshot(
+            id=task_id,
+            account_id=account_id,
+            state=state,
+            progress=_copy(raw_snapshot.get("progress", 0)),
+            total=_copy(raw_snapshot.get("total", 0)),
+            current_course=_copy(raw_snapshot.get("current_course")),
+            current_chapter=_copy(raw_snapshot.get("current_chapter")),
+            current_task=_copy(raw_snapshot.get("current_task")),
+            error=error,
+            started_at=started_at,
+            finished_at=finished_at,
+            stats=_copy(dict(stats)),
+        )
+        details = self._restore_details(payload.get("details", {}))
+        if interrupted:
+            # The old worker cannot still be running after this process has
+            # started, so stale active jobs would be misleading in the
+            # terminal monitor view.
+            details = replace(details, active_jobs={})
+        logs, next_sequence = self._restore_logs(payload.get("logs", []))
+        if interrupted:
+            next_sequence += 1
+            interruption_entry = TaskLogEntry(
+                sequence=next_sequence,
+                level="warning",
+                message=_RESTART_INTERRUPTION_ERROR,
+                timestamp=finished_at if finished_at is not None else time.time(),
+            )
+            logs.append(interruption_entry)
+        cancel_event = threading.Event()
+        done = threading.Event()
+        done.set()
+        started = threading.Event()
+        started.set()
+        context = StudyRunContext(
+            task_id=task_id,
+            account_id=account_id,
+            course_ids=[],
+            preferences=AccountPreferences(),
+            auth=AccountAuth(username="", password="", cookies={}),
+            answer=None,
+            answer_semaphore=None,
+            cancel_event=cancel_event,
+            reporter=TaskReporter(self, task_id),
+        )
+        return (
+            _TaskRuntime(
+                snapshot=snapshot,
+                details=details,
+                context=context,
+                done=done,
+                started=started,
+                logs=logs,
+                next_sequence=next_sequence,
+                slot_released=True,
+            ),
+            interrupted,
+        )
+
+    def _restore_persisted_tasks(self) -> None:
+        try:
+            loader = getattr(self.persistence, "load_web_tasks", None)
+            if not callable(loader):
+                return
+            payloads = loader(limit=self.terminal_task_capacity)
+            payloads = list(payloads)
+        except Exception:
+            return
+        with self._lock:
+            for payload in payloads:
+                restored = self._restore_record(payload)
+                if restored is None:
+                    continue
+                record, interrupted = restored
+                self._tasks[record.snapshot.id] = record
+                if interrupted:
+                    self._persist_log_locked(
+                        record.snapshot.id,
+                        record.logs[-1],
+                    )
+                    self._persist_record_locked(record)
+            self._trim_terminal_locked()
+
+    @staticmethod
+    def _history_timestamp(record: _TaskRuntime) -> float:
+        value = record.snapshot.finished_at
+        if value is None:
+            value = record.snapshot.started_at
+        timestamp = _optional_timestamp(value)
+        if timestamp is None:
+            return 0.0
+        return timestamp
+
+    @staticmethod
+    def _list_timestamp(record: _TaskRuntime) -> float:
+        value = record.snapshot.started_at
+        if value is None:
+            value = record.snapshot.finished_at
+        timestamp = _optional_timestamp(value)
+        if timestamp is None:
+            return 0.0
+        return timestamp
+
+    def _trim_terminal_locked(self) -> None:
+        terminal = [
+            item
+            for item in self._tasks.values()
+            if item.snapshot.state not in {"running", "stopping"}
+        ]
+        terminal.sort(
+            key=lambda item: (self._history_timestamp(item), item.snapshot.id)
+        )
+        stale = terminal[: -self.terminal_task_capacity]
+        if not stale:
+            return
+        stale_ids = [item.snapshot.id for item in stale]
+        for task_id in stale_ids:
+            self._tasks.pop(task_id, None)
+        self._delete_persisted_tasks(stale_ids)
 
     def set_max_active_accounts(self, value: int) -> None:
         """Apply a new active-account limit at an idle settings boundary.
@@ -550,19 +885,6 @@ class TaskManager:
             if not self._active_slots.acquire(blocking=False):
                 raise TaskCapacityReached("maximum active account tasks reached")
 
-            # Keep one visible task per account.  Terminal records are useful
-            # until the next run is admitted, but retaining every completed
-            # context/log buffer would make process-local state grow without
-            # bound.  Evict only this account's terminal records after the
-            # new run has secured its slot, so a failed admission leaves all
-            # existing state untouched.
-            for old_task_id, old_record in tuple(self._tasks.items()):
-                if (
-                    old_record.snapshot.account_id == account
-                    and old_record.snapshot.state not in {"running", "stopping"}
-                ):
-                    self._tasks.pop(old_task_id, None)
-
             task_id = str(uuid.uuid4())
             now = time.time()
             reporter = TaskReporter(self, task_id)
@@ -595,6 +917,11 @@ class TaskManager:
             )
             self._tasks[task_id] = record
             self.active_by_account[account] = task_id
+            # Persist the initial running state before handing the worker its
+            # context.  The mapping contains no auth/preferences/answer
+            # values, and a later restart can normalize this state to a
+            # terminal failure if the process disappears.
+            self._persist_record_locked(record)
 
             thread = threading.Thread(
                 target=self._run_task,
@@ -732,16 +1059,8 @@ class TaskManager:
             answer_semaphore=None,
         )
         record.done.set()
-        terminal = [
-            item
-            for item in self._tasks.values()
-            if item.snapshot.state not in {"running", "stopping"}
-        ]
-        terminal.sort(
-            key=lambda item: item.snapshot.finished_at or item.snapshot.started_at or 0
-        )
-        for stale in terminal[: -self.terminal_task_capacity]:
-            self._tasks.pop(stale.snapshot.id, None)
+        self._persist_record_locked(record)
+        self._trim_terminal_locked()
 
     def cancel(self, task_id: str) -> TaskSnapshot:
         """Request cooperative cancellation and return the new snapshot."""
@@ -753,6 +1072,7 @@ class TaskManager:
             if record.snapshot.state == "running":
                 record.snapshot = replace(record.snapshot, state="stopping")
             record.context.cancel_event.set()
+            self._persist_record_locked(record)
             return self._snapshot_copy(record.snapshot)
 
     def wait(self, task_id: str, timeout: float | None = None) -> bool:
@@ -778,7 +1098,12 @@ class TaskManager:
 
     def list_tasks(self) -> list[TaskSnapshot]:
         with self._lock:
-            return [self._snapshot_copy(item.snapshot) for item in self._tasks.values()]
+            records = sorted(
+                self._tasks.values(),
+                key=lambda item: (self._list_timestamp(item), item.snapshot.id),
+                reverse=True,
+            )
+            return [self._snapshot_copy(item.snapshot) for item in records]
 
     def get_snapshot(self, task_id: str) -> TaskSnapshot:
         with self._lock:
@@ -810,6 +1135,7 @@ class TaskManager:
                 if key in {"current_course", "current_chapter", "current_task"}
             }
             record.snapshot = replace(record.snapshot, **updates)
+            self._persist_record_locked(record)
 
     @staticmethod
     def _infer_progress(counts: Mapping[str, Any]) -> tuple[Any, Any]:
@@ -853,6 +1179,7 @@ class TaskManager:
                 **({"total": total} if total is not None else {}),
             )
             record.details = replace(record.details, counts=_copy(merged_counts))
+            self._persist_record_locked(record)
 
     def _set_courses(self, task_id: str, courses: Any) -> None:
         with self._lock:
@@ -862,6 +1189,7 @@ class TaskManager:
             if not isinstance(copied, list):
                 copied = list(copied) if isinstance(copied, (tuple, set)) else [copied]
             record.details = replace(record.details, courses=copied)
+            self._persist_record_locked(record)
 
     def _set_active_jobs(self, task_id: str, active_jobs: Any) -> None:
         with self._lock:
@@ -871,6 +1199,7 @@ class TaskManager:
             if not isinstance(copied, dict):
                 copied = {}
             record.details = replace(record.details, active_jobs=copied)
+            self._persist_record_locked(record)
 
     def append_log(
         self,
@@ -898,6 +1227,7 @@ class TaskManager:
                 timestamp=_timestamp(timestamp),
             )
             record.logs.append(entry)
+            self._persist_log_locked(record.snapshot.id, entry)
             return entry
 
     def get_logs(self, task_id: str, after: int = 0) -> TaskLogPage:

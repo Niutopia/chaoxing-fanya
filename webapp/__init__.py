@@ -133,6 +133,7 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
             runner=runner,
             max_active_accounts=configured_limit,
             answer_semaphore=answer_semaphore,
+            persistence=store,
         )
 
     # The account routes only require the active-task guard protocol.  Keep an

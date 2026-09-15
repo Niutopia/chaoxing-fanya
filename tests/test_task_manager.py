@@ -13,7 +13,6 @@ from webapp.task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
     TaskManager,
-    TaskNotFound,
 )
 
 
@@ -415,7 +414,7 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
         assert secret not in visible
 
 
-def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
+def test_new_task_keeps_prior_terminal_record_and_owned_state(task_inputs):
     runner = OutcomeRunner("completed")
     manager = TaskManager(runner=runner, max_active_accounts=1)
     first = manager.start(**task_inputs("evict-account"))
@@ -424,13 +423,10 @@ def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
 
     second = manager.start(**task_inputs("evict-account"))
     assert manager.wait(second.id, timeout=1)
-    assert [snapshot.id for snapshot in manager.list_tasks()] == [second.id]
-    with pytest.raises(TaskNotFound):
-        manager.get_snapshot(first.id)
-    with pytest.raises(TaskNotFound):
-        manager.get_details(first.id)
-    with pytest.raises(TaskNotFound):
-        manager.get_logs(first.id)
+    assert [snapshot.id for snapshot in manager.list_tasks()] == [second.id, first.id]
+    assert manager.get_snapshot(first.id).state == "completed"
+    assert manager.get_details(first.id).courses == []
+    assert manager.get_logs(first.id).items == []
 
 
 def test_terminal_task_releases_decrypted_credentials(task_inputs):
@@ -470,4 +466,4 @@ def test_terminal_task_history_is_globally_bounded(task_inputs):
         task = manager.start(**task_inputs(account))
         assert manager.wait(task.id, timeout=1)
         ids.append(task.id)
-    assert [item.id for item in manager.list_tasks()] == ids[-2:]
+    assert [item.id for item in manager.list_tasks()] == list(reversed(ids[-2:]))
