@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
 from contextlib import nullcontext
+import json
 import random
 import re
 import threading
@@ -46,6 +47,9 @@ class _CompletionMappingError(ValueError):
     """Raised when a completion answer cannot fit the actual form fields."""
 
 
+_CACHE_EXPECTED_UNSET = object()
+
+
 def _completion_field_modes(answer_field: Mapping, question_id: str):
     """Return aggregate, one-based, and underscore-indexed actual fields."""
 
@@ -79,7 +83,122 @@ def _completion_parts(result) -> list[str]:
     return [str(result).strip()]
 
 
-def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
+_CHOICE_WORD_RE = re.compile(r"(?<![A-Za-z])([A-Za-z]+)(?![A-Za-z])")
+_NATURAL_CHOICE_FRAGMENT_RES = (
+    re.compile(
+        r"\boptions?\s+(?P<fragment>[A-Za-z]+(?:\s*(?:[,，、]|and|or)\s*"
+        r"[A-Za-z]+)*)\s+(?:is|are)\s+(?:correct|right)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:correct\s+)?answers?\s*(?:is|are|:|：|=)\s*"
+        r"(?P<fragment>[^.!?。！？;；\n]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"correct\s+options?\s*(?:is|are|:|：|=)\s*"
+        r"(?P<fragment>[^.!?。！？;；\n]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:答案|答复|正确答案|正确选项)\s*(?:是|为|:|：|=)\s*"
+        r"(?P<fragment>[^.!?。！？;；\n]*)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _natural_label_gap_is_allowed(gap: str) -> bool:
+    """Whether text between two natural-language labels is just a joiner."""
+
+    compact = re.sub(r"[\s,，、|/&+;；:：()（）\[\]【】.．-]", "", gap)
+    return compact.casefold() in {"", "and", "or", "和", "或", "及", "与", "以及", "或者"}
+
+
+def _unwrap_choice_result(result):
+    """Extract an Answer/answer value from provider-shaped JSON values."""
+
+    candidate = result
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if text.startswith("```") and text.endswith("```"):
+            text = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+        if (
+            (text.startswith("{") and text.endswith("}"))
+            or (text.startswith("[") and text.endswith("]"))
+        ):
+            try:
+                candidate = json.loads(text)
+            except (TypeError, ValueError):
+                candidate = result
+    if isinstance(candidate, Mapping):
+        for key, value in candidate.items():
+            if str(key).strip().casefold() in {"answer", "answers"}:
+                return value
+    return candidate
+
+
+def _natural_choice_labels(value, valid_labels: set[str], *, multiple: bool):
+    """Extract explicit labels from a natural-language answer wrapper.
+
+    A label is considered only when the surrounding text contains a stable
+    answer/option marker.  This keeps words such as ``Babbage`` from turning
+    their first letter into an option label.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    labels = []
+    for pattern in _NATURAL_CHOICE_FRAGMENT_RES:
+        for fragment_match in pattern.finditer(text):
+            fragment = fragment_match.group("fragment")
+            previous_end = 0
+            fragment_labels = []
+            for token_match in _CHOICE_WORD_RE.finditer(fragment):
+                if not _natural_label_gap_is_allowed(
+                    fragment[previous_end : token_match.start()]
+                ):
+                    break
+                token = token_match.group(1)
+                label = label_from_token(token, valid_labels)
+                if label:
+                    fragment_labels.append(label)
+                    previous_end = token_match.end()
+                    continue
+                # Words such as ``and``/``or`` may join two labels, but any
+                # other non-label token ends the explicit answer fragment.
+                if not _natural_label_gap_is_allowed(
+                    fragment[previous_end : token_match.end()]
+                ):
+                    break
+                previous_end = token_match.end()
+            labels.extend(fragment_labels)
+
+    if not labels:
+        return []
+
+    # For a single-choice response, one explicit label is required.  For a
+    # multiple-choice response, repeated labels are harmless but the answer
+    # order remains the page's option order through ordered_unique().
+    if not multiple and len(set(labels)) != 1:
+        return []
+    return labels
+
+
+def _resolve_choice_answer(
+    result,
+    options,
+    *,
+    multiple: bool,
+    strict_labels_only: bool = False,
+) -> str:
     """Map strict labels or complete option text to the form's labels.
 
     In particular, do not scan every alphabetic character in a normal word:
@@ -91,6 +210,7 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
     if not entries or not valid_labels:
         return ""
 
+    result = _unwrap_choice_result(result)
     raw_text = str(result or "").strip()
     parts = answer_parts(result)
     nonempty_parts = [part for part in parts if str(part).strip()]
@@ -110,6 +230,17 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
             if entry.normalized_text == normalized
         ]
 
+    # A complete option body is more authoritative than a natural-language
+    # wrapper that happens to contain a legal-looking label.  Reject duplicate
+    # display bodies here instead of allowing the wrapper fallback to choose
+    # one of them arbitrarily.
+    if not strict_labels_only and not is_collection:
+        whole_matches = text_candidates(raw_text)
+        if len(whole_matches) == 1:
+            return whole_matches[0]
+        if len(whole_matches) > 1:
+            return ""
+
     # A single value can be either a strict label or complete option text.
     # Multiple requested values are never silently truncated for single-choice
     # questions.
@@ -117,6 +248,19 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
         label = label_from_token(nonempty_parts[0], valid_labels)
         if label:
             return label
+        part_matches = (
+            [] if strict_labels_only else text_candidates(nonempty_parts[0])
+        )
+        if len(part_matches) == 1:
+            return part_matches[0]
+        if len(part_matches) > 1:
+            return ""
+        if not strict_labels_only:
+            natural_labels = _natural_choice_labels(
+                nonempty_parts[0], valid_labels, multiple=multiple
+            )
+            if natural_labels:
+                return ordered_unique(natural_labels)
     elif multiple and nonempty_parts:
         label_parts = [
             label_from_token(part, valid_labels) for part in nonempty_parts
@@ -125,20 +269,21 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
             return ordered_unique(label_parts)
     elif not multiple and nonempty_parts:
         # A multi-token sequence made entirely of labels cannot represent a
-        # single answer, even if an option's literal text happens to resemble
-        # the same compact sequence.
+        # single answer unless every token repeats the same legal label.
         label_parts = [
             label_from_token(part, valid_labels) for part in nonempty_parts
         ]
         if all(label_parts):
-            return ""
+            return label_parts[0] if len(set(label_parts)) == 1 else ""
 
     # Prefer complete normalized text before splitting ordinary phrases into
     # segments (for example, an option whose text is "New York").
-    if not is_collection:
-        whole_matches = text_candidates(raw_text)
-        if len(whole_matches) == 1:
-            return whole_matches[0]
+    if not strict_labels_only and not is_collection:
+        natural_labels = _natural_choice_labels(
+            raw_text, valid_labels, multiple=multiple
+        )
+        if natural_labels:
+            return ordered_unique(natural_labels)
 
     # Compact multi-choice labels are accepted only when the unseparated
     # answer has exactly one segmentation under the current option labels.
@@ -186,13 +331,38 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
         return ""
 
     matched = []
+    matched_texts = set()
     for part in nonempty_parts:
         label = label_from_token(part, valid_labels)
-        candidates = [label] if label else text_candidates(part)
+        if label:
+            candidates = [label]
+        else:
+            part_matches = (
+                [] if strict_labels_only else text_candidates(part)
+            )
+            if len(part_matches) > 1:
+                return ""
+            natural_labels = (
+                _natural_choice_labels(part, valid_labels, multiple=False)
+                if not strict_labels_only and not part_matches
+                else []
+            )
+            candidates = (
+                part_matches
+                if part_matches
+                else natural_labels
+                if natural_labels
+                else []
+            )
         # Every non-empty segment must identify exactly one option.  This
         # prevents a useful-looking partial result from hiding bad data.
         if len(candidates) != 1:
             return ""
+        if not label:
+            normalized = normalize_choice_text(part)
+            if normalized in matched_texts:
+                return ""
+            matched_texts.add(normalized)
         matched.append(candidates[0])
 
     if not multiple and len(matched) != 1:
@@ -351,7 +521,7 @@ class Chaoxing:
                 timeout=8,
             )
         except RequestException as exc:
-            logger.debug("Cookie validation request failed: {}", exc)
+            logger.debug("Cookie validation request failed (exception omitted)")
             return False
 
         if resp.status_code != 200:
@@ -576,8 +746,8 @@ class Chaoxing:
         )
         try:
             resp = session.get(info_url, timeout=8, headers=headers)
-        except RequestException as exc:
-            logger.debug("刷新视频状态失败: {}", exc)
+        except RequestException:
+            logger.debug("刷新视频状态失败（异常内容已省略）")
             return None
 
         if resp.status_code != 200:
@@ -586,8 +756,8 @@ class Chaoxing:
 
         try:
             data = resp.json()
-        except ValueError as exc:
-            logger.debug("解析视频状态响应失败: {}", exc)
+        except ValueError:
+            logger.debug("解析视频状态响应失败（响应内容已省略）")
             return None
 
         if data.get("status") == "success":
@@ -628,7 +798,7 @@ class Chaoxing:
         _video_info = _session.get(_info_url, headers=headers).json()
 
         if _video_info["status"] != "success":
-            logger.error(f"Unknown status: {_video_info['status']}")
+            logger.error("视频状态异常（服务端状态已省略）")
             return StudyResult.ERROR
 
         _dtoken = _video_info["dtoken"]
@@ -645,7 +815,11 @@ class Chaoxing:
         last_iter = time.time()
         wait_time = int(random.uniform(30, 90))
 
-        logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
+        logger.info(
+            "开始视频任务（时长={}s，已进行={}s；任务标题已省略）",
+            duration,
+            play_time,
+        )
 
         # 首次上报进度
         if callable(progress_callback):
@@ -653,10 +827,10 @@ class Chaoxing:
                 progress_callback(_course, _job, float(play_time), float(duration))
             except StudyCancelled:
                 raise
-            except Exception as exc:
-                logger.debug(f"视频进度回调执行失败(初始): {exc}")
+            except Exception:
+                logger.debug("视频进度回调执行失败(初始，异常内容已省略)")
 
-        pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
+        pbar = tqdm(total=duration, initial=play_time, desc="视频任务",
                     unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
 
         forbidden_retry = 0
@@ -668,7 +842,7 @@ class Chaoxing:
         _raise_if_cancelled(cancel_event)
 
         if passed:
-            logger.info("任务瞬间完成: {}", _job['name'])
+            logger.info("视频任务瞬间完成（任务标题已省略）")
             return StudyResult.SUCCESS
 
         while not passed:
@@ -696,7 +870,11 @@ class Chaoxing:
                         _duration = refreshed_meta.get("duration", duration)
                         play_time = refreshed_meta.get("playTime", play_time)
 
-                        logger.debug("Refreshed video metadata, duration={}, play time={}", _duration, play_time)
+                        logger.debug(
+                            "视频元数据已刷新（时长={}，进度={}；令牌已省略）",
+                            _duration,
+                            play_time,
+                        )
                         continue
 
                 elif not passed and state != 200:
@@ -721,12 +899,12 @@ class Chaoxing:
                     progress_callback(_course, _job, float(play_time), float(duration))
                 except StudyCancelled:
                     raise
-                except Exception as exc:
-                    logger.debug(f"视频进度回调执行失败: {exc}")
+                except Exception:
+                    logger.debug("视频进度回调执行失败（异常内容已省略）")
 
             _wait_or_cancel(cancel_event, gc.THRESHOLD)
 
-        logger.info("任务完成: {}", _job['name'])
+        logger.info("视频任务完成（任务标题已省略）")
         return StudyResult.SUCCESS
 
     def study_document(self, _course, _job) -> StudyResult:
@@ -773,7 +951,7 @@ class Chaoxing:
 
             if q_type == "judgement":
                 answer = "true" if random.choice([True, False]) else "false"
-                logger.info(f"随机选择 -> {answer}")
+                logger.info("判断题未匹配答案，使用随机策略（答案内容已省略）")
                 return answer
             if q_type == "completion":
                 # There is no meaningful random fill-in text.  An empty value
@@ -815,7 +993,10 @@ class Chaoxing:
             else:
                 return ""
 
-            logger.info(f"随机选择 -> {answer}")
+            logger.info(
+                "选择题未匹配答案，使用随机策略（题型={}，答案内容已省略）",
+                q_type,
+            )
             return answer
 
         def multi_cut(answer: str):
@@ -957,12 +1138,173 @@ class Chaoxing:
         total_questions = len(questions["questions"])
         found_answers = 0
         has_partial_completion = False
+        has_uncovered_answers = False
         cancel_event = self.kwargs.get("cancel_event")
+
+        def _mark_uncovered(q, reason_code: str) -> None:
+            nonlocal has_uncovered_answers
+            has_uncovered_answers = True
+            logger.warning(
+                "题目答案未覆盖（题目ID={}，题型={}，原因码={}）",
+                q.get("id", ""),
+                q.get("type", "unknown"),
+                reason_code,
+            )
+
+        def _update_choice_cache(
+            q, answer: Optional[str], *, expected=_CACHE_EXPECTED_UNSET
+        ) -> None:
+            """Keep only canonical labels for AI/SiliconFlow choices."""
+
+            if not isinstance(self.tiku, (AI, SiliconFlow)):
+                return
+            cache = getattr(self.tiku, "_cache", None)
+            question = q.get("title")
+            if cache is None or not question:
+                return
+            try:
+                if answer is None:
+                    remove = getattr(cache, "remove_cache", None)
+                    if callable(remove):
+                        if expected is _CACHE_EXPECTED_UNSET:
+                            remove(question)
+                        else:
+                            try:
+                                remove(question, expected=expected)
+                            except TypeError:
+                                # Keep compatibility with older in-memory
+                                # doubles while retaining a best-effort
+                                # compare before their unconditional removal.
+                                current = getattr(cache, "get_cache", lambda _q: None)(
+                                    question
+                                )
+                                if current == expected:
+                                    remove(question)
+                        return
+                    replace = getattr(cache, "replace_cache", None)
+                    if callable(replace):
+                        if expected is _CACHE_EXPECTED_UNSET:
+                            replace(question, None)
+                        else:
+                            current = getattr(cache, "get_cache", lambda _q: None)(
+                                question
+                            )
+                            if current == expected:
+                                replace(question, None)
+                        return
+                    # Legacy test doubles/custom DAOs may only expose add_cache;
+                    # an empty value is treated as a miss by Tiku.query.
+                    add = getattr(cache, "add_cache", None)
+                    if callable(add):
+                        add(question, "")
+                    return
+
+                replace = getattr(cache, "replace_cache", None)
+                if callable(replace):
+                    replace(question, answer)
+                    return
+                add = getattr(cache, "add_cache", None)
+                if callable(add):
+                    add(question, answer)
+            except Exception:
+                # Cache maintenance must not turn a safe uncovered answer into
+                # a failed work submission.
+                logger.warning("选择题缓存更新失败（缓存内容已省略）")
+
+        def _choice_cache_value(q, result):
+            """Return the exact cached value only when it is this result.
+
+            A provider result can outlive a concurrent canonical cache write.
+            Capturing a matching value before repair lets cleanup use
+            compare-and-delete and leaves a newer canonical value untouched.
+            """
+
+            if not isinstance(self.tiku, (AI, SiliconFlow)):
+                return _CACHE_EXPECTED_UNSET
+            cache = getattr(self.tiku, "_cache", None)
+            question = q.get("title")
+            getter = getattr(cache, "get_cache", None)
+            if not cache or not question or not callable(getter):
+                return _CACHE_EXPECTED_UNSET
+            try:
+                cached = getter(question)
+            except Exception:
+                return _CACHE_EXPECTED_UNSET
+            if cached is None or result is None:
+                return _CACHE_EXPECTED_UNSET
+            try:
+                if str(cached).strip() == str(result).strip():
+                    return cached
+            except Exception:
+                pass
+            return _CACHE_EXPECTED_UNSET
+
+        def _resolve_provider_choice(q, result) -> tuple[str, str]:
+            """Resolve a provider answer, allowing one AI format repair."""
+
+            multiple = q.get("type") == "multiple"
+            cached_bad = _choice_cache_value(q, result)
+            answer = _resolve_choice_answer(
+                result, q.get("options", ""), multiple=multiple
+            )
+            if answer:
+                _update_choice_cache(q, answer)
+                return answer, ""
+
+            # Remove only the raw/legacy value actually observed for this
+            # result.  A concurrent canonical write must survive this cleanup.
+            if cached_bad is not _CACHE_EXPECTED_UNSET:
+                _update_choice_cache(q, None, expected=cached_bad)
+
+            # A missing answer means the provider did not return content; do
+            # not turn that absence into another network request.  Only an
+            # AI/OpenAI-compatible provider that explicitly exposes the
+            # repair capability may receive the one strict retry.
+            if not result or not isinstance(self.tiku, (AI, SiliconFlow)):
+                return "", "provider_answer_empty" if not result else "choice_unmapped"
+
+            repair = getattr(self.tiku, "repair_choice_answer", None)
+            if not callable(repair):
+                return "", "choice_unmapped"
+
+            _raise_if_cancelled(cancel_event)
+            try:
+                repaired = repair(q, result)
+            except StudyCancelled:
+                raise
+            except Exception:
+                logger.warning(
+                    "选择题答案修复失败（题目ID={}，题型={}，原因码=repair_provider_error）",
+                    q.get("id", ""),
+                    q.get("type", "unknown"),
+                )
+                return "", "choice_repair_error"
+            _raise_if_cancelled(cancel_event)
+
+            answer = _resolve_choice_answer(
+                repaired,
+                q.get("options", ""),
+                multiple=multiple,
+                strict_labels_only=True,
+            )
+            if answer:
+                _update_choice_cache(q, answer)
+                return answer, ""
+            if cached_bad is not _CACHE_EXPECTED_UNSET:
+                _update_choice_cache(q, None, expected=cached_bad)
+            return "", (
+                "choice_repair_empty"
+                if not repaired
+                else "choice_repair_unmapped"
+            )
 
         def _handle_question(q, inc_found):
             nonlocal found_answers, has_partial_completion
             _raise_if_cancelled(cancel_event)
-            logger.debug(f"当前题目信息 -> {q}")
+            logger.debug(
+                "开始处理题目（题型={}，题目内容与选项已省略）",
+                q.get("type", "unknown"),
+            )
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay", 0)
             if query_delay:
@@ -972,17 +1314,25 @@ class Chaoxing:
             answer = ""
             parts = []
             if not res:
-                # 随机答题
-                answer = random_answer(q["options"], q["type"])
-                q[f'answerSource{q["id"]}'] = "random"
+                answer = ""
+                q[f'answerSource{q["id"]}'] = "uncovered"
+                _mark_uncovered(q, "provider_answer_empty")
             else:
                 # 根据响应结果选择答案
-                if q["type"] == "multiple":
-                    answer = _resolve_choice_answer(res, q["options"], multiple=True)
-                elif q["type"] == "single":
-                    answer = _resolve_choice_answer(res, q["options"], multiple=False)
+                if q["type"] in {"multiple", "single"}:
+                    answer, mapping_reason = _resolve_provider_choice(q, res)
+                    if not answer:
+                        q[f'answerSource{q["id"]}'] = "uncovered"
+                        _mark_uncovered(q, mapping_reason or "choice_unmapped")
                 elif q["type"] == "judgement":
-                    answer = "true" if self.tiku.judgement_select(res) else "false"
+                    selected = self.tiku.judgement_select(res)
+                    answer = (
+                        "true"
+                        if selected is True
+                        else "false"
+                        if selected is False
+                        else ""
+                    )
                 elif q["type"] == "completion":
                     # Keep blank positions: indexed Chaoxing fields are
                     # positional, and ``splitlines`` would discard a tail
@@ -1023,9 +1373,10 @@ class Chaoxing:
                 has_answer = any(str(part).strip() for part in parts)
 
             if not has_answer:  # 检查 answer 是否为空
-                logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
-                q[f'answerSource{q["id"]}'] = "random"
+                q[f'answerSource{q["id"]}'] = "uncovered"
+                if q["type"] not in {"single", "multiple"}:
+                    _mark_uncovered(q, "provider_answer_empty")
+                answer = ""
                 if q["type"] == "completion":
                     # Even an all-empty completion is an incomplete answer;
                     # save its cleared positional fields rather than submit.
@@ -1086,7 +1437,10 @@ class Chaoxing:
                     else:
                         has_partial_completion = True
                 else:
-                    logger.info(f"成功获取到答案：{answer}")
+                    logger.info(
+                        "题库答案处理完成（题型={}，答案内容已省略）",
+                        q.get("type", "unknown"),
+                    )
                     q[f'answerSource{q["id"]}'] = "cover"
                     inc_found()
 
@@ -1115,7 +1469,10 @@ class Chaoxing:
             else:
                 answer_key = f'answer{q["id"]}'
                 q["answerField"][answer_key] = answer
-            logger.info(f'{q["title"]} 填写答案为 {answer}')
+            logger.info(
+                "答题字段已填写（题型={}，题干与答案内容已省略）",
+                q.get("type", "unknown"),
+            )
 
         # 若使用 AI 题库，则在同一张卷内并发搜题，避免单题串行阻塞
         if isinstance(self.tiku, AI):
@@ -1203,10 +1560,9 @@ class Chaoxing:
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
 
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
-        if has_partial_completion:
+        if has_uncovered_answers or has_partial_completion:
             # A partial completion answer must be saved so known positions are
-            # not discarded, even when rollback or coverage would otherwise
-            # select direct submission.
+            # not discarded, and an uncovered answer must never be submitted.
             questions["pyFlag"] = "1"
         elif self.tiku.get_submit_params() == "1":
             questions["pyFlag"] = "1"
@@ -1219,8 +1575,8 @@ class Chaoxing:
         def _fill_answers_into_form(is_save: bool):
             """将每道题的 answerField 写回提交表单。
 
-            - is_save=True: 仅在 answerSource 为 cover 时写入答案（随机答案留空）。
-            - is_save=False: 所有 answer* 字段直接写入（提交时保留随机答案）。
+            - is_save=True: 仅在 answerSource 为 cover 时写入答案；未覆盖题留空。
+            - is_save=False: 所有 answer* 字段直接写入。
             """
             for q in questions["questions"]:
                 src = q.get(f'answerSource{q["id"]}', "")
@@ -1281,20 +1637,31 @@ class Chaoxing:
         if res.status_code == 200:
             res_json = res.json()
             if res_json["status"]:
-                logger.info(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题成功 -> {res_json["msg"]}')
+                logger.info(
+                    "{}答题成功（服务端消息已省略）",
+                    "提交" if questions["pyFlag"] == "" else "保存",
+                )
             else:
                 msg = str(res_json.get("msg", ""))
                 # 作业已过期：直接视为跳过本作业，不再重试
                 if "已过期" in msg:
                     logger.warning(
-                        f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败(作业已过期，将跳过本作业) -> {msg}'
+                        "{}答题失败（作业已过期，将跳过本作业；服务端消息已省略）",
+                        "提交" if questions["pyFlag"] == "" else "保存",
                     )
                     return StudyResult.SUCCESS
 
-                logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {msg}')
+                logger.error(
+                    "{}答题失败（服务端消息已省略）",
+                    "提交" if questions["pyFlag"] == "" else "保存",
+                )
                 return StudyResult.ERROR
         else:
-            logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> HTTP {res.status_code}')
+            logger.error(
+                "{}答题失败（HTTP status={}）",
+                "提交" if questions["pyFlag"] == "" else "保存",
+                res.status_code,
+            )
             return StudyResult.ERROR
         return StudyResult.SUCCESS
 
@@ -1314,11 +1681,11 @@ class Chaoxing:
             },
         )
         if _resp.status_code != 200:
-            logger.error(f"阅读任务学习失败 -> HTTP {_resp.status_code}")
+            logger.error("阅读任务学习失败（HTTP status={}）", _resp.status_code)
             return StudyResult.ERROR
         else:
             _resp_json = _resp.json()
-            logger.info(f"阅读任务学习 -> {_resp_json['msg']}")
+            logger.info("阅读任务学习完成（服务端消息已省略）")
             return StudyResult.SUCCESS
 
     def study_emptypage(self, _course, point):
@@ -1338,8 +1705,11 @@ class Chaoxing:
             },
         )
         if _resp.status_code != 200:
-            logger.error(f"空页面任务失败 -> [{_resp.status_code}]{point['title']}")
+            logger.error(
+                "空页面任务失败（HTTP status={}；章节标题已省略）",
+                _resp.status_code,
+            )
             return StudyResult.ERROR
         else:
-            logger.info(f"空页面任务完成 -> {point['title']}")
+            logger.info("空页面任务完成（章节标题已省略）")
             return StudyResult.SUCCESS

@@ -226,7 +226,7 @@ def test_all_empty_completion_saves_and_clears_actual_fields(monkeypatch):
     )
 
     assert outcome is StudyResult.SUCCESS
-    assert question["answerSourceq1"] == "random"
+    assert question["answerSourceq1"] == "uncovered"
     assert posts[0]["pyFlag"] == "1"
     assert posts[0]["answerq11"] == ""
     assert posts[0]["answerq12"] == ""

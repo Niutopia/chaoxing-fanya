@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import api.base as base
-from api.answer import AI, SiliconFlow
+from api.answer import AI, SiliconFlow, Tiku
 from api.base import Account, Chaoxing, StudyResult, _resolve_choice_answer
 from api.option_parser import option_entries
 
@@ -113,7 +113,7 @@ def _silicon_prompt_messages(question, answer="A"):
     return session.payload["messages"]
 
 
-def test_none_answer_uses_type_aware_random_fallback(monkeypatch):
+def test_none_choice_answer_is_saved_uncovered_without_random_fallback(monkeypatch):
     posted = _run_work(
         monkeypatch,
         {
@@ -126,7 +126,97 @@ def test_none_answer_uses_type_aware_random_fallback(monkeypatch):
         None,
     )
 
-    assert posted["answerq1"] in {"A", "B"}
+    assert posted["answerq1"] == ""
+    assert posted["pyFlag"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("question_type", "options"),
+    [("single", "A. first\nB. second"), ("multiple", "A. first\nB. second"), ("judgement", "")],
+)
+def test_empty_choice_or_judgement_is_uncovered_without_random_fallback(
+    monkeypatch, question_type, options
+):
+    monkeypatch.setattr(
+        base.random,
+        "choice",
+        lambda *_args, **_kwargs: pytest.fail("empty answer must not be randomized"),
+    )
+    posted = _run_work(
+        monkeypatch,
+        {
+            "id": "q1",
+            "title": "empty answer",
+            "options": options,
+            "type": question_type,
+            "answerField": {"answerq1": "old", "answertypeq1": "0"},
+        },
+        "",
+    )
+
+    assert posted["answerq1"] == ""
+    assert posted["pyFlag"] == "1"
+
+
+def test_empty_direct_judgement_selection_is_not_randomized(monkeypatch):
+    provider = Tiku()
+    provider.true_list = ["true"]
+    provider.false_list = ["false"]
+    monkeypatch.setattr(
+        base.random,
+        "choice",
+        lambda *_args, **_kwargs: pytest.fail("empty answer must not be randomized"),
+    )
+
+    assert provider.judgement_select("") is None
+
+
+def test_mixed_covered_and_uncovered_answers_force_save_and_preserve_coverage(
+    monkeypatch,
+):
+    covered_question = {
+        "id": "q1",
+        "title": "covered",
+        "options": "A. first\nB. second",
+        "type": "single",
+        "answerField": {"answerq1": "", "answertypeq1": "0"},
+    }
+    uncovered_question = {
+        "id": "q2",
+        "title": "uncovered",
+        "options": "A. first\nB. second",
+        "type": "single",
+        "answerField": {"answerq2": "old", "answertypeq2": "0"},
+    }
+    questions = {
+        "questions": [covered_question, uncovered_question],
+        "answerwqbid": "q1,q2,",
+    }
+    monkeypatch.setattr(base, "decode_questions_info", lambda *_a, **_k: questions)
+
+    class _MixedTiku(_AnswerTiku):
+        def query(self, question):
+            return "B" if question["id"] == "q1" else None
+
+    session = _WorkSession()
+    tiku = _MixedTiku(None)
+    tiku.COVER_RATE = 0.0
+    engine = Chaoxing(
+        Account("test-user", "test-password"), tiku=tiku, session=session
+    )
+
+    outcome = engine.study_work(
+        {"courseId": "course", "clazzId": "clazz"},
+        {"jobid": "work-1", "enc": "enc"},
+        {"knowledgeid": "knowledge", "ktoken": "token", "cpi": "cpi"},
+    )
+
+    assert outcome is StudyResult.SUCCESS
+    assert covered_question["answerSourceq1"] == "cover"
+    assert uncovered_question["answerSourceq2"] == "uncovered"
+    assert session.posts[0]["pyFlag"] == "1"
+    assert session.posts[0]["answerq1"] == "B"
+    assert session.posts[0]["answerq2"] == ""
 
 
 @pytest.mark.parametrize(
@@ -187,7 +277,7 @@ def test_all_empty_completion_is_saved_as_uncovered(monkeypatch):
 
     posted = _run_work(monkeypatch, question, ["", ""], cover_rate=0.5)
 
-    assert question["answerSourceq1"] == "random"
+    assert question["answerSourceq1"] == "uncovered"
     assert posted["pyFlag"] == "1"
     assert posted["answerq1"] == ""
     assert posted["answerq1_0"] == ""
