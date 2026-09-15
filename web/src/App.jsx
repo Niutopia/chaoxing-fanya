@@ -65,7 +65,12 @@ function NewAccountPage({ onSaved }) {
   const navigate = useNavigate()
 
   const handleOpenChange = (open) => {
-    if (!open) navigate('/')
+    if (!open) {
+      // The empty overview normally redirects first-time visitors here. Mark
+      // an intentional dismissal so navigating back does not immediately
+      // reopen the same controlled dialog.
+      navigate('/', { replace: true, state: { accountDialogDismissed: true } })
+    }
   }
 
   const handleSaved = (saved, meta) => {
@@ -120,7 +125,11 @@ function RouteTree({
         <Route
           index
           element={(
-            !loading && !error && !hasAccounts && location.pathname === '/'
+            !loading
+              && !error
+              && !hasAccounts
+              && location.pathname === '/'
+              && !location.state?.accountDialogDismissed
               ? <Navigate to="/accounts/new" replace />
               : <OverviewPage
                 accounts={accounts}
