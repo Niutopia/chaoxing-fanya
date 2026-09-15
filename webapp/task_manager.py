@@ -11,6 +11,7 @@ public snapshot, details object, or log entry.
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 import uuid
@@ -202,8 +203,14 @@ def _config_secret_values(config: Any) -> list[str]:
                         iterator = iter(value.items())
                     except BaseException:
                         return
-                    for index, pair in enumerate(iterator):
-                        if index >= MAX_CONFIG_LIST_LENGTH or nodes >= MAX_CONFIG_NODES:
+                    for pair in iterator:
+                        # Mapping entries are bounded by the shared node
+                        # budget, not the list-item limit.  The latter is a
+                        # JSON-list constraint; applying it to provider
+                        # mappings silently skipped credentials after the
+                        # 256th key even when the complete config was within
+                        # MAX_CONFIG_NODES.
+                        if nodes >= MAX_CONFIG_NODES:
                             break
                         try:
                             key, item = pair
@@ -308,11 +315,15 @@ def _timestamp(value: Any = None) -> float:
     if value is None:
         return time.time()
     if isinstance(value, datetime):
-        return value.timestamp()
+        try:
+            value = value.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return time.time()
     try:
-        return float(value)
+        timestamp = float(value)
     except (TypeError, ValueError, OverflowError):
         return time.time()
+    return timestamp if math.isfinite(timestamp) else time.time()
 
 
 def _optional_timestamp(value: Any) -> float | None:
@@ -321,11 +332,15 @@ def _optional_timestamp(value: Any) -> float | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.timestamp()
+        try:
+            value = value.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
-        return float(value)
+        timestamp = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
+    return timestamp if math.isfinite(timestamp) else None
 
 
 @dataclass(frozen=True, repr=False)
@@ -559,6 +574,20 @@ class TaskManager:
         return dict(sanitized) if isinstance(sanitized, Mapping) else {}
 
     @classmethod
+    def _safe_snapshot_mapping_with_dirty(
+        cls, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Sanitize a restored mapping and conservatively track rewrites."""
+
+        sanitized = cls._safe_snapshot_mapping(value)
+        if not isinstance(value, Mapping):
+            return sanitized, True
+        try:
+            return sanitized, sanitized != value
+        except BaseException:
+            return sanitized, True
+
+    @classmethod
     def _safe_details_mapping(cls, value: Any) -> dict[str, Any]:
         sanitized = cls._safe_snapshot_value(value)
         return dict(sanitized) if isinstance(sanitized, Mapping) else {}
@@ -657,43 +686,65 @@ class TaskManager:
         dropping unrelated safe history.
         """
 
-        if not isinstance(value, (list, tuple)):
+        if isinstance(value, (list, tuple)):
+            # Persistence adapters are untrusted.  The durable loader emits
+            # logs in ascending sequence order, so selecting the tail before
+            # iterating both retains the newest capacity and bounds work for
+            # an arbitrarily large legacy list.  Slicing also bypasses a
+            # hostile list subclass's unbounded iterator in the normal path.
+            try:
+                value = value[-self.log_capacity :]
+            except BaseException:
+                value = []
+        else:
+            # Do not consume arbitrary generators/mappings supplied by a
+            # custom adapter.  They have no reliable notion of "latest" and
+            # may be infinite or raise during iteration; treating them as an
+            # empty history is the safe bounded fallback.
             value = []
         by_sequence: dict[int, TaskLogEntry] = {}
         dirty = False
-        for raw_entry in value:
-            if not isinstance(raw_entry, Mapping):
-                continue
-            try:
-                sequence = int(raw_entry.get("sequence"))
-            except BaseException:
-                continue
-            if sequence < 1:
-                continue
-            try:
-                timestamp = _optional_timestamp(raw_entry.get("timestamp"))
-                if timestamp is None:
-                    timestamp = time.time()
-                level = raw_entry.get("level", "info")
-                message = raw_entry.get("message", "")
-                cleaned_message = sanitize_log_message(
-                    message,
-                    historical=True,
+        try:
+            iterator = iter(value)
+            for raw_entry in iterator:
+                if not isinstance(raw_entry, Mapping):
+                    continue
+                try:
+                    sequence = int(raw_entry.get("sequence"))
+                except BaseException:
+                    continue
+                if sequence < 1:
+                    continue
+                try:
+                    timestamp = _optional_timestamp(raw_entry.get("timestamp"))
+                    if timestamp is None:
+                        timestamp = time.time()
+                    level = raw_entry.get("level", "info")
+                    message = raw_entry.get("message", "")
+                    cleaned_message = sanitize_log_message(
+                        message,
+                        historical=True,
+                    )
+                    # Compare sanitized forms rather than calling ``str`` on
+                    # a dict-like/arbitrary old value: a hostile ``__str__``
+                    # must not abort startup or enter a persistence/API
+                    # response.
+                    current_message = sanitize_log_message(message)
+                    if cleaned_message != current_message:
+                        dirty = True
+                except BaseException:
+                    continue
+                by_sequence[sequence] = TaskLogEntry(
+                    sequence=sequence,
+                    level=sanitize_log_level(level),
+                    message=cleaned_message,
+                    timestamp=timestamp,
                 )
-                # Compare sanitized forms rather than calling ``str`` on a
-                # dict-like/arbitrary old value: a hostile ``__str__`` must
-                # not abort startup or enter a persistence/API response.
-                current_message = sanitize_log_message(message)
-                if cleaned_message != current_message:
-                    dirty = True
-            except BaseException:
-                continue
-            by_sequence[sequence] = TaskLogEntry(
-                sequence=sequence,
-                level=sanitize_log_level(level),
-                message=cleaned_message,
-                timestamp=timestamp,
-            )
+        except BaseException:
+            # A custom list/tuple subclass can still raise while exposing its
+            # iterator.  Keep any bounded entries already decoded and ignore
+            # the broken suffix rather than failing manager startup.
+            pass
         ordered = sorted(by_sequence.values(), key=lambda item: item.sequence)
         next_sequence = max(by_sequence, default=0)
         if len(ordered) > self.log_capacity:
@@ -727,7 +778,10 @@ class TaskManager:
         # reading any nested public field so a custom adapter (or a legacy
         # SQLite row) cannot reintroduce credentials, cycles, or oversized
         # structures into the monitor API.
-        raw_snapshot = self._safe_snapshot_mapping(raw_snapshot)
+        raw_snapshot, record_dirty = self._safe_snapshot_mapping_with_dirty(
+            raw_snapshot
+        )
+        record_dirty = record_dirty or payload.get("_record_dirty") is True
         try:
             task_id = validate_task_id(raw_snapshot.get("id"))
         except (TypeError, ValueError):
@@ -773,7 +827,12 @@ class TaskManager:
             finished_at=finished_at,
             stats=_copy(dict(stats)),
         )
-        details = self._restore_details(payload.get("details", {}))
+        raw_details = payload.get("details", {})
+        details_mapping, details_dirty = self._safe_snapshot_mapping_with_dirty(
+            raw_details
+        )
+        record_dirty = record_dirty or details_dirty
+        details = self._restore_details(details_mapping)
         if interrupted:
             # The old worker cannot still be running after this process has
             # started, so stale active jobs would be misleading in the
@@ -821,12 +880,18 @@ class TaskManager:
                 logs=logs,
                 next_sequence=next_sequence,
                 slot_released=True,
+                record_dirty=record_dirty,
                 logs_dirty=logs_dirty,
             ),
             interrupted,
         )
 
     def _restore_persisted_tasks(self) -> None:
+        # Prune while stale rows still advertise running/stopping.  The store
+        # deliberately preserves those rows, so a small terminal quota cannot
+        # discard them before this manager has a chance to normalize each one
+        # to the restart-interrupted terminal state.
+        self._prune_persisted_history()
         try:
             loader = getattr(self.persistence, "load_web_tasks", None)
             if not callable(loader):
@@ -845,22 +910,27 @@ class TaskManager:
             self._prune_persisted_history()
             return
         with self._lock:
+            interrupted_ids: set[str] = set()
             for payload in payloads:
                 restored = self._restore_record(payload)
                 if restored is None:
                     continue
                 record, interrupted = restored
                 self._tasks[record.snapshot.id] = record
+                if interrupted:
+                    interrupted_ids.add(record.snapshot.id)
+                if record.record_dirty:
+                    self._persist_record_locked(record)
                 self._persist_dirty_logs_locked(record)
                 if interrupted:
                     if not self._persist_log_locked(record.snapshot.id, record.logs[-1]):
                         record.logs_dirty = True
                     self._persist_record_locked(record)
-            self._trim_terminal_locked()
-        # Loading is intentionally pure-read.  Any rows outside the bounded
-        # monitor history are removed in a separate best-effort operation so a
-        # restart does not leave an ever-growing SQLite log/task table.
-        self._prune_persisted_history()
+            # Every stale active row was explicitly requested by the loader;
+            # keep those normalized interruption records for this startup even
+            # when the terminal quota is one.  Future terminal transitions use
+            # the ordinary bounded history path.
+            self._trim_terminal_locked(preserve_ids=interrupted_ids)
 
     def _prune_persisted_history(self) -> bool:
         """Ask the persistence adapter to trim durable monitor history."""
@@ -904,19 +974,22 @@ class TaskManager:
 
     @staticmethod
     def _list_timestamp(record: _TaskRuntime) -> float:
-        value = record.snapshot.started_at
+        value = record.snapshot.finished_at
         if value is None:
-            value = record.snapshot.finished_at
+            value = record.snapshot.started_at
         timestamp = _optional_timestamp(value)
         if timestamp is None:
             return 0.0
         return timestamp
 
-    def _trim_terminal_locked(self) -> None:
+    def _trim_terminal_locked(
+        self, *, preserve_ids: set[str] | frozenset[str] = frozenset()
+    ) -> None:
         terminal = [
             item
             for item in self._tasks.values()
             if item.snapshot.state not in {"running", "stopping"}
+            and item.snapshot.id not in preserve_ids
         ]
         terminal.sort(
             key=lambda item: (self._history_timestamp(item), item.snapshot.id)
@@ -1389,7 +1462,73 @@ class TaskManager:
         Unknown task IDs are ignored.  This is important for the global
         Loguru sink: a late queued record from a task that has already been
         torn down must never turn logging itself into an application error.
+
+        ``_event_time`` is retained as a compatibility-shaped keyword for
+        callers that may have discovered an older private implementation, but
+        it is never trusted.  Only :meth:`_append_log_from_sink`, guarded by
+        the private capability held by ``task_logging``, can admit a queued
+        record after terminalization.
         """
+
+        if _event_time is not None:
+            return None
+        return self._append_log_internal(
+            task_id,
+            message,
+            level,
+            timestamp=timestamp,
+            event_time=None,
+            from_sink=False,
+        )
+
+    def _append_log_from_sink(
+        self,
+        task_id: str,
+        message: Any,
+        level: str = "info",
+        *,
+        timestamp: Any = None,
+        _capability: Any = None,
+    ) -> TaskLogEntry | None:
+        """Admit one genuine queued Loguru record.
+
+        This method is intentionally private and requires the identity of a
+        capability object created and retained only by ``task_logging``.  A
+        caller can pass any timestamp to the public API, but it cannot turn
+        that value into a trusted pre-terminal event marker.
+        """
+
+        from .task_logging import _TASK_LOG_SINK_CAPABILITY
+
+        if _capability is not _TASK_LOG_SINK_CAPABILITY:
+            return None
+        # ``None`` is supported only for tiny synthetic records that omit
+        # Loguru's ``time`` field; active records receive a fresh finite local
+        # timestamp, while terminal records are rejected below.  An explicit
+        # malformed value is never normalized into a trusted event time.
+        event_time = _optional_timestamp(timestamp)
+        if timestamp is not None and event_time is None:
+            return None
+        return self._append_log_internal(
+            task_id,
+            message,
+            level,
+            timestamp=event_time,
+            event_time=event_time,
+            from_sink=True,
+        )
+
+    def _append_log_internal(
+        self,
+        task_id: str,
+        message: Any,
+        level: str,
+        *,
+        timestamp: Any,
+        event_time: float | None,
+        from_sink: bool,
+    ) -> TaskLogEntry | None:
+        """Append after the caller's provenance has been established."""
 
         with self._lock:
             try:
@@ -1400,12 +1539,9 @@ class TaskManager:
             if record is None:
                 return None
             if record.snapshot.state not in {"running", "stopping"}:
-                # Only the process-wide Loguru sink may pass an event time.
-                # Public/direct appends have no trustworthy creation marker
-                # and are therefore always rejected after terminalization.
-                event_time = _optional_timestamp(_event_time)
                 if (
-                    event_time is None
+                    not from_sink
+                    or event_time is None
                     or record.terminal_cutoff is None
                     or event_time > record.terminal_cutoff
                 ):

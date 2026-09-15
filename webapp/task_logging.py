@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import weakref
 from collections.abc import Iterable
+from datetime import datetime
+import math
 from typing import TYPE_CHECKING, Any, Callable
 
 from api.logger import (
@@ -26,6 +28,20 @@ _SINK_COMPLETE_LOCK = threading.Lock()
 _SINK_ID: int | None = None
 _MANAGERS: weakref.WeakSet["TaskManager"] = weakref.WeakSet()
 _MANAGERS_SNAPSHOT: tuple["TaskManager", ...] = ()
+
+
+class _TaskLogSinkCapability:
+    """Unconstructible-by-value capability for the real Loguru sink."""
+
+    __slots__ = ()
+
+
+# Keep this object private to this module.  The manager checks object identity
+# when accepting a routed record, so an ordinary append caller cannot replay a
+# pre-terminal timestamp by guessing a keyword argument or creating a value
+# that merely compares equal to the capability.
+_TASK_LOG_SINK_CAPABILITY = _TaskLogSinkCapability()
+_INVALID_RECORD_TIME = object()
 
 
 def _refresh_manager_snapshot_locked() -> None:
@@ -76,6 +92,26 @@ def _task_record_filter(record: dict[str, Any]) -> bool:
     return True
 
 
+def _record_creation_time(record: Any) -> float | None | object:
+    """Extract a finite timestamp from Loguru's record creation field.
+
+    Real Loguru records always carry a ``datetime`` in ``time``.  Small
+    integrations/tests sometimes call ``_route_record`` with a minimal record
+    that omits it; ``None`` is retained as a compatibility fallback for a
+    currently-active task, while an explicitly malformed/non-finite value is
+    rejected before it reaches the manager.
+    """
+
+    if not isinstance(record, dict) or "time" not in record:
+        return None
+    value = record.get("time")
+    try:
+        timestamp = value.timestamp() if isinstance(value, datetime) else float(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return _INVALID_RECORD_TIME
+    return timestamp if math.isfinite(timestamp) else _INVALID_RECORD_TIME
+
+
 def _route_record(message: Any) -> None:
     record = getattr(message, "record", {})
     extra = record.get("extra", {}) if isinstance(record, dict) else {}
@@ -86,10 +122,9 @@ def _route_record(message: Any) -> None:
     text = record.get("message", "") if isinstance(record, dict) else ""
     level = record.get("level") if isinstance(record, dict) else None
     level_name = getattr(level, "name", level or "info")
-    timestamp = record.get("time") if isinstance(record, dict) else None
-    timestamp_value = (
-        timestamp.timestamp() if hasattr(timestamp, "timestamp") else timestamp
-    )
+    timestamp_value = _record_creation_time(record)
+    if timestamp_value is _INVALID_RECORD_TIME:
+        return
 
     # A task ID is globally unique, so exactly one manager should accept the
     # record.  The immutable snapshot is refreshed under ``_SINK_LOCK`` by
@@ -100,12 +135,12 @@ def _route_record(message: Any) -> None:
     managers = _MANAGERS_SNAPSHOT
     for manager in managers:
         try:
-            entry = manager.append_log(
+            entry = manager._append_log_from_sink(
                 task_id,
                 text,
                 str(level_name).lower(),
                 timestamp=timestamp_value,
-                _event_time=timestamp_value,
+                _capability=_TASK_LOG_SINK_CAPABILITY,
             )
         except Exception:
             # Logging must remain best-effort.  In particular, a manager may
