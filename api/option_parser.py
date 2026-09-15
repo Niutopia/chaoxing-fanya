@@ -6,16 +6,29 @@ import re
 from typing import NamedTuple
 
 
+_BRACKET_PAIRS = {
+    "(": ")",
+    "[": "]",
+    "【": "】",
+    "（": "）",
+}
+_CLEAR_ENUMERATORS = frozenset({".", "．", ")", "）", "、"})
+_SINGLE_ENUMERATORS = _CLEAR_ENUMERATORS | frozenset({",", "，", ":", "："})
+
+
 # A prefix is a label token followed by punctuation or whitespace.  The
 # validation below deliberately keeps the grammar stricter than this shape so
 # ordinary text such as ``cat, dog`` is never treated as a label.
 _OPTION_PREFIX_RE = re.compile(
-    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)"
-    r"(?:\s*([\.．,，、:：\)\]）】])\s*|(\s+))"
+    r"^\s*(?:(?P<opening>[\(\[【（])\s*)?"
+    r"(?P<label>[A-Za-z]+)"
+    r"(?:(?:\s*(?P<separator>[\.．,，、:：\)\]）】]))\s*|(?P<space>\s+))"
 )
 _OPTION_LABEL_RE = re.compile(
-    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)\s*"
-    r"(?:[\.．,，、:：\)\]）】]\s*)?(?:[\]\)】]\s*)?$"
+    r"^\s*(?:(?P<opening>[\(\[【（])\s*)?"
+    r"(?P<label>[A-Za-z]+)\s*"
+    r"(?:(?P<separator>[\.．,，、:：\)\]）】])\s*)?"
+    r"(?P<closing>[\]\)】）])?\s*$"
 )
 _TEXT_PUNCTUATION_RE = re.compile(
     r"[，。！？；：、,.!?;:()（）\[\]【】\"“”‘’\-_\/\\|]"
@@ -27,6 +40,9 @@ class OptionPrefix(NamedTuple):
     end: int
     valid: bool
     punctuated: bool
+    separator: str
+    bracketed: bool
+    opening: str
 
 
 class OptionEntry(NamedTuple):
@@ -73,9 +89,26 @@ def find_option_prefix(value) -> OptionPrefix | None:
     match = _OPTION_PREFIX_RE.match(text)
     if not match:
         return None
-    raw_label = match.group(1)
-    valid = len(raw_label) == 1 or raw_label.isupper()
-    return OptionPrefix(raw_label, match.end(), valid, bool(match.group(2)))
+    raw_label = match.group("label")
+    opening = match.group("opening") or ""
+    separator = match.group("separator") or ""
+    expected_closing = _BRACKET_PAIRS.get(opening)
+    bracketed = bool(expected_closing and separator == expected_closing)
+    if opening:
+        valid = bracketed and (len(raw_label) == 1 or raw_label.isupper())
+    elif len(raw_label) == 1:
+        valid = not separator or separator in _SINGLE_ENUMERATORS
+    else:
+        valid = raw_label.isupper() and separator in _CLEAR_ENUMERATORS
+    return OptionPrefix(
+        raw_label,
+        match.end(),
+        valid,
+        bool(separator),
+        separator,
+        bracketed,
+        opening,
+    )
 
 
 def _prefix_should_be_removed(prefix: OptionPrefix) -> bool:
@@ -84,7 +117,14 @@ def _prefix_should_be_removed(prefix: OptionPrefix) -> bool:
     # A lowercase two-letter Excel-looking prefix (``aa.``) is still an
     # explicit marker whose content should be retained under a generated
     # label.  Longer lowercase words (``cat, dog``) remain ordinary text.
-    return prefix.punctuated and len(prefix.raw_label) <= 2
+    return (
+        prefix.bracketed
+        or (
+            not prefix.opening
+            and prefix.separator in _CLEAR_ENUMERATORS
+            and len(prefix.raw_label) <= 2
+        )
+    )
 
 
 def strip_option_prefix(value) -> str:
@@ -161,13 +201,37 @@ def label_from_token(value, valid_labels: set[str]) -> str:
     match = _OPTION_LABEL_RE.fullmatch(raw_text)
     if not match:
         return ""
-    raw_label = match.group(1)
-    if len(raw_label) == 1:
-        label = raw_label.upper()
-    elif raw_label.isupper():
-        label = raw_label
-    else:
+    raw_label = match.group("label")
+    opening = match.group("opening") or ""
+    separator = match.group("separator") or ""
+    closing = match.group("closing") or ""
+    if closing or (opening and separator != _BRACKET_PAIRS.get(opening)):
         return ""
+
+    if len(raw_label) == 1:
+        if opening or separator:
+            if opening:
+                valid_syntax = separator == _BRACKET_PAIRS.get(opening)
+            else:
+                valid_syntax = separator in _SINGLE_ENUMERATORS
+            if not valid_syntax:
+                return ""
+        label = raw_label.upper()
+    else:
+        # A plain exact multi-letter label is the strongest signal and is
+        # accepted before considering decorated forms.  Other multi-letter
+        # forms must carry an unambiguous bracket/enumerator marker; a comma
+        # or colon after a word is ordinary text, not a label.
+        if not raw_label.isupper():
+            return ""
+        bracketed = bool(
+            opening and separator == _BRACKET_PAIRS.get(opening)
+        )
+        clear_enumerator = not opening and separator in _CLEAR_ENUMERATORS
+        exact_plain = not opening and not separator and raw_label in valid_labels
+        if not (bracketed or clear_enumerator or exact_plain):
+            return ""
+        label = raw_label
     return label if label in valid_labels else ""
 
 

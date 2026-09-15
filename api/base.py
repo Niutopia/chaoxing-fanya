@@ -108,6 +108,12 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
     # handled above by label_from_token and therefore take precedence.
     if multiple and not is_collection and re.fullmatch(r"[A-Za-z]{2,}", raw_text):
         compact = raw_text.upper()
+        # Once an option list contains an Excel-style label such as AA, a
+        # compact string like AAB has more than one valid decomposition
+        # (AA+B or A+A+B).  Require explicit separators in that situation;
+        # exact AA was already handled by label_from_token above.
+        if any(len(label) > 1 for label in valid_labels):
+            return ""
         single_labels = {label for label in valid_labels if len(label) == 1}
         if all(label in single_labels for label in compact):
             return ordered_unique(compact)

@@ -8,6 +8,7 @@ import pytest
 import api.base as base
 from api.answer import AI, SiliconFlow
 from api.base import Account, Chaoxing, StudyResult, _resolve_choice_answer
+from api.option_parser import option_entries
 
 
 class _AnswerTiku:
@@ -317,6 +318,64 @@ def test_exact_multi_letter_label_takes_precedence_over_compact_labels():
     options = "AA. alpha\nA. other"
 
     assert _resolve_choice_answer("AA", options, multiple=True) == "AA"
+
+
+def test_compact_labels_are_rejected_when_multi_letter_labels_make_them_ambiguous():
+    options = "AA. alpha\nA. other\nB. third"
+
+    # The compact spelling could mean AA+B or A+A+B.  Only exact AA and
+    # explicitly separated AA,B are unambiguous.
+    assert _resolve_choice_answer("AAB", options, multiple=True) == ""
+    assert _resolve_choice_answer("AA,B", options, multiple=True) == "AAB"
+    assert _resolve_choice_answer("AA", options, multiple=True) == "AA"
+
+
+@pytest.mark.parametrize("options", ["CAT, DOG\nB. other", "CAT: DOG\nB. other"])
+def test_uppercase_words_with_ambiguous_punctuation_stay_complete_text(options):
+    entries = option_entries(options)
+
+    assert [(entry.label, entry.text) for entry in entries] == [
+        ("A", options.splitlines()[0]),
+        ("B", "other"),
+    ]
+    assert _resolve_choice_answer(options.splitlines()[0], options, multiple=False) == "A"
+    assert _resolve_choice_answer("DOG", options, multiple=False) == ""
+    messages = AI()._build_messages(
+        {"type": "single", "title": "ordinary words", "options": options}
+    )
+    assert f"A. {options.splitlines()[0]}" in messages[1]["content"]
+
+
+def test_lowercase_multi_letter_words_with_comma_stay_complete_text():
+    options = "ab, cd\nB. other"
+    entries = option_entries(options)
+
+    assert [(entry.label, entry.text) for entry in entries] == [
+        ("A", "ab, cd"),
+        ("B", "other"),
+    ]
+    assert _resolve_choice_answer("ab, cd", options, multiple=False) == "A"
+    assert _resolve_choice_answer("cd", options, multiple=False) == ""
+    messages = AI()._build_messages(
+        {"type": "single", "title": "ordinary lowercase words", "options": options}
+    )
+    assert "A. ab, cd" in messages[1]["content"]
+
+
+@pytest.mark.parametrize("prefix", ["（A）", "（ A ）"])
+def test_fullwidth_opening_bracket_is_a_valid_option_prefix(prefix):
+    options = f"{prefix} foo\nB. bar"
+    entries = option_entries(options)
+
+    assert [(entry.label, entry.text) for entry in entries] == [
+        ("A", "foo"),
+        ("B", "bar"),
+    ]
+    assert _resolve_choice_answer("foo", options, multiple=False) == "A"
+    messages = AI()._build_messages(
+        {"type": "single", "title": "fullwidth", "options": options}
+    )
+    assert "A. foo" in messages[1]["content"]
 
 
 def test_multiple_labels_are_deduplicated_in_option_order():
