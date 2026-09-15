@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
@@ -451,7 +452,14 @@ def test_historical_migration_clears_dirty_only_after_retry_succeeds():
 
 
 def test_task_details_cycle_and_arbitrary_values_are_safe():
-    manager = TaskManager(runner=lambda _context: None)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def runner(_context):
+        entered.set()
+        release.wait(timeout=2)
+
+    manager = TaskManager(runner=runner)
     task = manager.start(
         account_id="details-account",
         course_ids=["course"],
@@ -468,14 +476,19 @@ def test_task_details_cycle_and_arbitrary_values_are_safe():
         ),
         auth=AccountAuth(username="u", password="", cookies={}),
     )
-    cycle: dict[str, object] = {}
-    cycle["self"] = cycle
-    cycle["raw"] = object()
-    manager.get_reporter(task.id).set_courses([cycle])
+    try:
+        assert entered.wait(timeout=1)
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle
+        cycle["raw"] = object()
+        manager.get_reporter(task.id).set_courses([cycle])
 
-    details = manager.get_details(task.id)
-    assert details.courses[0]["self"] == "[redacted-cycle]"
-    assert details.courses[0]["raw"] == "[redacted-object]"
+        details = manager.get_details(task.id)
+        assert details.courses[0]["self"] == "[redacted-cycle]"
+        assert details.courses[0]["raw"] == "[redacted-object]"
+    finally:
+        release.set()
+        assert manager.wait(task.id, timeout=1)
 
 
 def test_worker_error_uses_conservative_historical_boundary():

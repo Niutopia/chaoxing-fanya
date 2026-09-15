@@ -1432,6 +1432,12 @@ class TaskManager:
     def _set_current(self, task_id: str, values: Mapping[str, Any]) -> None:
         with self._lock:
             record = self._lookup(task_id)
+            # A worker callback may have passed its own lifecycle gate before
+            # the owning task became terminal.  Once cancellation or
+            # finalization wins, reporter metadata must not reopen the public
+            # snapshot or durable record.
+            if record.snapshot.state != "running":
+                return
             if not values:
                 return
             secrets = self._secrets_for(record)
@@ -1471,6 +1477,8 @@ class TaskManager:
     def _set_counts(self, task_id: str, values: Mapping[str, Any]) -> None:
         with self._lock:
             record = self._lookup(task_id)
+            if record.snapshot.state != "running":
+                return
             secrets = self._secrets_for(record)
             copied = _redact(dict(values), secrets)
             if not isinstance(copied, dict):
@@ -1490,6 +1498,8 @@ class TaskManager:
     def _set_courses(self, task_id: str, courses: Any) -> None:
         with self._lock:
             record = self._lookup(task_id)
+            if record.snapshot.state != "running":
+                return
             value = [] if courses is None else courses
             copied = _redact(value, self._secrets_for(record))
             if not isinstance(copied, list):
@@ -1500,6 +1510,8 @@ class TaskManager:
     def _set_active_jobs(self, task_id: str, active_jobs: Any) -> None:
         with self._lock:
             record = self._lookup(task_id)
+            if record.snapshot.state != "running":
+                return
             value = {} if active_jobs is None else active_jobs
             copied = _redact(value, self._secrets_for(record))
             if not isinstance(copied, dict):
