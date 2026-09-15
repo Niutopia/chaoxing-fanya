@@ -83,6 +83,117 @@ MIXED_OPTION_FORM = """
 """
 
 
+MULTI_UL_LEGACY_PRIORITY_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-multi-ul">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic multi-ul title</div>
+      <ul class="legacy-options">
+        <li>A. legacy alpha</li>
+        <li>B. legacy beta</li>
+      </ul>
+      <ul class="Zy_ulTk">
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">new alpha</div>
+        </div>
+        <div class="clearfix">
+          <span class="num_option">B</span>
+          <div class="answer_p">new beta</div>
+        </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
+ORDINARY_LAYOUT_UL_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-layout-ul">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic layout title</div>
+      <ul class="layout-options">
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">layout text</div>
+        </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
+DUPLICATE_NEW_BLOCKS_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-duplicates">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic duplicate title</div>
+      <ul class="Zy_ulTk">
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">same alpha</div>
+        </div>
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">same alpha</div>
+        </div>
+        <div class="clearfix">
+          <span class="num_option">B</span>
+          <div class="answer_p">same beta</div>
+        </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
+CONFLICTING_DUPLICATE_NEW_BLOCKS_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-conflicting-duplicates">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic conflicting duplicate title</div>
+      <ul class="Zy_ulTk">
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">first alpha</div>
+        </div>
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">different alpha</div>
+        </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
+NESTED_DECORATIVE_BLOCK_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-nested-decoration">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic nested decoration title</div>
+      <ul class="Zy_ulTk">
+        <div class="clearfix">
+          <span class="num_option">A</span>
+          <div class="answer_p">direct alpha</div>
+        </div>
+        <div class="clearfix layout-wrapper">
+          <div class="layout-child">
+            <span class="num_option">B</span>
+            <div class="answer_p">nested beta</div>
+          </div>
+        </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
 DECORATED_OPTION_FORM = """
 <form id="synthetic-work">
   <div class="singleQuesId" data="q-decorated">
@@ -107,8 +218,25 @@ DECORATED_OPTION_FORM = """
           <span class="num_option" data="B">B</span>
           <div class="answer_p">beta</div>
         </div>
+      </ul>
+    </div>
+  </div>
+</form>
+"""
+
+
+MIXED_TEXT_AND_IMAGE_OPTION_FORM = """
+<form id="synthetic-work">
+  <div class="singleQuesId" data="q-text-image">
+    <div class="TiMu" data="0">
+      <div class="Zy_TItle">Synthetic text and image title</div>
+      <ul class="Zy_ulTk">
         <div class="clearfix">
-          <span class="num_option" data="C">C</span>
+          <span class="num_option">A</span>
+          <div class="answer_p">text alpha</div>
+        </div>
+        <div class="clearfix">
+          <span class="num_option">B</span>
           <div class="answer_p"><img src="only-image.png"></div>
         </div>
       </ul>
@@ -155,10 +283,52 @@ def test_decode_mixed_li_and_new_blocks_uses_li_path_without_duplicates():
     ]
 
 
+def test_decode_first_legacy_ul_wins_over_later_zy_ultk():
+    question = _decoded_question(MULTI_UL_LEGACY_PRIORITY_FORM)
+
+    assert question["options"].splitlines() == [
+        "A. legacy alpha",
+        "B. legacy beta",
+    ]
+
+
+def test_decode_does_not_parse_an_ordinary_layout_ul_as_choices():
+    question = _decoded_question(ORDINARY_LAYOUT_UL_FORM)
+
+    assert question["options"] == ""
+
+
+def test_decode_deduplicates_identical_alternate_choice_blocks():
+    question = _decoded_question(DUPLICATE_NEW_BLOCKS_FORM)
+
+    assert question["options"].splitlines() == [
+        "A. same alpha",
+        "B. same beta",
+    ]
+
+
+def test_decode_rejects_alternate_duplicate_label_with_different_text():
+    question = _decoded_question(CONFLICTING_DUPLICATE_NEW_BLOCKS_FORM)
+
+    assert question["options"] == ""
+
+
+def test_decode_ignores_nested_decorative_choice_pairs():
+    question = _decoded_question(NESTED_DECORATIVE_BLOCK_FORM)
+
+    assert question["options"] == "A. direct alpha"
+
+
 def test_decode_new_blocks_require_valid_label_and_text_pair():
     question = _decoded_question(DECORATED_OPTION_FORM)
 
     assert question["options"].splitlines() == ["A. alpha", "B. beta"]
+
+
+def test_decode_rejects_mixed_text_and_image_only_alternate_choices():
+    question = _decoded_question(MIXED_TEXT_AND_IMAGE_OPTION_FORM)
+
+    assert question["options"] == ""
 
 
 class _CountingTiku:

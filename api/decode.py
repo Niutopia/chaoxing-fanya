@@ -861,27 +861,28 @@ def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, 
     
     # 提取题目内容和选项
     title_div = div_tag.find("div", class_="Zy_TItle")
-    options_container = div_tag.find("ul", class_="Zy_ulTk") or div_tag.find("ul")
-    options_list = options_container.find_all("li") if options_container else []
+    # The first ul is the legacy source of truth.  Do not let a later
+    # alternate-format ul shadow its li options.
+    legacy_container = div_tag.find("ul")
+    options_list = legacy_container.find_all("li") if legacy_container else []
 
     # 解析题目和选项
     q_title = _extract_title(title_div, font_decoder, session=session)
-    q_options = []
+    q_options: List[str] = []
     if options_list:
         # Keep the legacy ``ul > li`` path unchanged when any li exists.
         for li in options_list:
             q_options.append(_extract_choices(li, font_decoder))
-    elif options_container:
-        # Newer pages place each choice in a ``div.clearfix`` pair instead
-        # of an li.  Only complete label/text pairs are choices.
-        for choice_block in options_container.find_all(
-            "div", class_="clearfix", recursive=False
-        ):
-            choice = _extract_choice_block(choice_block, font_decoder)
-            if choice:
-                q_options.append(choice)
-    # 排序选项
-    q_options.sort()
+        # 排序选项
+        q_options.sort()
+    else:
+        # Newer pages place each choice in a ``div.clearfix`` pair inside a
+        # dedicated Zy_ulTk.  Never treat an arbitrary layout ul as this
+        # alternate source.
+        alternate_container = div_tag.find("ul", class_="Zy_ulTk")
+        q_options = _extract_alternate_choices(
+            alternate_container, font_decoder
+        )
     q_options = '\n'.join(q_options)
     
     # 初始化答题字段：至少包含 answer{id} 和 answertype{id}
@@ -979,13 +980,63 @@ def _extract_choices(element, font_decoder=None) -> str:
     return cleaned_content
 
 
-def _extract_choice_block(element, font_decoder=None) -> str:
-    """Extract one option from a ``clearfix`` label/text pair."""
+def _extract_alternate_choices(element, font_decoder=None) -> List[str]:
+    """Extract and validate choices from direct alternate-format blocks."""
 
-    label_element = element.find("span", class_="num_option")
-    answer_element = element.find("div", class_="answer_p")
+    if not element:
+        return []
+
+    choices: List[str] = []
+    seen_choices = set()
+    labels = {}
+    has_incomplete_choice = False
+    for choice_block in element.find_all(
+        "div", class_="clearfix", recursive=False
+    ):
+        choice = _extract_choice_block(choice_block, font_decoder)
+        if choice is None:
+            # Layout/decorative blocks are not choices.
+            continue
+        if not choice:
+            # A valid label paired with an empty/image-only answer is a
+            # malformed choice, not a decorative block.
+            has_incomplete_choice = True
+            continue
+
+        normalized_choice = re.sub(r"\s+", "", choice).casefold()
+        label = choice.partition(".")[0]
+        previous = labels.get(label)
+        if previous is not None and previous != normalized_choice:
+            # The same label maps to different text; no alternate result is
+            # safe to submit.
+            return []
+        labels[label] = normalized_choice
+        if normalized_choice in seen_choices:
+            continue
+        seen_choices.add(normalized_choice)
+        choices.append(choice)
+
+    if has_incomplete_choice and choices:
+        return []
+    return choices
+
+
+def _extract_choice_block(element, font_decoder=None) -> Optional[str]:
+    """Extract one direct ``clearfix`` label/text pair.
+
+    ``None`` denotes a decorative block without a direct pair.  An empty
+    string denotes a valid label whose answer text is missing, which callers
+    must treat as an incomplete choice set.
+    """
+
+    label_element = element.find(
+        "span", class_="num_option", recursive=False
+    )
+    answer_element = element.find(
+        "div", class_="answer_p", recursive=False
+    )
     if not label_element or not answer_element:
-        return ""
+        return None
 
     label_candidates = [label_element.get_text(" ", strip=True)]
     for attr in ("aria-label", "data", "value"):
@@ -1000,7 +1051,7 @@ def _extract_choice_block(element, font_decoder=None) -> str:
             label = match.group(1).upper()
             break
     if not label:
-        return ""
+        return None
 
     answer = _extract_choices(answer_element, font_decoder)
     if not answer:
