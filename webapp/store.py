@@ -67,6 +67,21 @@ _PREFERENCE_SECRET_PREFIX = "fernet:v1:"
 DEFAULT_WEB_TASK_LOG_CAPACITY = 5_000
 
 
+class _TrustedWebTaskRecord(dict[str, Any]):
+    """A loader record carrying canonical metadata outside its JSON shape."""
+
+    __slots__ = ("_history_timestamp",)
+
+    def __init__(
+        self,
+        value: Mapping[str, Any],
+        *,
+        history_timestamp: float | None,
+    ) -> None:
+        super().__init__(value)
+        self._history_timestamp = history_timestamp
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
@@ -119,6 +134,7 @@ CREATE TABLE IF NOT EXISTS web_tasks (
     details_json TEXT NOT NULL,
     started_at REAL,
     finished_at REAL,
+    history_at REAL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -312,25 +328,50 @@ class SQLiteStore:
                     connection.execute(
                         "ALTER TABLE web_tasks ADD COLUMN finished_at REAL"
                     )
-                # Backfill the new ordering column from legacy JSON when it
-                # is available.  Invalid/non-finite values remain NULL and
-                # therefore use started_at as the deterministic fallback.
+                if "history_at" not in task_columns:
+                    # ``history_at`` is an internal ordering value.  It keeps
+                    # an interrupted row's original started_at fallback
+                    # stable after the public snapshot receives a real
+                    # failure finished_at timestamp.
+                    connection.execute(
+                        "ALTER TABLE web_tasks ADD COLUMN history_at REAL"
+                    )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS web_tasks_history_at_idx "
+                    "ON web_tasks(history_at DESC)"
+                )
+                # Backfill the ordering columns from legacy JSON when they
+                # are available.  Invalid/non-finite values remain NULL and
+                # therefore use the next deterministic fallback.
                 task_rows = connection.execute(
-                    "SELECT id, finished_at, snapshot_json FROM web_tasks"
+                    "SELECT id, started_at, finished_at, history_at, snapshot_json "
+                    "FROM web_tasks"
                 ).fetchall()
                 for row in task_rows:
-                    if row["finished_at"] is not None:
-                        continue
-                    payload = _json_load(row["snapshot_json"], {})
-                    if not isinstance(payload, Mapping):
-                        continue
-                    finished_at = _finite_timestamp(payload.get("finished_at"))
+                    finished_at = _finite_timestamp(row["finished_at"])
                     if finished_at is None:
+                        payload = _json_load(row["snapshot_json"], {})
+                        if isinstance(payload, Mapping):
+                            finished_at = _finite_timestamp(payload.get("finished_at"))
+                        if finished_at is not None:
+                            connection.execute(
+                                "UPDATE web_tasks SET finished_at = ? WHERE id = ?",
+                                (finished_at, row["id"]),
+                            )
+                    if _finite_timestamp(row["history_at"]) is not None:
                         continue
-                    connection.execute(
-                        "UPDATE web_tasks SET finished_at = ? WHERE id = ?",
-                        (finished_at, row["id"]),
-                    )
+                    history_at = finished_at
+                    if history_at is None:
+                        history_at = _finite_timestamp(row["started_at"])
+                    if history_at is None:
+                        payload = _json_load(row["snapshot_json"], {})
+                        if isinstance(payload, Mapping):
+                            history_at = _finite_timestamp(payload.get("started_at"))
+                    if history_at is not None:
+                        connection.execute(
+                            "UPDATE web_tasks SET history_at = ? WHERE id = ?",
+                            (history_at, row["id"]),
+                        )
                 # Older persistent volumes do not have an explicit
                 # authentication mode.  Add it in place and normalize any
                 # malformed legacy values before the app serves profiles.
@@ -1228,6 +1269,8 @@ class SQLiteStore:
         self,
         snapshot: Mapping[str, Any],
         details: Mapping[str, Any],
+        *,
+        history_timestamp: Any = _UNSET,
     ) -> bool:
         """Upsert one credential-free task monitor record.
 
@@ -1255,17 +1298,28 @@ class SQLiteStore:
         safe_snapshot["account_id"] = account_id
         started_at = _finite_timestamp(snapshot.get("started_at"))
         finished_at = _finite_timestamp(snapshot.get("finished_at"))
+        if history_timestamp is _UNSET:
+            history_timestamp = finished_at
+            if history_timestamp is None:
+                history_timestamp = started_at
+        else:
+            history_timestamp = _finite_timestamp(history_timestamp)
+            if history_timestamp is None:
+                history_timestamp = finished_at
+                if history_timestamp is None:
+                    history_timestamp = started_at
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO web_tasks
-                    (id, account_id, snapshot_json, details_json, started_at, finished_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, account_id, snapshot_json, details_json, started_at, finished_at, history_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     snapshot_json = excluded.snapshot_json,
                     details_json = excluded.details_json,
                     started_at = excluded.started_at,
                     finished_at = excluded.finished_at,
+                    history_at = excluded.history_at,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1275,6 +1329,7 @@ class SQLiteStore:
                     _json_dump(safe_details),
                     started_at,
                     finished_at,
+                    history_timestamp,
                     _utc_now(),
                 ),
             )
@@ -1360,7 +1415,7 @@ class SQLiteStore:
             # used by TaskManager.
             row_fields = (
                 "id, account_id, snapshot_json, details_json, "
-                "started_at, finished_at"
+                "started_at, finished_at, history_at"
             )
             active_rows = connection.execute(
                 f"""
@@ -1369,7 +1424,7 @@ class SQLiteStore:
                 WHERE json_valid(snapshot_json)
                   AND json_extract(snapshot_json, '$.state')
                       IN ('running', 'stopping')
-                ORDER BY COALESCE(finished_at, started_at, 0) DESC, id DESC
+                ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
                 """
             ).fetchall()
             terminal_rows = connection.execute(
@@ -1379,7 +1434,7 @@ class SQLiteStore:
                 WHERE json_valid(snapshot_json)
                   AND json_extract(snapshot_json, '$.state')
                       IN ('completed', 'failed', 'stopped')
-                ORDER BY COALESCE(finished_at, started_at, 0) DESC, id DESC
+                ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -1462,30 +1517,30 @@ class SQLiteStore:
                             "message": cleaned_message,
                         }
                     )
-                record = {
-                    "snapshot": dict(snapshot),
-                    "details": dict(details),
-                    # Loading is itself a persistence/API boundary.  Old rows
-                    # are cleaned before any caller can inspect the returned
-                    # payload.  TaskManager owns any best-effort migration
-                    # write-back separately, so this loader stays a pure read
-                    # even for read-only or locked databases.
-                    "logs": cleaned_logs,
-                }
-                if logs_dirty:
-                    record["_logs_dirty"] = True
-                # SQLite returns log rows in ascending sequence order after
-                # the bounded query.  This private hint lets the manager use
-                # the ordered fast path while custom adapters are always
-                # treated as unordered and scanned within their own budget.
-                record["_logs_ordered"] = True
-                if snapshot_dirty or details_dirty:
-                    record["_record_dirty"] = True
-                order_timestamp = _finite_timestamp(snapshot.get("finished_at"))
+                # Loading is itself a persistence/API boundary.  Old rows
+                # are cleaned before any caller can inspect the returned
+                # payload.  TaskManager owns any best-effort migration
+                # write-back separately, so this loader stays a pure read
+                # even for read-only or locked databases.
+                order_timestamp = _finite_timestamp(row["history_at"])
                 if order_timestamp is None:
-                    order_timestamp = _finite_timestamp(snapshot.get("started_at"))
+                    order_timestamp = _finite_timestamp(row["finished_at"])
+                if order_timestamp is None:
+                    order_timestamp = _finite_timestamp(row["started_at"])
                 if order_timestamp is None:
                     order_timestamp = 0.0
+                record = _TrustedWebTaskRecord(
+                    {
+                        "snapshot": dict(snapshot),
+                        "details": dict(details),
+                        "logs": cleaned_logs,
+                    },
+                    history_timestamp=order_timestamp,
+                )
+                if logs_dirty:
+                    record["_logs_dirty"] = True
+                if snapshot_dirty or details_dirty:
+                    record["_record_dirty"] = True
                 records.append(((order_timestamp, str(task_id)), record))
             records.sort(key=lambda item: item[0], reverse=True)
             return [record for _, record in records]
@@ -1544,7 +1599,7 @@ class SQLiteStore:
                     WHERE json_valid(snapshot_json)
                       AND json_extract(snapshot_json, '$.state')
                           IN ('completed', 'failed', 'stopped')
-                    ORDER BY COALESCE(finished_at, started_at, 0) DESC, id DESC
+                    ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
                     LIMIT -1 OFFSET ?
                 )
                 """,

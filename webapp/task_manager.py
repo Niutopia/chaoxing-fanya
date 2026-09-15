@@ -61,6 +61,28 @@ _RESTART_INTERRUPTION_ERROR = "服务重启导致任务中断，超星进度保�
 _UNSET = object()
 
 
+def _is_builtin_sqlite_method(method: Any, function_name: str) -> bool:
+    """Return whether ``method`` is an exact built-in SQLiteStore method.
+
+    Restore payloads cross an adapter boundary and are therefore not allowed
+    to grant capabilities through ordinary mapping fields.  The manager uses
+    the bound method identity as the trusted channel for the two values that
+    the SQLite loader can establish from canonical database columns.
+    """
+
+    try:
+        from .store import SQLiteStore
+
+        owner = getattr(method, "__self__", None)
+        function = getattr(method, "__func__", None)
+        return (
+            type(owner) is SQLiteStore
+            and function is getattr(SQLiteStore, function_name)
+        )
+    except BaseException:
+        return False
+
+
 class TaskManagerError(RuntimeError):
     """Base class for task admission and lookup failures."""
 
@@ -397,6 +419,10 @@ class _TaskRuntime:
     # later.  This closes the enqueue/terminal transition race without
     # reopening a task for arbitrary direct ``append_log`` calls.
     terminal_cutoff: float | None = None
+    # Canonical history ordering timestamp.  For a restored interrupted row
+    # this can remain its original started_at fallback while the public
+    # snapshot receives a real failure finished_at timestamp.
+    history_timestamp: float | None = None
     record_dirty: bool = False
     # Set while restoring an old record when one or more persisted messages
     # were replaced by the historical safety marker.  It is intentionally
@@ -621,10 +647,19 @@ class TaskManager:
             saver = getattr(self.persistence, "save_web_task", None)
             if not callable(saver):
                 return False
-            result = saver(
-                self._snapshot_mapping(record.snapshot),
-                self._details_mapping(record.details),
-            )
+            snapshot = self._snapshot_mapping(record.snapshot)
+            details = self._details_mapping(record.details)
+            if (
+                record.history_timestamp is not None
+                and _is_builtin_sqlite_method(saver, "save_web_task")
+            ):
+                result = saver(
+                    snapshot,
+                    details,
+                    history_timestamp=record.history_timestamp,
+                )
+            else:
+                result = saver(snapshot, details)
             persisted = result is True
             record.record_dirty = not persisted
             return persisted
@@ -812,6 +847,9 @@ class TaskManager:
     def _restore_record(
         self,
         payload: Any,
+        *,
+        trusted_ordered_logs: bool = False,
+        history_timestamp: Any = _UNSET,
     ) -> tuple[_TaskRuntime, bool] | None:
         """Build a terminal runtime from a persistence adapter response.
 
@@ -866,6 +904,19 @@ class TaskManager:
             error = cleaned_error
         started_at = _optional_timestamp(raw_snapshot.get("started_at"))
         finished_at = _optional_timestamp(raw_snapshot.get("finished_at"))
+        if history_timestamp is _UNSET:
+            history_timestamp = finished_at
+            if history_timestamp is None:
+                history_timestamp = started_at
+        else:
+            # Only the built-in SQLite loader can supply this out-of-band
+            # value.  Invalid values fall back to the public timestamps, but
+            # ordinary payload fields are never consulted for ordering.
+            history_timestamp = _optional_timestamp(history_timestamp)
+            if history_timestamp is None:
+                history_timestamp = finished_at
+                if history_timestamp is None:
+                    history_timestamp = started_at
         if interrupted and finished_at is None:
             finished_at = time.time()
         snapshot = TaskSnapshot(
@@ -895,11 +946,11 @@ class TaskManager:
             details = replace(details, active_jobs={})
         logs, next_sequence, logs_dirty = self._decode_logs(
             payload.get("logs", []),
-            ordered=payload.get("_logs_ordered") is True,
+            ordered=trusted_ordered_logs,
         )
         # SQLiteStore sanitizes rows while keeping its loader pure-read.  Its
-        # private marker tells this manager that the in-memory canonical value
-        # still needs a separate best-effort write-back.
+        # private dirty marker tells this manager that the in-memory canonical
+        # value still needs a separate best-effort write-back.
         logs_dirty = logs_dirty or payload.get("_logs_dirty") is True
         if interrupted:
             next_sequence += 1
@@ -936,6 +987,7 @@ class TaskManager:
                 logs=logs,
                 next_sequence=next_sequence,
                 slot_released=True,
+                history_timestamp=history_timestamp,
                 record_dirty=record_dirty,
                 logs_dirty=logs_dirty,
             ),
@@ -952,6 +1004,7 @@ class TaskManager:
             loader = getattr(self.persistence, "load_web_tasks", None)
             if not callable(loader):
                 return
+            trusted_loader = _is_builtin_sqlite_method(loader, "load_web_tasks")
             try:
                 payloads = loader(
                     limit=self.terminal_task_capacity,
@@ -968,7 +1021,19 @@ class TaskManager:
         with self._lock:
             interrupted_ids: set[str] = set()
             for payload in payloads:
-                restored = self._restore_record(payload)
+                trusted_history_timestamp: Any = _UNSET
+                if trusted_loader:
+                    try:
+                        trusted_history_timestamp = getattr(
+                            payload, "_history_timestamp", _UNSET
+                        )
+                    except BaseException:
+                        trusted_history_timestamp = _UNSET
+                restored = self._restore_record(
+                    payload,
+                    trusted_ordered_logs=trusted_loader,
+                    history_timestamp=trusted_history_timestamp,
+                )
                 if restored is None:
                     continue
                 record, interrupted = restored
@@ -1020,7 +1085,9 @@ class TaskManager:
 
     @staticmethod
     def _history_timestamp(record: _TaskRuntime) -> float:
-        value = record.snapshot.finished_at
+        value = record.history_timestamp
+        if value is None:
+            value = record.snapshot.finished_at
         if value is None:
             value = record.snapshot.started_at
         timestamp = _optional_timestamp(value)
@@ -1030,13 +1097,7 @@ class TaskManager:
 
     @staticmethod
     def _list_timestamp(record: _TaskRuntime) -> float:
-        value = record.snapshot.finished_at
-        if value is None:
-            value = record.snapshot.started_at
-        timestamp = _optional_timestamp(value)
-        if timestamp is None:
-            return 0.0
-        return timestamp
+        return TaskManager._history_timestamp(record)
 
     def _trim_terminal_locked(
         self, *, preserve_ids: set[str] | frozenset[str] = frozenset()
@@ -1312,13 +1373,15 @@ class TaskManager:
         # late enqueue callback can then distinguish records generated before
         # return from a genuinely post-terminal logger call.
         record.terminal_cutoff = time.time()
+        finished_at = time.time()
         record.snapshot = replace(
             record.snapshot,
             state=state,
             error=error,
-            finished_at=time.time(),
+            finished_at=finished_at,
             stats=_copy(record.snapshot.stats),
         )
+        record.history_timestamp = finished_at
         # A cancellation or worker error can bypass the normal job-done
         # callback.  Never leave a terminal task advertising phantom active
         # jobs to the monitor.
