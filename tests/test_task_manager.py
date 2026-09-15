@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from webapp.models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
+from webapp.limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from webapp.task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
@@ -139,6 +140,30 @@ def test_same_account_cannot_start_twice(task_inputs):
     with pytest.raises(AccountTaskConflict):
         manager.start(**task_inputs("account-a"))
     runner.release.set()
+
+
+@pytest.mark.parametrize(
+    "course_ids",
+    [
+        "course-1",
+        ["course"] * (MAX_SELECTED_COURSE_IDS + 1),
+        ["x" * (MAX_COURSE_ID_LENGTH + 1)],
+        ["   "],
+    ],
+)
+def test_manager_rejects_invalid_course_selection_before_admission(
+    task_inputs, course_ids
+):
+    runner = BlockingRunner()
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    values = task_inputs("account-a")
+    values["course_ids"] = course_ids
+
+    with pytest.raises((TypeError, ValueError)):
+        manager.start(**values)
+
+    assert manager.list_tasks() == []
+    assert manager.has_active_task("account-a") is False
 
 
 def test_global_account_limit_is_released_after_terminal_task(task_inputs):

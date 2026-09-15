@@ -149,7 +149,7 @@ class DefaultNotification(NotificationService):
             # 获取对应的通知服务类
             provider_class = globals().get(provider_name)
             if not provider_class:
-                logger.error(f"未找到名为 {provider_name} 的通知服务提供商")
+                logger.error("未找到通知服务提供商")
                 self.disabled = True
                 return self
 
@@ -199,10 +199,10 @@ class ServerChan(NotificationService):
             response.raise_for_status()
             result = response.json()
             logger.info("Server酱通知发送成功")
-        except requests.RequestException as e:
-            logger.error(f"Server酱通知发送失败: {e}")
-        except ValueError as e:
-            logger.error(f"Server酱返回数据解析失败: {e}")
+        except requests.RequestException:
+            logger.error("Server酱通知发送失败（网络异常已省略）")
+        except ValueError:
+            logger.error("Server酱返回数据解析失败（响应内容已省略）")
 
 
 class Qmsg(NotificationService):
@@ -235,10 +235,10 @@ class Qmsg(NotificationService):
             response.raise_for_status()
             result = response.json()
             logger.info("Qmsg酱通知发送成功")
-        except requests.RequestException as e:
-            logger.error(f"Qmsg酱通知发送失败: {e}")
-        except ValueError as e:
-            logger.error(f"Qmsg酱返回数据解析失败: {e}")
+        except requests.RequestException:
+            logger.error("Qmsg酱通知发送失败（网络异常已省略）")
+        except ValueError:
+            logger.error("Qmsg酱返回数据解析失败（响应内容已省略）")
 
 
 class Bark(NotificationService):
@@ -270,10 +270,10 @@ class Bark(NotificationService):
             response.raise_for_status()
             result = response.json()
             logger.info("Bark通知发送成功")
-        except requests.RequestException as e:
-            logger.error(f"Bark通知发送失败: {e}")
-        except ValueError as e:
-            logger.error(f"Bark返回数据解析失败: {e}")
+        except requests.RequestException:
+            logger.error("Bark通知发送失败（网络异常已省略）")
+        except ValueError:
+            logger.error("Bark返回数据解析失败（响应内容已省略）")
 
 class Telegram(NotificationService):
     """
@@ -311,10 +311,10 @@ class Telegram(NotificationService):
                 logger.info("Telegram通知发送成功")
             else:
                 logger.error("Telegram通知发送失败")
-        except requests.RequestException as e:
-            logger.error(f"Telegram通知发送失败: {e}")
-        except ValueError as e:
-            logger.error(f"Telegram返回数据解析失败: {e}")
+        except requests.RequestException:
+            logger.error("Telegram通知发送失败（网络异常已省略）")
+        except ValueError:
+            logger.error("Telegram返回数据解析失败（响应内容已省略）")
 
 # 为了向后兼容，保留原来的Notification类
 Notification = DefaultNotification

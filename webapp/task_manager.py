@@ -22,7 +22,14 @@ from datetime import datetime
 from typing import Any
 
 from api.live_process import StudyCancelled
+from api.logger import (
+    sanitize_log_extra,
+    sanitize_log_level,
+    sanitize_log_message,
+    validate_task_id,
+)
 
+from .limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from .models import (
     AccountAuth,
     AccountPreferences,
@@ -81,18 +88,7 @@ def _copy(value: Any) -> Any:
 def _json_compatible(value: Any) -> Any:
     """Detach public monitor values into the store's JSON-compatible shape."""
 
-    if isinstance(value, Mapping):
-        return {
-            str(key): _json_compatible(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_json_compatible(item) for item in value]
-    if isinstance(value, set):
-        return [_json_compatible(item) for item in sorted(value, key=str)]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+    return sanitize_log_extra(value)
 
 
 def _account_preferences(value: AccountPreferences | Mapping[str, Any]) -> AccountPreferences:
@@ -275,14 +271,7 @@ _SENSITIVE_KEYS = frozenset(
 
 
 def _redact_text(value: Any, secrets: tuple[str, ...]) -> str:
-    try:
-        text = str(value)
-    except Exception:
-        text = "[unavailable]"
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[redacted]")
-    return text
+    return sanitize_log_message(value, secrets=secrets)
 
 
 def _redact(value: Any, secrets: tuple[str, ...], *, key: Any = None) -> Any:
@@ -293,20 +282,7 @@ def _redact(value: Any, secrets: tuple[str, ...], *, key: Any = None) -> Any:
         marker in key_name for marker in ("password", "cookie", "api_key", "token", "secret")
     ):
         return "[redacted]"
-    if isinstance(value, Mapping):
-        return {
-            _copy(item_key): _redact(item_value, secrets, key=item_key)
-            for item_key, item_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact(item, secrets) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact(item, secrets) for item in value)
-    if isinstance(value, set):
-        return {_redact(item, secrets) for item in value}
-    if isinstance(value, str):
-        return _redact_text(value, secrets)
-    return _copy(value)
+    return sanitize_log_extra(value, secrets=secrets)
 
 
 def _timestamp(value: Any = None) -> float:
@@ -375,6 +351,10 @@ class _TaskRuntime:
     next_sequence: int = 0
     slot_released: bool = False
     thread: threading.Thread | None = None
+    # Set while restoring an old record when one or more persisted messages
+    # were replaced by the historical safety marker.  It is intentionally
+    # internal: API callers only see the cleaned log entries.
+    logs_dirty: bool = False
 
 
 class TaskReporter:
@@ -382,7 +362,7 @@ class TaskReporter:
 
     def __init__(self, manager: "TaskManager", task_id: str):
         self._manager = manager
-        self.task_id = str(task_id)
+        self.task_id = validate_task_id(task_id)
 
     def set_current(
         self,
@@ -550,7 +530,7 @@ class TaskManager:
             "timestamp": float(entry.timestamp),
         }
 
-    def _persist_record_locked(self, record: _TaskRuntime) -> None:
+    def _persist_record_locked(self, record: _TaskRuntime) -> bool:
         """Best-effort persistence of one public snapshot/details pair.
 
         Persistence is deliberately an adapter rather than a hard dependency
@@ -563,29 +543,31 @@ class TaskManager:
         try:
             saver = getattr(self.persistence, "save_web_task", None)
             if not callable(saver):
-                return
-            saver(
+                return False
+            result = saver(
                 self._snapshot_mapping(record.snapshot),
                 self._details_mapping(record.details),
             )
-        except Exception:
+            return result is not False
+        except BaseException:
             # Monitoring persistence is best effort.  In particular, an
             # injected store may not have an account row for a direct unit
             # test, while the in-memory task should still run normally.
-            return
+            return False
 
-    def _persist_log_locked(self, task_id: str, entry: TaskLogEntry) -> None:
+    def _persist_log_locked(self, task_id: str, entry: TaskLogEntry) -> bool:
         try:
             saver = getattr(self.persistence, "save_web_task_log", None)
             if not callable(saver):
-                return
-            saver(
+                return False
+            result = saver(
                 str(task_id),
                 self._log_mapping(entry),
                 capacity=self.log_capacity,
             )
-        except Exception:
-            return
+            return result is not False
+        except BaseException:
+            return False
 
     def _delete_persisted_tasks(self, task_ids: list[str]) -> None:
         if not task_ids:
@@ -616,35 +598,66 @@ class TaskManager:
             counts=_copy(dict(counts)),
         )
 
-    def _restore_logs(self, value: Any) -> tuple[deque[TaskLogEntry], int]:
+    def _decode_logs(
+        self, value: Any
+    ) -> tuple[deque[TaskLogEntry], int, bool]:
+        """Restore persisted logs and mark rows rewritten for safety.
+
+        Older releases persisted free-form question/answer/card content.  A
+        restored row is cleaned as a whole when it matches one of those known
+        formats, while ordinary progress metadata remains available.  The
+        dirty flag allows the caller to write the cleaned rows back without
+        dropping unrelated safe history.
+        """
+
         if not isinstance(value, (list, tuple)):
             value = []
         by_sequence: dict[int, TaskLogEntry] = {}
+        dirty = False
         for raw_entry in value:
             if not isinstance(raw_entry, Mapping):
                 continue
             try:
                 sequence = int(raw_entry.get("sequence"))
-            except (TypeError, ValueError, OverflowError):
+            except BaseException:
                 continue
             if sequence < 1:
                 continue
-            timestamp = _optional_timestamp(raw_entry.get("timestamp"))
-            if timestamp is None:
-                timestamp = time.time()
-            level = raw_entry.get("level", "info")
-            message = raw_entry.get("message", "")
+            try:
+                timestamp = _optional_timestamp(raw_entry.get("timestamp"))
+                if timestamp is None:
+                    timestamp = time.time()
+                level = raw_entry.get("level", "info")
+                message = raw_entry.get("message", "")
+                cleaned_message = sanitize_log_message(
+                    message,
+                    historical=True,
+                )
+                # Compare sanitized forms rather than calling ``str`` on a
+                # dict-like/arbitrary old value: a hostile ``__str__`` must
+                # not abort startup or enter a persistence/API response.
+                current_message = sanitize_log_message(message)
+                if cleaned_message != current_message:
+                    dirty = True
+            except BaseException:
+                continue
             by_sequence[sequence] = TaskLogEntry(
                 sequence=sequence,
-                level=_redact_text(level, ()).lower(),
-                message=_redact_text(message, ()),
+                level=sanitize_log_level(level),
+                message=cleaned_message,
                 timestamp=timestamp,
             )
         ordered = sorted(by_sequence.values(), key=lambda item: item.sequence)
         next_sequence = max(by_sequence, default=0)
         if len(ordered) > self.log_capacity:
             ordered = ordered[-self.log_capacity :]
-        return deque(ordered, maxlen=self.log_capacity), next_sequence
+        return deque(ordered, maxlen=self.log_capacity), next_sequence, dirty
+
+    def _restore_logs(self, value: Any) -> tuple[deque[TaskLogEntry], int]:
+        """Backward-compatible two-value wrapper around :meth:`_decode_logs`."""
+
+        logs, next_sequence, _ = self._decode_logs(value)
+        return logs, next_sequence
 
     def _restore_record(
         self,
@@ -663,7 +676,10 @@ class TaskManager:
         raw_snapshot = payload.get("snapshot")
         if not isinstance(raw_snapshot, Mapping):
             return None
-        task_id = str(raw_snapshot.get("id", "")).strip()
+        try:
+            task_id = validate_task_id(raw_snapshot.get("id"))
+        except (TypeError, ValueError):
+            return None
         account_id = str(raw_snapshot.get("account_id", "")).strip()
         if not task_id or not account_id:
             return None
@@ -686,7 +702,7 @@ class TaskManager:
         if interrupted:
             error = _RESTART_INTERRUPTION_ERROR
         elif error is not None:
-            error = _redact_text(error, ())
+            error = sanitize_log_message(error, historical=True)
         started_at = _optional_timestamp(raw_snapshot.get("started_at"))
         finished_at = _optional_timestamp(raw_snapshot.get("finished_at"))
         if interrupted and finished_at is None:
@@ -711,7 +727,13 @@ class TaskManager:
             # started, so stale active jobs would be misleading in the
             # terminal monitor view.
             details = replace(details, active_jobs={})
-        logs, next_sequence = self._restore_logs(payload.get("logs", []))
+        logs, next_sequence, logs_dirty = self._decode_logs(
+            payload.get("logs", [])
+        )
+        # SQLiteStore sanitizes rows while keeping its loader pure-read.  Its
+        # private marker tells this manager that the in-memory canonical value
+        # still needs a separate best-effort write-back.
+        logs_dirty = logs_dirty or payload.get("_logs_dirty") is True
         if interrupted:
             next_sequence += 1
             interruption_entry = TaskLogEntry(
@@ -747,6 +769,7 @@ class TaskManager:
                 logs=logs,
                 next_sequence=next_sequence,
                 slot_released=True,
+                logs_dirty=logs_dirty,
             ),
             interrupted,
         )
@@ -767,13 +790,25 @@ class TaskManager:
                     continue
                 record, interrupted = restored
                 self._tasks[record.snapshot.id] = record
+                self._persist_dirty_logs_locked(record)
                 if interrupted:
-                    self._persist_log_locked(
-                        record.snapshot.id,
-                        record.logs[-1],
-                    )
+                    if not self._persist_log_locked(record.snapshot.id, record.logs[-1]):
+                        record.logs_dirty = True
                     self._persist_record_locked(record)
             self._trim_terminal_locked()
+
+    def _persist_dirty_logs_locked(self, record: _TaskRuntime) -> bool:
+        """Best-effort historical migration with an honest dirty flag."""
+
+        if not record.logs_dirty:
+            return True
+        all_saved = True
+        for entry in record.logs:
+            if not self._persist_log_locked(record.snapshot.id, entry):
+                all_saved = False
+        if all_saved:
+            record.logs_dirty = False
+        return all_saved
 
     @staticmethod
     def _history_timestamp(record: _TaskRuntime) -> float:
@@ -836,9 +871,13 @@ class TaskManager:
             self._active_slots = threading.BoundedSemaphore(value)
 
     def _lookup(self, task_id: str) -> _TaskRuntime:
-        record = self._tasks.get(str(task_id))
+        try:
+            task_id = validate_task_id(task_id)
+        except (TypeError, ValueError):
+            raise TaskNotFound("invalid task id") from None
+        record = self._tasks.get(task_id)
         if record is None:
-            raise TaskNotFound(str(task_id))
+            raise TaskNotFound(task_id)
         return record
 
     def _secrets_for(self, record: _TaskRuntime) -> tuple[str, ...]:
@@ -865,11 +904,22 @@ class TaskManager:
         account = str(account_id)
         if not account.strip():
             raise ValueError("account_id must not be blank")
-        if course_ids is None:
+        if not isinstance(course_ids, list):
             raise TypeError("course_ids must be a list")
+        if not course_ids:
+            raise ValueError("course_ids must not be empty")
+        if len(course_ids) > MAX_SELECTED_COURSE_IDS:
+            raise ValueError("too many course_ids")
+        if not all(
+            isinstance(item, str)
+            and item.strip()
+            and len(item.strip()) <= MAX_COURSE_ID_LENGTH
+            for item in course_ids
+        ):
+            raise ValueError("course_ids contain an invalid value")
         # Resolve and copy all caller-owned values before acquiring a global
         # slot.  Invalid input must not strand a semaphore permit.
-        copied_course_ids = [str(item) for item in list(course_ids)]
+        copied_course_ids = list(dict.fromkeys(item.strip() for item in course_ids))
         copied_preferences = _account_preferences(preferences)
         copied_auth = _account_auth(auth)
         copied_answer = _answer_connection(answer)
@@ -971,7 +1021,12 @@ class TaskManager:
         error: str | None = None
         normal_return = False
         try:
-            run_with_task_context(task_id, self._invoke_runner, context)
+            run_with_task_context(
+                task_id,
+                self._invoke_runner,
+                context,
+                log_secrets=self._secrets_for(record),
+            )
             normal_return = True
         except StudyCancelled:
             # The study engine raises this only at a cooperative safe
@@ -997,7 +1052,11 @@ class TaskManager:
                 self._finish_locked(record, state, error)
 
     def _sanitize(self, record: _TaskRuntime, value: Any) -> str:
-        text = _redact_text(value, self._secrets_for(record))
+        text = sanitize_log_message(
+            value,
+            secrets=self._secrets_for(record),
+            historical=True,
+        )
         return text or "Task failed"
 
     @staticmethod
@@ -1216,18 +1275,28 @@ class TaskManager:
         """
 
         with self._lock:
-            record = self._tasks.get(str(task_id))
+            try:
+                task_id = validate_task_id(task_id)
+            except (TypeError, ValueError):
+                return None
+            record = self._tasks.get(task_id)
             if record is None or record.snapshot.state not in {"running", "stopping"}:
                 return None
             record.next_sequence += 1
             entry = TaskLogEntry(
                 sequence=record.next_sequence,
-                level=_redact_text(level, self._secrets_for(record)).lower(),
-                message=self._sanitize(record, message),
+                level=sanitize_log_level(level),
+                message=sanitize_log_message(
+                    message,
+                    secrets=self._secrets_for(record),
+                    historical=True,
+                ),
                 timestamp=_timestamp(timestamp),
             )
             record.logs.append(entry)
-            self._persist_log_locked(record.snapshot.id, entry)
+            persisted = self._persist_log_locked(record.snapshot.id, entry)
+            if self.persistence is not None and not persisted:
+                record.logs_dirty = True
             return entry
 
     def get_logs(self, task_id: str, after: int = 0) -> TaskLogPage:
@@ -1241,11 +1310,39 @@ class TaskManager:
             raise ValueError("after cursor must be a non-negative integer")
         with self._lock:
             record = self._lookup(task_id)
-            items = [
-                item
-                for item in record.logs
-                if item.sequence > after
-            ]
+            self._persist_dirty_logs_locked(record)
+            secrets = self._secrets_for(record)
+            items: list[TaskLogEntry] = []
+            for index, item in enumerate(record.logs):
+                if item.sequence <= after:
+                    continue
+                # The route is a security boundary.  Re-sanitize here even
+                # though append/restore already clean entries, so a legacy
+                # adapter or an in-process integration cannot reintroduce a
+                # sensitive row after startup.
+                cleaned = sanitize_log_message(
+                    item.message,
+                    secrets=secrets,
+                    historical=True,
+                )
+                if cleaned != item.message:
+                    replacement = replace(item, message=cleaned)
+                    try:
+                        record.logs[index] = replacement
+                    except (ValueError, IndexError):
+                        # A concurrent teardown cannot invalidate the API
+                        # response; return the detached replacement regardless.
+                        pass
+                    item = replacement
+                    if self.persistence is not None and not self._persist_log_locked(
+                        record.snapshot.id, replacement
+                    ):
+                        # A sanitized replacement is still a migration.  Do
+                        # not claim it was durable until the adapter confirms
+                        # the write, otherwise a later restart can restore the
+                        # old unsafe value without another retry.
+                        record.logs_dirty = True
+                items.append(item)
             next_cursor = max(after, record.next_sequence)
             return TaskLogPage(items=_copy(items), next_cursor=next_cursor)
 

@@ -103,8 +103,8 @@ class FontHashDAO:
 # 初始化字体哈希DAO单例
 try:
     fonthash_dao = FontHashDAO()
-except Exception as e:
-    logger.warning(f"初始化字体哈希数据失败 - {e}")
+except Exception:
+    logger.warning("初始化字体哈希数据失败（异常内容已省略）")
     fonthash_dao = FontHashDAO.__new__(FontHashDAO)
     fonthash_dao.char_map = {}
     fonthash_dao.hash_map = {}

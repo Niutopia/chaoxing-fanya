@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from api.logger import (
+    sanitize_log_level,
+    sanitize_log_message,
+    validate_task_id,
+)
+
 from .crypto import SecretBox
 from .answer_connection import (
     DEFAULT_MAX_CONCURRENCY,
@@ -220,6 +226,21 @@ class SQLiteStore:
         except BaseException:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Open a genuinely read-only SQLite connection for history loads."""
+
+        connection = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
         finally:
             connection.close()
 
@@ -1127,7 +1148,7 @@ class SQLiteStore:
         self,
         snapshot: Mapping[str, Any],
         details: Mapping[str, Any],
-    ) -> None:
+    ) -> bool:
         """Upsert one credential-free task monitor record.
 
         Task credentials remain in the encrypted account tables.  This table
@@ -1136,9 +1157,9 @@ class SQLiteStore:
         decrypted password, cookie, or answer-service key.
         """
 
-        task_id = str(snapshot.get("id", "")).strip()
+        task_id = validate_task_id(snapshot.get("id", ""))
         account_id = str(snapshot.get("account_id", "")).strip()
-        if not task_id or not account_id:
+        if not account_id:
             raise ValueError("task id and account id are required")
         started_at = snapshot.get("started_at")
         if started_at is not None:
@@ -1164,6 +1185,7 @@ class SQLiteStore:
                     _utc_now(),
                 ),
             )
+        return True
 
     def save_web_task_log(
         self,
@@ -1171,11 +1193,12 @@ class SQLiteStore:
         entry: Mapping[str, Any],
         *,
         capacity: int,
-    ) -> None:
+    ) -> bool:
         """Append one task log and retain only the bounded newest entries."""
 
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ValueError("capacity must be a positive integer")
+        task_id = validate_task_id(task_id)
         sequence = int(entry["sequence"])
         with self._connection() as connection:
             connection.execute(
@@ -1191,8 +1214,11 @@ class SQLiteStore:
                 (
                     str(task_id),
                     sequence,
-                    str(entry.get("level", "info")),
-                    str(entry.get("message", "")),
+                    sanitize_log_level(entry.get("level", "info")),
+                    sanitize_log_message(
+                        entry.get("message", ""),
+                        historical=True,
+                    ),
                     float(entry.get("timestamp", time.time())),
                 ),
             )
@@ -1208,13 +1234,17 @@ class SQLiteStore:
                 """,
                 (str(task_id), str(task_id), capacity),
             )
+        return True
 
     def load_web_tasks(self, *, limit: int) -> list[dict[str, Any]]:
         """Load newest persisted monitor records with their bounded logs."""
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
-        with self._connection() as connection:
+        # Do not use the mutating connection context here: even setting WAL
+        # mode can acquire a write lock, and historical migration must remain
+        # an independent best-effort operation owned by TaskManager.
+        with self._read_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT id, snapshot_json, details_json
@@ -1239,13 +1269,42 @@ class SQLiteStore:
                     """,
                     (row["id"],),
                 ).fetchall()
-                records.append(
-                    {
-                        "snapshot": dict(snapshot),
-                        "details": dict(details),
-                        "logs": [dict(item) for item in log_rows],
-                    }
-                )
+                cleaned_logs: list[dict[str, Any]] = []
+                logs_dirty = False
+                for item in log_rows:
+                    cleaned_message = sanitize_log_message(
+                        item["message"],
+                        historical=True,
+                    )
+                    cleaned_level = sanitize_log_level(item["level"])
+                    if (
+                        cleaned_message != item["message"]
+                        or cleaned_level != item["level"]
+                    ):
+                        # This is metadata for the in-process manager only;
+                        # the write-back itself is deliberately not performed
+                        # by this read-only loader.
+                        logs_dirty = True
+                    cleaned_logs.append(
+                        {
+                            **dict(item),
+                            "level": cleaned_level,
+                            "message": cleaned_message,
+                        }
+                    )
+                record = {
+                    "snapshot": dict(snapshot),
+                    "details": dict(details),
+                    # Loading is itself a persistence/API boundary.  Old rows
+                    # are cleaned before any caller can inspect the returned
+                    # payload.  TaskManager owns any best-effort migration
+                    # write-back separately, so this loader stays a pure read
+                    # even for read-only or locked databases.
+                    "logs": cleaned_logs,
+                }
+                if logs_dirty:
+                    record["_logs_dirty"] = True
+                records.append(record)
             return records
 
     def delete_web_tasks(self, task_ids: list[str] | tuple[str, ...]) -> None:

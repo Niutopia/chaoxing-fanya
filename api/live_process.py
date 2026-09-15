@@ -58,7 +58,7 @@ class LiveProcessor:
                     logger.error("该直播不允许回看，无法提交观看进度")
                     return False
             if percent >= 90 or watched_seconds >= duration:
-                logger.info(f"直播'{live.name}'观看进度已达标，无需重复学习")
+                logger.info("直播观看进度已达标，无需重复学习（直播标题已省略）")
                 return True
         except StudyCancelled:
             raise
@@ -88,16 +88,21 @@ class LiveProcessor:
         # multiple of 30 seconds.
         total_reports = math.ceil(adjusted_duration / report_interval) + 1
         logger.info(
-            f"开始刷取直播'{live.name}'，剩余约{math.ceil(adjusted_duration / 60)}分钟"
+            "开始刷取直播，剩余约{}分钟（直播标题已省略）",
+            math.ceil(adjusted_duration / 60),
         )
 
         # 官方页面按30秒心跳。第一次为启动信号，后续为持续观看。
         for index in range(total_reports):
             _raise_if_cancelled(cancel_event)
-            logger.info(f"直播'{live.name}'正在上报进度 {index + 1}/{total_reports}")
+            logger.info(
+                "直播正在上报进度 {}/{}（直播标题已省略）",
+                index + 1,
+                total_reports,
+            )
             success = live.do_finish()
             if not success:
-                logger.warning(f"第{index + 1}次直播进度上报失败，5秒后重试")
+                logger.warning("直播进度上报失败，稍后重试")
                 if cancel_event is not None and cancel_event.wait(5):
                     raise StudyCancelled()
                 elif cancel_event is None:
@@ -114,7 +119,7 @@ class LiveProcessor:
             elif cancel_event is None:
                 time.sleep(report_interval)
 
-        logger.success(f"直播'{live.name}'时长刷取完成")
+        logger.success("直播时长刷取完成（直播标题已省略）")
         return True
 
 

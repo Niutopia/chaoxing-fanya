@@ -18,7 +18,10 @@ from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
 
+from api.logger import sanitize_log_message
+
 from ..answer_connection import outbound_url
+from ..limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from ..models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
 from ..task_manager import (
     AccountTaskConflict,
@@ -94,7 +97,10 @@ def _log_data(entry: Any) -> dict[str, Any]:
     return {
         "sequence": entry.sequence,
         "level": entry.level,
-        "message": entry.message,
+        # Keep a final serializer boundary in case a custom manager/adapter
+        # supplies an unclean entry.  Historical content is replaced as a
+        # whole; harmless progress metadata remains visible.
+        "message": sanitize_log_message(entry.message, historical=True),
         "timestamp": entry.timestamp,
     }
 
@@ -148,6 +154,10 @@ def _valid_preferences(value: Any) -> bool:
         isinstance(course_id, str) and course_id.strip() for course_id in selected
     ):
         return False
+    if len(selected) > MAX_SELECTED_COURSE_IDS or any(
+        len(course_id) > MAX_COURSE_ID_LENGTH for course_id in selected
+    ):
+        return False
     if not _finite_number(value.speed) or not 1.0 <= float(value.speed) <= 2.0:
         return False
     if (
@@ -180,7 +190,11 @@ def _course_ids(payload: Mapping[str, Any], preferences: AccountPreferences) -> 
         raise ValueError("courses_required")
     if not value:
         raise ValueError("courses_required")
+    if len(value) > MAX_SELECTED_COURSE_IDS:
+        raise ValueError("invalid_courses")
     if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError("invalid_courses")
+    if any(len(item.strip()) > MAX_COURSE_ID_LENGTH for item in value):
         raise ValueError("invalid_courses")
     # De-duplicate while retaining the user's order.  Sending the same course
     # twice must not make the runner process it twice.

@@ -335,6 +335,49 @@ def test_ocr_endpoint_change_requires_explicit_key(client, store, saved_account)
     assert stored.ocr_config["api_key"] == "ocr-api-key-secret"
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ftp://localhost:8849/v1",
+        "http://user:password@localhost:8849/v1",
+        "http://localhost:8849/v1?token=value",
+        "http://localhost:8849/v1#fragment",
+        "http://local host:8849/v1",
+        "http://localhost:invalid/v1",
+    ],
+)
+def test_ocr_endpoint_rejects_ambiguous_or_credential_bearing_urls(
+    client, saved_account, endpoint
+):
+    response = client.put(
+        f"/api/accounts/{saved_account.id}/preferences",
+        json={"ocr_config": {"endpoint": endpoint, "api_key": "new-key"}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_preferences"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:8849/v1",
+        "http://127.0.0.1:8849/ocr",
+        "http://192.168.1.20:8849/ocr",
+        "https://ocr.example.invalid/v1",
+    ],
+)
+def test_ocr_endpoint_allows_http_services_including_local_networks(
+    client, saved_account, endpoint
+):
+    response = client.put(
+        f"/api/accounts/{saved_account.id}/preferences",
+        json={"ocr_config": {"endpoint": endpoint, "api_key": "new-key"}},
+    )
+
+    assert response.status_code == 200
+
+
 def test_patch_without_password_preserves_secret(client, store, saved_account):
     response = client.patch(
         f"/api/accounts/{saved_account.id}", json={"name": "新名称"}

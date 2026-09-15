@@ -118,22 +118,23 @@ def _init_paddle_ocr(preferred_device: Optional[str] = None):
                     )
                     _PADDLE_OCR_ENGINE = engine
                     _PADDLE_OCR_DEVICE = device
-                    logger.info(f"PaddleOCR 初始化成功 ({device.upper()})，将用于题目图片 OCR")
+                    logger.info("PaddleOCR 初始化成功，将用于题目图片 OCR")
                     return _PADDLE_OCR_ENGINE
                 except Exception as exc_device:
                     last_exc = exc_device
-                    logger.warning(f"PaddleOCR {device.upper()} 初始化失败: {exc_device}")
+                    logger.warning(
+                        "PaddleOCR {} 初始化失败（异常内容已省略）",
+                        device.upper(),
+                    )
 
             if last_exc:
                 raise last_exc
         except Exception as exc:
             cause = getattr(exc, "__cause__", None)
-            if cause is not None:
-                logger.warning(
-                    f"PaddleOCR 初始化失败，将不使用本地 OCR: {exc} (底层依赖错误: {cause})"
-                )
-            else:
-                logger.warning(f"PaddleOCR 初始化失败，将不使用本地 OCR: {exc}")
+            logger.warning(
+                "PaddleOCR 初始化失败，将不使用本地 OCR（依赖异常已省略，底层原因={}）",
+                "存在" if cause is not None else "无",
+            )
             _PADDLE_OCR_ENGINE = None
             _PADDLE_OCR_DEVICE = None
 
@@ -223,7 +224,7 @@ def _call_http_ocr(ocr_endpoint: str, image_bytes: bytes, img_url: str) -> str:
         files = {"file": ("question.png", image_bytes, "image/png")}
         ocr_resp = requests.post(ocr_endpoint, files=files, timeout=20)
         if ocr_resp.status_code != 200:
-            logger.debug(f"HTTP OCR 服务返回异常状态码: {ocr_resp.status_code}")
+            logger.debug("HTTP OCR 服务返回异常状态码")
             return ""
         data = ocr_resp.json()
     except StudyCancelled:
@@ -284,7 +285,7 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
 
         resp = session.get(img_url, headers=extra_headers or None, timeout=8)
         if resp.status_code != 200:
-            logger.debug(f"下载题目图片失败: HTTP {resp.status_code}")
+            logger.debug("下载题目图片失败")
             return ""
         image_bytes = resp.content
     except StudyCancelled:
@@ -384,12 +385,17 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
                     except Exception as exc:
                         global _PADDLE_OCR_DEVICE
                         if device_attempt == 0 and _PADDLE_OCR_DEVICE == "gpu":
-                            logger.debug(f"PaddleOCR GPU 推理失败，切换到 CPU: {exc}")
+                            logger.debug(
+                                "PaddleOCR GPU 推理失败，切换到 CPU（异常内容已省略）"
+                            )
                             engine = _init_paddle_ocr(preferred_device="cpu")
                             if engine is None:
                                 break
                             continue
-                        logger.debug(f"PaddleOCR 识别失败 (模式{preprocess_mode}): {exc}")
+                        logger.debug(
+                            "PaddleOCR 识别失败（模式{}，异常内容已省略）",
+                            preprocess_mode,
+                        )
                         break
                 
                 if final_texts:
@@ -400,7 +406,7 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
                     )
                     break
                 else:
-                    logger.debug(f"PaddleOCR 预处理模式{preprocess_mode}未识别出文本，尝试下一模式")
+                    logger.debug("PaddleOCR 预处理模式未识别出文本，尝试下一模式")
             
             if not final_texts:
                 logger.debug("PaddleOCR 所有预处理模式均未识别出文本")
@@ -706,7 +712,6 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             if work_job:
                 job_list.append(work_job)
         else:
-            logger.warning(f"Unknown card type: {card_type}")
             logger.warning("未知任务卡片类型，原始卡片已省略")
 
     return job_list
@@ -729,8 +734,10 @@ def _process_live_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "liveId": property_data.get("liveId"),
             "streamName": property_data.get("streamName")
         }
-    except Exception as e:
-        logger.error(f"解析直播任务失败: {str(e)}, 任务数据: {str(card)[:200]}")
+    except Exception:
+        # Card payloads contain job tokens and may include full question/content
+        # data.  Keep only the stable failure category.
+        logger.error("解析直播任务失败（任务卡片内容与异常已省略）")
         return None
 def _process_read_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """处理阅读类型任务"""
@@ -992,7 +999,7 @@ def _get_question_type(type_code: str) -> str:
     if type_code in type_map:
         return type_map[type_code]
     
-    logger.info(f"未知题型代码 -> {type_code}")
+    logger.info("未知题型代码，题型元数据已省略")
     return "unknown"
 
 

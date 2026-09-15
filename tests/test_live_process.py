@@ -1,9 +1,11 @@
+import threading
 from types import SimpleNamespace
 
 import main
 
 from api.base import StudyResult
 from api.live_process import LiveProcessor
+from api.live_process import StudyCancelled
 
 
 class FakeLive:
@@ -126,3 +128,46 @@ def test_process_job_propagates_live_processor_success(monkeypatch):
     )
 
     assert result is StudyResult.SUCCESS
+
+
+def test_process_job_stops_waiting_for_noncooperative_live_worker_on_cancel(
+    monkeypatch,
+):
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocked_run_live(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(main, "Live", lambda **_kwargs: object())
+    monkeypatch.setattr(main.LiveProcessor, "run_live", blocked_run_live)
+    chaoxing = SimpleNamespace(get_uid=lambda: "uid", session=object())
+    cancel_event = threading.Event()
+    captured = []
+
+    def invoke():
+        try:
+            main.process_job(
+                chaoxing,
+                {"title": "course", "clazzId": "class", "courseId": "course"},
+                {"type": "live", "jobid": "job", "property": {"title": "live"}},
+                {"knowledgeid": "knowledge"},
+                1,
+                config={"cancel_event": cancel_event},
+            )
+        except BaseException as exc:
+            captured.append(exc)
+
+    caller = threading.Thread(target=invoke)
+    caller.start()
+    assert started.wait(timeout=1)
+    cancel_event.set()
+    caller.join(timeout=0.5)
+    release.set()
+    caller.join(timeout=1)
+
+    assert not caller.is_alive()
+    assert len(captured) == 1
+    assert isinstance(captured[0], StudyCancelled)

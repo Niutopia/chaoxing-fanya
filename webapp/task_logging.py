@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import threading
 import weakref
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Callable
 
-from api.logger import logger
+from api.logger import (
+    _normalise_secrets,
+    logger,
+    validate_task_id,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
     from .task_manager import TaskManager
@@ -21,11 +26,21 @@ def run_with_task_context(
     task_id: str,
     target: Callable[..., Any],
     *args: Any,
+    log_secrets: Iterable[Any] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Run ``target`` with a Loguru ``task_id`` context value."""
 
-    with logger.contextualize(task_id=str(task_id)):
+    task_id = validate_task_id(task_id)
+    secrets = _normalise_secrets(log_secrets) if log_secrets is not None else None
+    # The logger patcher consumes ``_log_secrets`` before a record reaches any
+    # sink.  Keeping the values in Loguru's scoped context lets console/file
+    # sinks protect exceptions and direct logger calls from a task, while no
+    # credential-bearing value is serialized as an ``extra`` field.
+    context_values: dict[str, Any] = {"task_id": task_id}
+    if secrets is not None:
+        context_values["_log_secrets"] = secrets
+    with logger.contextualize(**context_values):
         return target(*args, **kwargs)
 
 
@@ -40,11 +55,22 @@ def _sink_is_installed(sink_id: int | None) -> bool:
     return sink_id in handlers
 
 
+def _task_record_filter(record: dict[str, Any]) -> bool:
+    """Filter only records carrying a valid, bounded task identifier."""
+
+    try:
+        validate_task_id(record.get("extra", {}).get("task_id"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _route_record(message: Any) -> None:
     record = getattr(message, "record", {})
     extra = record.get("extra", {}) if isinstance(record, dict) else {}
-    task_id = extra.get("task_id") if isinstance(extra, dict) else None
-    if not task_id:
+    try:
+        task_id = validate_task_id(extra.get("task_id"))
+    except (TypeError, ValueError):
         return
     text = record.get("message", "") if isinstance(record, dict) else ""
     level = record.get("level") if isinstance(record, dict) else None
@@ -62,7 +88,7 @@ def _route_record(message: Any) -> None:
     for manager in managers:
         try:
             entry = manager.append_log(
-                str(task_id),
+                task_id,
                 text,
                 str(level_name).lower(),
                 timestamp=timestamp_value,
@@ -83,7 +109,7 @@ def install_task_log_sink(manager: "TaskManager") -> int:
         if not _sink_is_installed(_SINK_ID):
             _SINK_ID = logger.add(
                 _route_record,
-                filter=lambda record: bool(record["extra"].get("task_id")),
+                filter=_task_record_filter,
                 enqueue=True,
             )
         _MANAGERS.add(manager)
@@ -96,11 +122,21 @@ def remove_task_log_sink(sink_id: int | None = None) -> None:
     global _SINK_ID
     with _SINK_LOCK:
         target = _SINK_ID if sink_id is None else sink_id
-        if target is not None:
-            logger.remove(target)
-        if sink_id is None or sink_id == _SINK_ID:
+        if target is None:
+            return
+        should_clear = sink_id is None or sink_id == _SINK_ID
+        if should_clear:
             _SINK_ID = None
             _MANAGERS.clear()
+    # ``logger.remove`` waits for an enqueue=True sink to drain.  Never hold
+    # the routing lock while waiting: the sink callback itself acquires that
+    # lock to append its record, otherwise teardown can deadlock forever.
+    try:
+        logger.remove(target)
+    except Exception:
+        # Teardown is best effort; a sink may already have been removed by a
+        # test fixture or by an embedding application's logger lifecycle.
+        return
 
 
 def unregister_task_log_sink(manager: "TaskManager") -> None:
@@ -117,9 +153,13 @@ def unregister_task_log_sink(manager: "TaskManager") -> None:
         _MANAGERS.discard(manager)
         if _MANAGERS:
             return
-        if _SINK_ID is not None:
-            logger.remove(_SINK_ID)
+        target = _SINK_ID
         _SINK_ID = None
+    if target is not None:
+        try:
+            logger.remove(target)
+        except Exception:
+            return
 
 
 __all__ = [

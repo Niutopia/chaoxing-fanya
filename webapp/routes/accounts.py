@@ -8,6 +8,7 @@ from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
+from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -315,9 +316,38 @@ def _ocr_endpoint(config: Any) -> str | None:
         if compact in _OCR_ENDPOINT_KEYS and isinstance(value, str):
             candidate = value.strip()
             if candidate:
-                # A trailing slash does not identify a different OCR service.
-                return candidate.rstrip("/")
+                return _normalize_ocr_endpoint(candidate)
     return None
+
+
+def _normalize_ocr_endpoint(endpoint: str) -> str:
+    """Validate a custom OCR URL while preserving local-network services."""
+
+    if not isinstance(endpoint, str):
+        raise ValueError("invalid OCR endpoint")
+    candidate = endpoint.strip()
+    if not candidate or candidate != endpoint or any(
+        character.isspace() for character in candidate
+    ):
+        raise ValueError("invalid OCR endpoint")
+    try:
+        parsed = urlsplit(candidate)
+        # Accessing ``port`` is itself validation for malformed values.
+        parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("invalid OCR endpoint") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid OCR endpoint")
+    # A trailing slash does not identify a different OCR service.
+    return candidate.rstrip("/")
 
 
 def _ocr_key_is_explicit(config: Any) -> bool:
@@ -553,6 +583,7 @@ def _preferences_payload(
     try:
         validate_config_shape(notification, field_name="notification_config")
         validate_config_shape(ocr, field_name="ocr_config")
+        _ocr_endpoint(ocr)
     except (TypeError, ValueError):
         raise ValueError("invalid preference config") from None
 

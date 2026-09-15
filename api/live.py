@@ -93,8 +93,8 @@ class Live:
             )
             response.raise_for_status()
             return True
-        except Exception as exc:
-            logger.error(f"建立直播观看会话失败: {exc}")
+        except Exception:
+            logger.error("建立直播观看会话失败（异常内容已省略）")
             return False
 
     def do_finish(self):
@@ -133,8 +133,8 @@ class Live:
             success = response.text.strip() == "@success"
             logger.debug("直播时长提交成功" if success else "直播时长提交被服务器拒绝")
             return success
-        except Exception as exc:
-            logger.error(f"提交直播时长失败: {exc}")
+        except Exception:
+            logger.error("提交直播时长失败（异常内容已省略）")
             return False
 
     def get_status(self) -> dict|None:
@@ -167,6 +167,6 @@ class Live:
             )
             response.raise_for_status()
             return json.loads(response.text)  # 返回包含总时长的状态字典
-        except Exception as exc:
-            logger.error(f"获取直播状态失败: {exc}")
+        except Exception:
+            logger.error("获取直播状态失败（异常内容已省略）")
             return None

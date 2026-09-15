@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import pytest
 
 from webapp import create_app
+from webapp.limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from webapp.models import AccountPreferences
 from webapp.task_manager import TaskManager
 
@@ -139,6 +140,25 @@ def test_missing_courses_and_invalid_cursor_are_rejected(client, prepared_accoun
     bad_cursor = client.get(f"/api/tasks/{running_task}/logs?after=not-a-number")
     assert bad_cursor.status_code == 400
     assert bad_cursor.get_json()["code"] == "invalid_cursor"
+
+
+@pytest.mark.parametrize(
+    "course_ids",
+    [
+        ["course"] * (MAX_SELECTED_COURSE_IDS + 1),
+        ["x" * (MAX_COURSE_ID_LENGTH + 1)],
+    ],
+)
+def test_start_rejects_oversized_explicit_course_selection(
+    client, prepared_account, course_ids
+):
+    response = client.post(
+        f"/api/accounts/{prepared_account.id}/tasks",
+        json={"course_ids": course_ids},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_courses"
 
 
 def test_cancel_is_idempotent_and_unknown_task_is_404(client, running_task):

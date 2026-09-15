@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 import configparser
+import contextvars
 import enum
 from functools import partial
 import sys
@@ -91,7 +92,7 @@ def _notify_callback(
             raise
         # Monitoring is best effort.  The task runner itself owns the public
         # error boundary, so callback diagnostics stay in debug logs.
-        logger.debug("callback {} failed: {}", name, exc)
+        logger.debug("任务监控回调失败（异常内容已省略）")
 
 
 def _normalise_points(value: Any) -> list[dict[str, Any]]:
@@ -222,7 +223,7 @@ def run_with_task_context(
 
     from webapp.task_logging import run_with_task_context as _run_with_task_context
 
-    return _run_with_task_context(str(task_id), target, *args, **kwargs)
+    return _run_with_task_context(task_id, target, *args, **kwargs)
 
 
 def _run_worker_with_context(
@@ -241,13 +242,16 @@ def _run_worker_with_context(
 
     task_id = worker_context.get("task_id") if worker_context else None
     ocr_config = worker_context.get("ocr_config") if worker_context else None
+    log_secrets = worker_context.get("_log_secrets") if worker_context else None
 
     def invoke():
         with vision_ocr_context(ocr_config):
             return target(*args, **kwargs)
 
-    if task_id:
-        return run_with_task_context(str(task_id), invoke)
+    if task_id is not None:
+        if log_secrets is None:
+            return run_with_task_context(task_id, invoke)
+        return run_with_task_context(task_id, invoke, log_secrets=log_secrets)
     return invoke()
 
 
@@ -261,8 +265,7 @@ def log_error(func):
             # safe boundary without emitting an error traceback per thread.
             raise
         except BaseException as e:
-            logger.error(f"Error in thread {threading.current_thread().name}: {e}")
-            traceback.print_exception(type(e), e, e.__traceback__)
+            logger.error("线程工作失败（异常内容已省略）")
             raise
 
     return wrapper
@@ -475,7 +478,7 @@ def process_job(
     raise_if_cancelled(config)
     # 视频任务
     if job["type"] == "video":
-        logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        logger.trace("识别到视频任务")
         # 超星的接口没有返回当前任务是否为Audio音频任务
         video_result = chaoxing.study_video(
             course, job, job_info, _speed=speed, _type="Video",
@@ -493,30 +496,30 @@ def process_job(
             raise_if_cancelled(config)
         if video_result.is_failure():
             logger.warning(
-                f"出现异常任务 -> 任务章节: {course['title']} 任务ID: {job['jobid']}, 已跳过"
+                "视频任务处理失败，已跳过（任务元数据已省略）"
             )
         return video_result
     # 文档任务
     elif job["type"] == "document":
-        logger.trace(f"识别到文档任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        logger.trace("识别到文档任务")
         result = chaoxing.study_document(course, job)
         raise_if_cancelled(config)
         return result
     # 测验任务
     elif job["type"] == "workid":
-        logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
+        logger.trace("识别到章节检测任务")
         result = chaoxing.study_work(course, job, job_info)
         raise_if_cancelled(config)
         return result
     # 阅读任务
     elif job["type"] == "read":
-        logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
+        logger.trace("识别到阅读任务")
         result = chaoxing.study_read(course, job, job_info)
         raise_if_cancelled(config)
         return result
     # 直播任务
     elif job["type"] == "live":
-        logger.trace(f"识别到直播任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
+        logger.trace("识别到直播任务")
         try:
             raise_if_cancelled(config)
             # 准备直播所需参数
@@ -559,18 +562,24 @@ def process_job(
 
             thread = threading.Thread(target=run_live_and_capture, daemon=True)
             thread.start()
-            thread.join()  # 等待直播处理完成
+            # The live worker normally observes the same cancel event itself,
+            # but a socket/client implementation may block until its timeout.
+            # Poll the join so the owning Web task can become stopped promptly
+            # instead of waiting indefinitely for a non-cooperative worker.
+            while thread.is_alive():
+                thread.join(timeout=0.1)
+                raise_if_cancelled(config)
             if live_error:
                 raise live_error[0]
             raise_if_cancelled(config)
             return StudyResult.SUCCESS if live_result == [True] else StudyResult.ERROR
         except StudyCancelled:
             raise
-        except Exception as e:
-            logger.error(f"处理直播任务时出错: {str(e)}")
+        except Exception:
+            logger.error("处理直播任务失败（异常内容已省略）")
             return StudyResult.ERROR
 
-    logger.error(f"未知任务类型: {job['type']}")
+    logger.error("未知任务类型（任务元数据已省略）")
     return StudyResult.ERROR
 
 
@@ -627,17 +636,19 @@ class JobProcessor:
             self.task_queue.put(task)
 
         for i in range(self.worker_num):
+            worker_context = contextvars.copy_context()
             thread = threading.Thread(
-                target=_run_worker_with_context,
-                args=(self.config, self.worker_thread),
+                target=worker_context.run,
+                args=(_run_worker_with_context, self.config, self.worker_thread),
                 daemon=True,
             )
             self.threads.append(thread)
             thread.start()
 
+        retry_context = contextvars.copy_context()
         self.retry_thread_handle = threading.Thread(
-            target=_run_worker_with_context,
-            args=(self.config, self.retry_thread),
+            target=retry_context.run,
+            args=(_run_worker_with_context, self.config, self.retry_thread),
             daemon=True,
         )
         self.retry_thread_handle.start()
@@ -727,15 +738,15 @@ class JobProcessor:
 
                 match task.result:
                     case ChapterResult.SUCCESS:
-                        logger.debug("Task success: {}", task.point["title"])
+                        logger.debug("章节任务完成")
                         self.task_queue.task_done()
                         task_finished = True
-                        logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
+                        logger.debug("章节任务队列状态已更新")
 
                     case ChapterResult.NOT_OPEN:
                         # task.tries += 1
                         if self.config["notopen_action"] == "continue":
-                            logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                            logger.warning("章节未开启，正在跳过")
                             self.task_queue.task_done()
                             task_finished = True
                             continue
@@ -744,7 +755,7 @@ class JobProcessor:
                             logger.error(
                                 "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                                 "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
-                            , task.point["title"])
+                            )
                             self.task_queue.task_done()
                             task_finished = True
                             continue
@@ -754,10 +765,13 @@ class JobProcessor:
 
                     case ChapterResult.ERROR:
                         task.tries += 1
-                        logger.warning("Retrying task {} ({}/{} attempts)", task.point["title"], task.tries,
-                                       self.max_tries)
+                        logger.warning(
+                            "章节任务失败，正在重试（第{}次，共{}次）",
+                            task.tries,
+                            self.max_tries,
+                        )
                         if task.tries >= self.max_tries:
-                            logger.error("Max retries reached for task: {}", task.point["title"])
+                            logger.error("章节任务达到最大重试次数")
                             self.failed_tasks.append(task)
                             self.task_queue.task_done()
                             task_finished = True
@@ -765,7 +779,7 @@ class JobProcessor:
                         self.retry_queue.put(task)
 
                     case _:
-                        logger.error("Invalid task state {} for task {}", task.result, task.point["title"])
+                        logger.error("章节任务状态无效（任务元数据已省略）")
                         self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         task_finished = True
@@ -832,7 +846,7 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     则回调通知外部（如 Web 端）更新进度统计。
     """
     raise_if_cancelled(config)
-    logger.info(f'当前章节: {point.get("title", point.get("name", ""))}')
+    logger.info("开始处理章节任务")
 
     # 通知外部当前章节开始（用于前端显示当前正在学习的章节）
     if config is not None:
@@ -842,11 +856,11 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                 start_cb(course, point)
             except StudyCancelled:
                 raise
-            except Exception as e:
-                logger.debug(f"调用 chapter_start_callback 时出错: {e}")
+            except Exception:
+                logger.debug("章节监控回调失败（异常内容已省略）")
     raise_if_cancelled(config)
     if point.get("has_finished", False):
-        logger.info(f'章节：{point.get("title", point.get("name", ""))} 已完成所有任务点')
+        logger.info("章节已完成所有任务点")
         # 已经在超星端标记为完成的章节，这里直接视为成功并同步监控器。
         _notify_callback(config, "chapter_done_callback", course, point)
         return ChapterResult.SUCCESS
@@ -898,9 +912,16 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             _notify_callback(config, "job_done_callback", course, point, job, result)
             return result
 
-        for result in executor.map(process_one_job, jobs):
+        # ThreadPoolExecutor workers do not inherit contextvars.  Capture a
+        # fresh context for every submission so task_id/scoped secrets stay
+        # isolated when two Web tasks run at the same time.
+        futures = [
+            executor.submit(contextvars.copy_context().run, process_one_job, job)
+            for job in jobs
+        ]
+        for future in futures:
             raise_if_cancelled(config)
-            job_results.append(result)
+            job_results.append(future.result())
     
     for result in job_results:
         if result.is_failure():
@@ -915,8 +936,8 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                 callback(course, point)
             except StudyCancelled:
                 raise
-            except Exception as e:
-                logger.debug(f"调用 chapter_done_callback 时出错: {e}")
+            except Exception:
+                logger.debug("章节监控回调失败（异常内容已省略）")
 
     return ChapterResult.SUCCESS
 
@@ -925,7 +946,7 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """处理单个课程"""
     raise_if_cancelled(config)
-    logger.info(f"开始学习课程: {course['title']}")
+    logger.info("开始处理课程任务")
     
     # 获取当前课程的所有章节
     point_list = chaoxing.get_course_point(
@@ -966,7 +987,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """
     while __point_index < len(point_list["points"]):
         point = point_list["points"][__point_index]
-        logger.debug(f"当前章节 __point_index: {__point_index}")
+        logger.debug("当前章节索引已更新")
         
         result, auto_skip_notopen = process_chapter(
             chaoxing, course, point, RB, notopen_action, speed, auto_skip_notopen
@@ -1055,7 +1076,7 @@ def main():
         course_task = filter_courses(all_course, common_config.get("course_list"))
         
         # 开始学习
-        logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+        logger.info("课程列表过滤完毕")
         for course in course_task:
             process_course(chaoxing, course, common_config)
         
@@ -1064,18 +1085,17 @@ def main():
         
     except SystemExit as e:
         if e.code != 0:
-            logger.error(f"错误: 程序异常退出, 返回码: {e.code}")
+            logger.error("程序异常退出（返回码已省略）")
         sys.exit(e.code)
-    except KeyboardInterrupt as e:
-        logger.error(f"错误: 程序被用户手动中断, {e}")
-    except BaseException as e:
-        logger.error(f"错误: {type(e).__name__}: {e}")
-        logger.error(traceback.format_exc())
+    except KeyboardInterrupt:
+        logger.error("程序被用户手动中断")
+    except BaseException:
+        logger.error("程序异常退出（异常内容已省略）")
         try:
-            notification.send(f"chaoxing : 出现错误 {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            notification.send("chaoxing : 程序异常退出（异常内容已省略）")
         except Exception:
             pass  # 如果通知发送失败，忽略异常
-        raise e
+        raise
 
 
 if __name__ == "__main__":
