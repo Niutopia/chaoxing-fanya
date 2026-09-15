@@ -14,6 +14,7 @@ from webapp.task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
     TaskManager,
+    _secret_values,
 )
 
 
@@ -396,6 +397,11 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
     chat_id = "telegram-chat-id-secret"
     token = "provider-token-secret"
     nested_alias = "nested-secret-alias"
+    push_key = "provider-push-key-value"
+    app_key = "provider-app-key-value"
+    auth = "provider-auth-value"
+    sign = "provider-sign-value"
+    signature = "provider-signature-value"
 
     class FailureRunner:
         def run(self, context):
@@ -408,10 +414,14 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
                 {"job": {"chat_id": chat_id, "nested": {"token": token}}}
             )
             context.reporter.append_log(
-                f"notify {notification_url} {chat_id} {token} {nested_alias}"
+                "notify "
+                f"{notification_url} {chat_id} {token} {nested_alias} "
+                f"{push_key} {app_key} {auth} {sign} {signature}"
             )
             raise RuntimeError(
-                f"notification failed: {notification_url} {chat_id} {token} {nested_alias}"
+                "notification failed: "
+                f"{notification_url} {chat_id} {token} {nested_alias} "
+                f"{push_key} {app_key} {auth} {sign} {signature}"
             )
 
     values = task_inputs("notification-account")
@@ -421,6 +431,11 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
             "provider": "Telegram",
             "url": notification_url,
             "tg_chat_id": chat_id,
+            "push_key": push_key,
+            "app_key": app_key,
+            "auth": auth,
+            "sign": sign,
+            "signature": signature,
             "nested": {"token": token, "secret_alias": nested_alias},
         },
     )
@@ -435,8 +450,58 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
             repr(manager.get_logs(task.id).items),
         ]
     )
-    for secret in (notification_url, chat_id, token, nested_alias):
+    for secret in (
+        notification_url,
+        chat_id,
+        token,
+        nested_alias,
+        push_key,
+        app_key,
+        auth,
+        sign,
+        signature,
+    ):
         assert secret not in visible
+
+
+def test_task_manager_collects_provider_specific_config_alias_secrets(task_inputs):
+    values = task_inputs("provider-alias-account")
+    ocr_config = {
+        "appKey": "ocr-app-key-value",
+        "auth": "ocr-auth-value",
+        "sign": "ocr-sign-value",
+        "signature": "ocr-signature-value",
+        "nested": {"push_key": "ocr-push-key-value"},
+    }
+    notification_config = {
+        "push_key": "notification-push-key-value",
+        "app_key": "notification-app-key-value",
+        "auth": "notification-auth-value",
+        "sign": "notification-sign-value",
+        "signature": "notification-signature-value",
+    }
+
+    secrets = _secret_values(
+        values["auth"],
+        values["answer"],
+        ocr_config=ocr_config,
+        notification_config=notification_config,
+    )
+
+    assert set(
+        (
+            "ocr-app-key-value",
+            "ocr-auth-value",
+            "ocr-sign-value",
+            "ocr-signature-value",
+            "ocr-push-key-value",
+            "notification-push-key-value",
+            "notification-app-key-value",
+            "notification-auth-value",
+            "notification-sign-value",
+            "notification-signature-value",
+        )
+    ).issubset(secrets)
 
 
 def test_new_task_keeps_prior_terminal_record_and_owned_state(task_inputs):

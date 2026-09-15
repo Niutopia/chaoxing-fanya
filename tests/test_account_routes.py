@@ -246,6 +246,7 @@ def test_preferences_response_redacts_nested_notification_and_ocr_secrets(
         notification_chat,
         ocr_key,
         ocr_authorization,
+        "http://ocr.example.invalid/v1",
         "nested-ocr-secret",
     ):
         assert secret not in body_text
@@ -253,8 +254,114 @@ def test_preferences_response_redacts_nested_notification_and_ocr_secrets(
     assert body["data"]["notification_config"]["has_url"] is True
     assert body["data"]["notification_config"]["has_tg_chat_id"] is True
     assert body["data"]["ocr_config"]["has_api_key"] is True
-    assert body["data"]["ocr_config"]["endpoint"] == "http://ocr.example.invalid/v1"
+    assert body["data"]["ocr_config"]["has_endpoint"] is True
     assert "fingerprint" not in body["data"]
+
+
+def test_preferences_responses_redact_provider_aliases_for_all_write_methods(
+    client, store, saved_account
+):
+    secrets = {
+        "notification-push-key-secret",
+        "notification-app-key-secret",
+        "notification-auth-secret",
+        "notification-sign-secret",
+        "notification-signature-secret",
+        "nested-notification-app-key-secret",
+        "nested-notification-auth-secret",
+        "nested-notification-sign-secret",
+        "nested-notification-signature-secret",
+        "ocr-app-key-secret",
+        "nested-ocr-auth-secret",
+        "nested-ocr-sign-secret",
+        "nested-ocr-signature-secret",
+        "nested-ocr-push-key-secret",
+    }
+    store.save_preferences(
+        saved_account.id,
+        AccountPreferences(
+            notification_config={
+                "provider": "custom",
+                "display_name": "Primary notifications",
+                "enabled": True,
+                "auth_mode": "header",
+                "token_count": 2,
+                "key_id": "notification-key-id",
+                "push_key": "notification-push-key-secret",
+                "app_key": "notification-app-key-secret",
+                "auth": "notification-auth-secret",
+                "sign": "notification-sign-secret",
+                "signature": "notification-signature-secret",
+                "nested": {
+                    "app_key": "nested-notification-app-key-secret",
+                    "auth": "nested-notification-auth-secret",
+                    "sign": "nested-notification-sign-secret",
+                    "signature": "nested-notification-signature-secret",
+                },
+            },
+            ocr_config={
+                "provider": "custom",
+                "display_name": "Primary OCR",
+                "model": "ocr-display-model",
+                "auth_mode": "api",
+                "app_key": "ocr-app-key-secret",
+                "nested": {
+                    "auth": "nested-ocr-auth-secret",
+                    "sign": "nested-ocr-sign-secret",
+                    "signature": "nested-ocr-signature-secret",
+                    "credentials": {
+                        "push_key": "nested-ocr-push-key-secret"
+                    },
+                },
+            },
+        ),
+    )
+
+    responses = [
+        client.get(f"/api/accounts/{saved_account.id}/preferences"),
+        client.put(
+            f"/api/accounts/{saved_account.id}/preferences",
+            json={
+                "notification_config": {"display_name": "PUT notifications"},
+                "ocr_config": {"display_name": "PUT OCR"},
+            },
+        ),
+        client.patch(
+            f"/api/accounts/{saved_account.id}/preferences",
+            json={
+                "notification_config": {"enabled": False},
+                "ocr_config": {"provider": "custom"},
+            },
+        ),
+    ]
+
+    for response in responses:
+        assert response.status_code == 200
+        body = response.get_json()
+        body_text = response.get_data(as_text=True)
+        assert body["data"]["notification_config"]["display_name"] in {
+            "Primary notifications",
+            "PUT notifications",
+        }
+        assert body["data"]["ocr_config"]["display_name"] in {
+            "Primary OCR",
+            "PUT OCR",
+        }
+        assert body["data"]["notification_config"]["auth_mode"] == "header"
+        assert body["data"]["notification_config"]["token_count"] == 2
+        assert body["data"]["notification_config"]["key_id"] == "notification-key-id"
+        assert body["data"]["ocr_config"]["model"] == "ocr-display-model"
+        for secret in secrets:
+            assert secret not in body_text
+
+    stored = store.get_preferences(saved_account.id)
+    assert stored.notification_config["push_key"] == "notification-push-key-secret"
+    assert stored.notification_config["app_key"] == "notification-app-key-secret"
+    assert stored.notification_config["auth"] == "notification-auth-secret"
+    assert stored.notification_config["sign"] == "notification-sign-secret"
+    assert stored.notification_config["signature"] == "notification-signature-secret"
+    assert stored.ocr_config["app_key"] == "ocr-app-key-secret"
+    assert stored.ocr_config["nested"]["auth"] == "nested-ocr-auth-secret"
 
 
 def test_partial_preferences_preserve_omitted_and_blank_advanced_secrets(

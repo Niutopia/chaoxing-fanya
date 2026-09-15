@@ -11,7 +11,6 @@ public snapshot, details object, or log entry.
 from __future__ import annotations
 
 import copy
-import re
 import threading
 import time
 import uuid
@@ -30,6 +29,7 @@ from api.logger import (
 )
 
 from .limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
+from .config_security import is_sensitive_config_key
 from .models import (
     AccountAuth,
     AccountPreferences,
@@ -154,31 +154,25 @@ def _config_secret_values(config: Any) -> list[str]:
     """Collect secret-bearing values from an account-owned config mapping."""
 
     values: list[str] = []
-    if isinstance(config, Mapping):
-        for key, value in config.items():
-            key_name = str(key).strip().lower().replace("-", "_")
-            is_secret_key = (
-                key_name in {
-                    "key",
-                    "api_key",
-                    "apikey",
-                    "access_key",
-                    "access_token",
-                    "token",
-                    "secret",
-                    "authorization",
-                }
-                or key_name.endswith(("_key", "_token", "_secret"))
-                or any(marker in key_name for marker in ("api_key", "secret", "token"))
-            )
-            if is_secret_key and not isinstance(value, (Mapping, list, tuple, set)):
-                if value:
-                    values.append(str(value))
-            else:
-                values.extend(_config_secret_values(value))
-    elif isinstance(config, (list, tuple, set)):
-        for item in config:
-            values.extend(_config_secret_values(item))
+
+    def walk(value: Any, secret_scope: bool = False) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                child_secret_scope = secret_scope or is_sensitive_config_key(
+                    key, include_destinations=True
+                )
+                if child_secret_scope and not isinstance(
+                    item, (Mapping, list, tuple, set)
+                ):
+                    if item is not None and item != "":
+                        values.append(str(item))
+                else:
+                    walk(item, child_secret_scope)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk(item, secret_scope)
+
+    walk(config)
     return values
 
 
@@ -193,42 +187,7 @@ def _notification_secret_values(config: Any) -> list[str]:
     arbitrary notification payloads.
     """
 
-    values: list[str] = []
-
-    def walk(value: Any, secret_scope: bool = False) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                normalized = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower())
-                compact = normalized.replace("_", "")
-                is_secret_key = (
-                    "url" in compact
-                    or "uri" in compact
-                    or "endpoint" in compact
-                    or "webhook" in compact
-                    or "token" in compact
-                    or "secret" in compact
-                    or "apikey" in compact
-                    or "accesskey" in compact
-                    or "key" in compact
-                    or "authorization" in compact
-                    or "password" in compact
-                    or "credential" in compact
-                    or "chat" in compact
-                )
-                child_secret_scope = secret_scope or is_secret_key
-                if child_secret_scope and not isinstance(
-                    item, (Mapping, list, tuple, set)
-                ):
-                    if item is not None and item != "":
-                        values.append(str(item))
-                else:
-                    walk(item, child_secret_scope)
-        elif isinstance(value, (list, tuple, set)):
-            for item in value:
-                walk(item, secret_scope)
-
-    walk(config)
-    return values
+    return _config_secret_values(config)
 
 
 def _secret_values(

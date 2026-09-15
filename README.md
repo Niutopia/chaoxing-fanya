@@ -15,16 +15,16 @@
   </a>
 </p>
 
-> 基于 [Samueli924/chaoxing](https://github.com/Samueli924/chaoxing) 二次开发：补全 Web 可视化、OCR、题库、外部通知与便携打包能力，向原作者致敬。
+> 基于 [Samueli924/chaoxing](https://github.com/Samueli924/chaoxing) 二次开发：补全 Web 核心流程可视化、后端 OCR/题库兼容能力、CLI 外部通知与便携打包能力，向原作者致敬。
 
 ## 功能亮点
 
-- **可视化覆盖 100% 功能**：React + TailwindCSS 前端，桌面/移动自适应，实时日志与进度
+- **Web 核心流程可视化**：React + TailwindCSS 前端，桌面/移动自适应，实时日志与进度
 - **一键上手**：Windows `start.bat` 检查依赖后即启动前后端；支持 Docker 与便携打包
 - **题库全家桶**：Yanxi / LIKE / TikuAdapter / AI / SiliconFlow，可调覆盖率与自动提交
-- **OCR 多方案**：内置 PaddleOCR 或外部大模型（OpenAI / Claude / Qwen / SiliconFlow 等）
-- **通知渠道**：Server酱 / Qmsg / Bark / Telegram 等完成 & 错误推送
-- **CLI 同步**：命令行模式与 Web 功能一致，便于集成与自动化
+- **OCR 多方案（后端兼容）**：内置 PaddleOCR 或外部大模型（OpenAI / Claude / Qwen / SiliconFlow 等）；Web 运行链可读取兼容配置，但当前 Web UI 不提供账户级 OCR 控件
+- **通知渠道（CLI）**：Server酱 / Qmsg / Bark / Telegram 等完成 & 错误推送；Web 账户通知配置接口仅为 legacy/deprecated 兼容保留，不参与 Web 执行
+- **CLI 与 Web 核心流程**：命令行适合通知和自动化，Web 适合账户、课程与任务监控
 
 ## 快速开始（推荐一键）
 
@@ -296,8 +296,9 @@ python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|conti
 - **登录**：支持账号密码或 cookies.txt（同后端配置说明）
 - **题库 `[tiku]`**：`provider=Yanxi|Like|TikuAdapter|AI|SiliconFlow`；`cover_rate=0.0-1.0`；`submit=true|false`
 - **未开放任务处理 `[common]`**：`notopen_action=retry|ask|continue`（命令行可用 `-a/--notopen-action` 覆盖）
-- **通知 `[notify]`**：`provider=ServerChan|Qmsg|Bark|Telegram`，按注释填写 `url` / `token` / `chat_id` 等
+- **通知 `[notify]`**（CLI）：`provider=ServerChan|Qmsg|Bark|Telegram`，按注释填写 `url` / `token` / `chat_id` 等。Web 的账户 `notification_config` 仅作为 legacy/deprecated 数据库/API 兼容字段保留，当前 Web 执行路径不可达，也不会自动推送
 - **OCR**：
+  - Web 运行链仍兼容读取后端保存的 `ocr_config`，用于任务执行；当前 Web UI 没有账户级 OCR 配置控件
   - 本地 PaddleOCR：安装 `paddlepaddle`、`paddlex`，并设置 `CHAOXING_ENABLE_OCR=1`
   - 外部大模型（推荐）：
     ```bash
@@ -313,9 +314,9 @@ python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|conti
 
 1) 登录：手机号+密码或上传 cookies  
 2) 选课：多选或默认全部课程  
-3) 配置：倍速、并发、题库、通知、OCR  
+3) 配置：账户工作台设置倍速、并发等学习参数；在“全局设置”配置共享答题连接和运行限制
 4) 开始：一键启动任务，实时查看进度/日志  
-5) 监控：完成/异常自动推送（如启用通知）
+5) 监控：在 Web 中查看实时进度和日志；完成/异常通知请使用 CLI 的 `[notify]` 配置
 
 ## 目录速览
 
