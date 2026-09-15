@@ -18,8 +18,19 @@ if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
 
 
 _SINK_LOCK = threading.RLock()
+# ``logger.complete()`` waits for Loguru's enqueue worker.  Serializing drains
+# keeps concurrent fast workers from contending in Loguru's private handler
+# bookkeeping, while deliberately using a different lock from ``_SINK_LOCK``
+# so a sink callback can always publish its manager snapshot during a drain.
+_SINK_COMPLETE_LOCK = threading.Lock()
 _SINK_ID: int | None = None
 _MANAGERS: weakref.WeakSet["TaskManager"] = weakref.WeakSet()
+_MANAGERS_SNAPSHOT: tuple["TaskManager", ...] = ()
+
+
+def _refresh_manager_snapshot_locked() -> None:
+    global _MANAGERS_SNAPSHOT
+    _MANAGERS_SNAPSHOT = tuple(_MANAGERS)
 
 
 def run_with_task_context(
@@ -81,10 +92,12 @@ def _route_record(message: Any) -> None:
     )
 
     # A task ID is globally unique, so exactly one manager should accept the
-    # record.  Iterating a weak set snapshot keeps callbacks safe if app/test
-    # teardown drops a manager while Loguru's enqueue worker is draining.
-    with _SINK_LOCK:
-        managers = tuple(_MANAGERS)
+    # record.  The immutable snapshot is refreshed under ``_SINK_LOCK`` by
+    # install/unregister operations, but read lock-free here.  This is
+    # important because ``logger.complete()`` may be called by code that is
+    # already holding the routing lock; taking the same lock in this callback
+    # would deadlock the enqueue worker while the caller waits for it.
+    managers = _MANAGERS_SNAPSHOT
     for manager in managers:
         try:
             entry = manager.append_log(
@@ -92,6 +105,7 @@ def _route_record(message: Any) -> None:
                 text,
                 str(level_name).lower(),
                 timestamp=timestamp_value,
+                _event_time=timestamp_value,
             )
         except Exception:
             # Logging must remain best-effort.  In particular, a manager may
@@ -113,6 +127,7 @@ def install_task_log_sink(manager: "TaskManager") -> int:
                 enqueue=True,
             )
         _MANAGERS.add(manager)
+        _refresh_manager_snapshot_locked()
         return _SINK_ID
 
 
@@ -128,6 +143,7 @@ def remove_task_log_sink(sink_id: int | None = None) -> None:
         if should_clear:
             _SINK_ID = None
             _MANAGERS.clear()
+            _refresh_manager_snapshot_locked()
     # ``logger.remove`` waits for an enqueue=True sink to drain.  Never hold
     # the routing lock while waiting: the sink callback itself acquires that
     # lock to append its record, otherwise teardown can deadlock forever.
@@ -151,6 +167,7 @@ def unregister_task_log_sink(manager: "TaskManager") -> None:
     global _SINK_ID
     with _SINK_LOCK:
         _MANAGERS.discard(manager)
+        _refresh_manager_snapshot_locked()
         if _MANAGERS:
             return
         target = _SINK_ID
@@ -162,9 +179,34 @@ def unregister_task_log_sink(manager: "TaskManager") -> None:
             return
 
 
+def complete_task_log_sink() -> None:
+    """Drain queued task records without holding the routing lock.
+
+    The returned awaitable from :func:`loguru.logger.complete` is only needed
+    for coroutine sinks.  Its synchronous portion drains every
+    ``enqueue=True`` handler, which is the part required for task monitor
+    records.  A separate lock prevents a hundred workers finishing together
+    from repeatedly entering Loguru's handler core while still allowing the
+    callback itself to take the manager lock.
+    """
+
+    with _SINK_LOCK:
+        if _SINK_ID is None:
+            return
+    with _SINK_COMPLETE_LOCK:
+        try:
+            logger.complete()
+        except Exception:
+            # A host application may remove/reconfigure Loguru handlers while
+            # a worker is unwinding.  The timestamp cutoff remains the
+            # correctness boundary even if this best-effort drain fails.
+            return
+
+
 __all__ = [
     "install_task_log_sink",
     "remove_task_log_sink",
     "unregister_task_log_sink",
+    "complete_task_log_sink",
     "run_with_task_context",
 ]

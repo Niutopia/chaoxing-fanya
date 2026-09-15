@@ -28,7 +28,13 @@ from api.logger import (
     validate_task_id,
 )
 
-from .limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
+from .limits import (
+    MAX_CONFIG_DEPTH,
+    MAX_CONFIG_LIST_LENGTH,
+    MAX_CONFIG_NODES,
+    MAX_COURSE_ID_LENGTH,
+    MAX_SELECTED_COURSE_IDS,
+)
 from .config_security import is_sensitive_config_key
 from .models import (
     AccountAuth,
@@ -154,23 +160,75 @@ def _config_secret_values(config: Any) -> list[str]:
     """Collect secret-bearing values from an account-owned config mapping."""
 
     values: list[str] = []
+    # ``validate_config_shape`` normally rejects cycles and oversized input at
+    # the account boundary, but task contexts can also be built directly by
+    # integrations/tests.  Keep this collector independently bounded so a
+    # hostile provider mapping cannot recurse forever or consume unbounded
+    # memory while a worker is starting.
+    visited: set[int] = set()
+    nodes = 0
 
-    def walk(value: Any, secret_scope: bool = False) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                child_secret_scope = secret_scope or is_sensitive_config_key(
-                    key, include_destinations=True
-                )
-                if child_secret_scope and not isinstance(
-                    item, (Mapping, list, tuple, set)
-                ):
-                    if item is not None and item != "":
-                        values.append(str(item))
+    def walk(value: Any, secret_scope: bool = False, depth: int = 0) -> None:
+        nonlocal nodes
+        if depth > MAX_CONFIG_DEPTH or nodes >= MAX_CONFIG_NODES:
+            return
+        container = isinstance(value, Mapping) or isinstance(
+            value, (list, tuple, set, frozenset)
+        )
+        if not container:
+            nodes += 1
+            if not secret_scope or not isinstance(value, (str, int, float, bool)):
+                return
+            if value == "":
+                return
+            try:
+                values.append(str(value))
+            except BaseException:
+                return
+            return
+        if container:
+            marker = id(value)
+            # Track only the active path, not every object ever seen.  A
+            # shared alias can occur once below a sensitive key and once below
+            # a normal key; rescanning that alias is necessary to collect the
+            # sensitive path without sacrificing cycle protection.
+            if marker in visited:
+                return
+            visited.add(marker)
+            nodes += 1
+            try:
+                if isinstance(value, Mapping):
+                    try:
+                        iterator = iter(value.items())
+                    except BaseException:
+                        return
+                    for index, pair in enumerate(iterator):
+                        if index >= MAX_CONFIG_LIST_LENGTH or nodes >= MAX_CONFIG_NODES:
+                            break
+                        try:
+                            key, item = pair
+                        except (TypeError, ValueError):
+                            continue
+                        try:
+                            child_secret_scope = secret_scope or is_sensitive_config_key(
+                                key, include_destinations=True
+                            )
+                        except BaseException:
+                            child_secret_scope = secret_scope
+                        walk(item, child_secret_scope, depth + 1)
                 else:
-                    walk(item, child_secret_scope)
-        elif isinstance(value, (list, tuple, set)):
-            for item in value:
-                walk(item, secret_scope)
+                    try:
+                        iterator = iter(value)
+                    except BaseException:
+                        return
+                    for index, item in enumerate(iterator):
+                        if index >= MAX_CONFIG_LIST_LENGTH or nodes >= MAX_CONFIG_NODES:
+                            break
+                        walk(item, secret_scope, depth + 1)
+            except BaseException:
+                return
+            finally:
+                visited.discard(marker)
 
     walk(config)
     return values
@@ -202,7 +260,9 @@ def _secret_values(
         values.append(str(password))
     cookies = getattr(auth, "cookies", {})
     if isinstance(cookies, Mapping):
-        values.extend(str(item) for item in cookies.values() if item)
+        # Treat the cookie jar as an already-sensitive scope, while retaining
+        # the same cycle/depth/item limits as provider configuration.
+        values.extend(_config_secret_values({"cookies": cookies}))
     api_key = getattr(answer, "api_key", None)
     if api_key:
         values.append(str(api_key))
@@ -310,6 +370,13 @@ class _TaskRuntime:
     next_sequence: int = 0
     slot_released: bool = False
     thread: threading.Thread | None = None
+    # Wall-clock moment at which the worker's terminal state became final.
+    # Enqueued Loguru records carry their own creation timestamp; the sink may
+    # still admit those records after this point, but never records created
+    # later.  This closes the enqueue/terminal transition race without
+    # reopening a task for arbitrary direct ``append_log`` calls.
+    terminal_cutoff: float | None = None
+    record_dirty: bool = False
     # Set while restoring an old record when one or more persisted messages
     # were replaced by the historical safety marker.  It is intentionally
     # internal: API callers only see the cleaned log entries.
@@ -481,6 +548,22 @@ class TaskManager:
         }
 
     @staticmethod
+    def _safe_snapshot_value(value: Any) -> Any:
+        """Return a bounded, detached public monitor value."""
+
+        return sanitize_log_extra(value)
+
+    @classmethod
+    def _safe_snapshot_mapping(cls, value: Any) -> dict[str, Any]:
+        sanitized = cls._safe_snapshot_value(value)
+        return dict(sanitized) if isinstance(sanitized, Mapping) else {}
+
+    @classmethod
+    def _safe_details_mapping(cls, value: Any) -> dict[str, Any]:
+        sanitized = cls._safe_snapshot_value(value)
+        return dict(sanitized) if isinstance(sanitized, Mapping) else {}
+
+    @staticmethod
     def _log_mapping(entry: TaskLogEntry) -> dict[str, Any]:
         return {
             "sequence": int(entry.sequence),
@@ -507,11 +590,14 @@ class TaskManager:
                 self._snapshot_mapping(record.snapshot),
                 self._details_mapping(record.details),
             )
-            return result is not False
+            persisted = result is True
+            record.record_dirty = not persisted
+            return persisted
         except BaseException:
             # Monitoring persistence is best effort.  In particular, an
             # injected store may not have an account row for a direct unit
             # test, while the in-memory task should still run normally.
+            record.record_dirty = True
             return False
 
     def _persist_log_locked(self, task_id: str, entry: TaskLogEntry) -> bool:
@@ -524,7 +610,10 @@ class TaskManager:
                 self._log_mapping(entry),
                 capacity=self.log_capacity,
             )
-            return result is not False
+            # Persistence adapters must explicitly acknowledge a durable
+            # write.  Treating ``None`` as success would silently clear the
+            # retry/dirty path for adapters whose method failed to return.
+            return result is True
         except BaseException:
             return False
 
@@ -540,8 +629,7 @@ class TaskManager:
 
     @staticmethod
     def _restore_details(value: Any) -> TaskDetails:
-        if not isinstance(value, Mapping):
-            value = {}
+        value = TaskManager._safe_details_mapping(value)
         courses = value.get("courses", [])
         if not isinstance(courses, list):
             courses = list(courses) if isinstance(courses, (tuple, set)) else []
@@ -635,6 +723,11 @@ class TaskManager:
         raw_snapshot = payload.get("snapshot")
         if not isinstance(raw_snapshot, Mapping):
             return None
+        # Persistence adapters are an untrusted boundary.  Do this before
+        # reading any nested public field so a custom adapter (or a legacy
+        # SQLite row) cannot reintroduce credentials, cycles, or oversized
+        # structures into the monitor API.
+        raw_snapshot = self._safe_snapshot_mapping(raw_snapshot)
         try:
             task_id = validate_task_id(raw_snapshot.get("id"))
         except (TypeError, ValueError):
@@ -738,9 +831,18 @@ class TaskManager:
             loader = getattr(self.persistence, "load_web_tasks", None)
             if not callable(loader):
                 return
-            payloads = loader(limit=self.terminal_task_capacity)
+            try:
+                payloads = loader(
+                    limit=self.terminal_task_capacity,
+                    log_capacity=self.log_capacity,
+                )
+            except TypeError:
+                # Keep compatibility with small in-memory adapters written
+                # against the original ``limit``-only protocol.
+                payloads = loader(limit=self.terminal_task_capacity)
             payloads = list(payloads)
         except Exception:
+            self._prune_persisted_history()
             return
         with self._lock:
             for payload in payloads:
@@ -755,6 +857,27 @@ class TaskManager:
                         record.logs_dirty = True
                     self._persist_record_locked(record)
             self._trim_terminal_locked()
+        # Loading is intentionally pure-read.  Any rows outside the bounded
+        # monitor history are removed in a separate best-effort operation so a
+        # restart does not leave an ever-growing SQLite log/task table.
+        self._prune_persisted_history()
+
+    def _prune_persisted_history(self) -> bool:
+        """Ask the persistence adapter to trim durable monitor history."""
+
+        if self.persistence is None:
+            return False
+        try:
+            pruner = getattr(self.persistence, "prune_web_tasks", None)
+            if not callable(pruner):
+                return False
+            result = pruner(
+                log_capacity=self.log_capacity,
+                terminal_task_capacity=self.terminal_task_capacity,
+            )
+            return result is True
+        except BaseException:
+            return False
 
     def _persist_dirty_logs_locked(self, record: _TaskRuntime) -> bool:
         """Best-effort historical migration with an honest dirty flag."""
@@ -1009,6 +1132,13 @@ class TaskManager:
                 if normal_return:
                     state = "stopped" if context.cancel_event.is_set() else "completed"
                 self._finish_locked(record, state, error)
+            # Loguru's enqueue worker may still be draining records emitted
+            # immediately before the runner returned.  Drain after releasing
+            # the manager lock: the route callback needs that lock, and taking
+            # it while waiting for ``logger.complete`` would deadlock.
+            from .task_logging import complete_task_log_sink
+
+            complete_task_log_sink()
 
     def _sanitize(self, record: _TaskRuntime, value: Any) -> str:
         text = sanitize_log_message(
@@ -1020,14 +1150,25 @@ class TaskManager:
 
     @staticmethod
     def _snapshot_copy(snapshot: TaskSnapshot) -> TaskSnapshot:
-        return replace(snapshot, stats=_copy(snapshot.stats))
+        return replace(
+            snapshot,
+            progress=_json_compatible(_copy(snapshot.progress)),
+            total=_json_compatible(_copy(snapshot.total)),
+            current_course=_json_compatible(_copy(snapshot.current_course)),
+            current_chapter=_json_compatible(_copy(snapshot.current_chapter)),
+            current_task=_json_compatible(_copy(snapshot.current_task)),
+            error=sanitize_log_message(snapshot.error, historical=True)
+            if snapshot.error is not None
+            else None,
+            stats=_json_compatible(_copy(snapshot.stats)),
+        )
 
     @staticmethod
     def _details_copy(details: TaskDetails) -> TaskDetails:
         return TaskDetails(
-            courses=_copy(details.courses),
-            active_jobs=_copy(details.active_jobs),
-            counts=_copy(details.counts),
+            courses=_json_compatible(_copy(details.courses)),
+            active_jobs=_json_compatible(_copy(details.active_jobs)),
+            counts=_json_compatible(_copy(details.counts)),
         )
 
     def _finish_locked(
@@ -1038,6 +1179,10 @@ class TaskManager:
     ) -> None:
         if record.done.is_set():
             return
+        # Capture the terminal boundary before changing the public state.  A
+        # late enqueue callback can then distinguish records generated before
+        # return from a genuinely post-terminal logger call.
+        record.terminal_cutoff = time.time()
         record.snapshot = replace(
             record.snapshot,
             state=state,
@@ -1096,6 +1241,11 @@ class TaskManager:
     def wait(self, task_id: str, timeout: float | None = None) -> bool:
         with self._lock:
             record = self._lookup(task_id)
+        # ``done`` is set at the terminal state transition.  Do not turn this
+        # bounded wait into an unbounded Loguru queue drain: a temporarily
+        # blocked sink must not change the timeout contract.  The worker's
+        # post-finalization drain and ``get_logs``'s explicit drain provide the
+        # eventual queue completion independently.
         return record.done.wait(timeout)
 
     def wait_until_started(self, task_id: str, timeout: float | None = None) -> bool:
@@ -1125,11 +1275,17 @@ class TaskManager:
 
     def get_snapshot(self, task_id: str) -> TaskSnapshot:
         with self._lock:
-            return self._snapshot_copy(self._lookup(task_id).snapshot)
+            record = self._lookup(task_id)
+            if record.record_dirty:
+                self._persist_record_locked(record)
+            return self._snapshot_copy(record.snapshot)
 
     def get_details(self, task_id: str) -> TaskDetails:
         with self._lock:
-            return self._details_copy(self._lookup(task_id).details)
+            record = self._lookup(task_id)
+            if record.record_dirty:
+                self._persist_record_locked(record)
+            return self._details_copy(record.details)
 
     def get_context(self, task_id: str) -> StudyRunContext:
         """Return the internal context for deterministic runner integrations."""
@@ -1225,6 +1381,8 @@ class TaskManager:
         message: Any,
         level: str = "info",
         timestamp: Any = None,
+        *,
+        _event_time: Any = None,
     ) -> TaskLogEntry | None:
         """Append one redacted entry, preserving per-task order.
 
@@ -1239,8 +1397,19 @@ class TaskManager:
             except (TypeError, ValueError):
                 return None
             record = self._tasks.get(task_id)
-            if record is None or record.snapshot.state not in {"running", "stopping"}:
+            if record is None:
                 return None
+            if record.snapshot.state not in {"running", "stopping"}:
+                # Only the process-wide Loguru sink may pass an event time.
+                # Public/direct appends have no trustworthy creation marker
+                # and are therefore always rejected after terminalization.
+                event_time = _optional_timestamp(_event_time)
+                if (
+                    event_time is None
+                    or record.terminal_cutoff is None
+                    or event_time > record.terminal_cutoff
+                ):
+                    return None
             record.next_sequence += 1
             entry = TaskLogEntry(
                 sequence=record.next_sequence,
@@ -1267,8 +1436,13 @@ class TaskManager:
             raise ValueError("after cursor must be a non-negative integer")
         if after < 0:
             raise ValueError("after cursor must be a non-negative integer")
+        from .task_logging import complete_task_log_sink
+
+        complete_task_log_sink()
         with self._lock:
             record = self._lookup(task_id)
+            if record.record_dirty:
+                self._persist_record_locked(record)
             self._persist_dirty_logs_locked(record)
             secrets = self._secrets_for(record)
             items: list[TaskLogEntry] = []

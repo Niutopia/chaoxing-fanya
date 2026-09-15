@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from api.logger import (
     sanitize_log_level,
+    sanitize_log_extra,
     sanitize_log_message,
     validate_task_id,
 )
@@ -59,6 +60,11 @@ _ANSWER_SECRET_KEY = "answer_api_key"
 _ANSWER_TEST_STATUS = "_last_test_status"
 _ANSWER_TEST_FINGERPRINT = "_last_test_fingerprint"
 _PREFERENCE_SECRET_PREFIX = "fernet:v1:"
+# Keep the read side bounded even when a legacy database was populated by a
+# caller that bypassed ``save_web_task_log(capacity=...)``.  TaskManager passes
+# its configured value when the adapter supports it; this default preserves
+# the original loader signature for small integrations.
+DEFAULT_WEB_TASK_LOG_CAPACITY = 5_000
 
 
 _SCHEMA = """
@@ -146,6 +152,19 @@ def _json_load(value: str, default: Any) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _sanitize_task_mapping(value: Any) -> dict[str, Any]:
+    """Return a bounded JSON-like monitor mapping with secrets redacted."""
+
+    sanitized = sanitize_log_extra(value)
+    return dict(sanitized) if isinstance(sanitized, Mapping) else {}
+
+
+def _positive_capacity(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
 
 
 def _validate_account_text(value: Any, max_length: int, field_name: str) -> str:
@@ -1157,13 +1176,30 @@ class SQLiteStore:
         decrypted password, cookie, or answer-service key.
         """
 
+        if not isinstance(snapshot, Mapping) or not isinstance(details, Mapping):
+            raise ValueError("snapshot and details must be mappings")
         task_id = validate_task_id(snapshot.get("id", ""))
         account_id = str(snapshot.get("account_id", "")).strip()
         if not account_id:
             raise ValueError("task id and account id are required")
+        # Re-sanitize direct store callers as well as TaskManager's normal
+        # public mapping.  The storage layer cannot assume its caller already
+        # removed a password/cookie/API key, and this sanitizer is bounded and
+        # cycle-safe for in-memory mappings before JSON serialization.
+        safe_snapshot = _sanitize_task_mapping(snapshot)
+        safe_details = _sanitize_task_mapping(details)
+        # Preserve the identifiers validated above even if an unusual account
+        # id happens to match one of the log sanitizer's word patterns.
+        safe_snapshot["id"] = str(task_id)
+        safe_snapshot["account_id"] = account_id
         started_at = snapshot.get("started_at")
         if started_at is not None:
-            started_at = float(started_at)
+            try:
+                started_at = float(started_at)
+            except (TypeError, ValueError, OverflowError):
+                started_at = None
+            if started_at is not None and not math.isfinite(started_at):
+                started_at = None
         with self._connection() as connection:
             connection.execute(
                 """
@@ -1179,8 +1215,8 @@ class SQLiteStore:
                 (
                     task_id,
                     account_id,
-                    _json_dump(dict(snapshot)),
-                    _json_dump(dict(details)),
+                    _json_dump(safe_snapshot),
+                    _json_dump(safe_details),
                     started_at,
                     _utc_now(),
                 ),
@@ -1196,10 +1232,24 @@ class SQLiteStore:
     ) -> bool:
         """Append one task log and retain only the bounded newest entries."""
 
-        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
-            raise ValueError("capacity must be a positive integer")
+        capacity = _positive_capacity(capacity, "capacity")
+        if not isinstance(entry, Mapping):
+            raise ValueError("entry must be a mapping")
         task_id = validate_task_id(task_id)
-        sequence = int(entry["sequence"])
+        sequence = entry.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise ValueError("sequence must be a positive integer")
+        level = sanitize_log_level(entry.get("level", "info"))
+        message = sanitize_log_message(
+            entry.get("message", ""),
+            historical=True,
+        )
+        try:
+            timestamp = float(entry.get("timestamp", time.time()))
+        except (TypeError, ValueError, OverflowError):
+            timestamp = time.time()
+        if not math.isfinite(timestamp):
+            timestamp = time.time()
         with self._connection() as connection:
             connection.execute(
                 """
@@ -1214,12 +1264,9 @@ class SQLiteStore:
                 (
                     str(task_id),
                     sequence,
-                    sanitize_log_level(entry.get("level", "info")),
-                    sanitize_log_message(
-                        entry.get("message", ""),
-                        historical=True,
-                    ),
-                    float(entry.get("timestamp", time.time())),
+                    level,
+                    message,
+                    timestamp,
                 ),
             )
             connection.execute(
@@ -1236,18 +1283,23 @@ class SQLiteStore:
             )
         return True
 
-    def load_web_tasks(self, *, limit: int) -> list[dict[str, Any]]:
+    def load_web_tasks(
+        self,
+        *,
+        limit: int,
+        log_capacity: int = DEFAULT_WEB_TASK_LOG_CAPACITY,
+    ) -> list[dict[str, Any]]:
         """Load newest persisted monitor records with their bounded logs."""
 
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError("limit must be a positive integer")
+        limit = _positive_capacity(limit, "limit")
+        log_capacity = _positive_capacity(log_capacity, "log_capacity")
         # Do not use the mutating connection context here: even setting WAL
         # mode can acquire a write lock, and historical migration must remain
         # an independent best-effort operation owned by TaskManager.
         with self._read_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id, snapshot_json, details_json
+                SELECT id, account_id, snapshot_json, details_json
                 FROM web_tasks
                 ORDER BY COALESCE(started_at, 0) DESC, id DESC
                 LIMIT ?
@@ -1256,22 +1308,39 @@ class SQLiteStore:
             ).fetchall()
             records: list[dict[str, Any]] = []
             for row in rows:
-                snapshot = _json_load(row["snapshot_json"], {})
-                details = _json_load(row["details_json"], {})
+                snapshot = _sanitize_task_mapping(
+                    _json_load(row["snapshot_json"], {})
+                )
+                details = _sanitize_task_mapping(
+                    _json_load(row["details_json"], {})
+                )
                 if not isinstance(snapshot, Mapping) or not isinstance(details, Mapping):
                     continue
+                try:
+                    task_id = validate_task_id(row["id"])
+                    account_id = str(row["account_id"]).strip()
+                except (TypeError, ValueError):
+                    continue
+                if not account_id:
+                    continue
+                # The table columns are the canonical identifiers used by the
+                # foreign key and ordering queries.  Reassert them after
+                # sanitization so no legacy JSON can replace the row identity.
+                snapshot["id"] = str(task_id)
+                snapshot["account_id"] = account_id
                 log_rows = connection.execute(
                     """
                     SELECT sequence, level, message, timestamp
                     FROM web_task_logs
                     WHERE task_id = ?
-                    ORDER BY sequence ASC
+                    ORDER BY sequence DESC
+                    LIMIT ?
                     """,
-                    (row["id"],),
+                    (row["id"], log_capacity),
                 ).fetchall()
                 cleaned_logs: list[dict[str, Any]] = []
                 logs_dirty = False
-                for item in log_rows:
+                for item in reversed(log_rows):
                     cleaned_message = sanitize_log_message(
                         item["message"],
                         historical=True,
@@ -1306,6 +1375,68 @@ class SQLiteStore:
                     record["_logs_dirty"] = True
                 records.append(record)
             return records
+
+    def prune_web_tasks(
+        self,
+        *,
+        log_capacity: int,
+        terminal_task_capacity: int,
+    ) -> bool:
+        """Trim durable monitor logs/tasks after a restart.
+
+        ``load_web_tasks`` remains a pure read so it can safely run against a
+        read-only/locked database.  TaskManager calls this independent,
+        best-effort mutation once restoration has completed.  Both deletes are
+        expressed in terms of bounded newest-first subqueries and run in one
+        transaction, so a failed write is rolled back rather than reported as
+        a successful cleanup.
+        """
+
+        log_capacity = _positive_capacity(log_capacity, "log_capacity")
+        terminal_task_capacity = _positive_capacity(
+            terminal_task_capacity, "terminal_task_capacity"
+        )
+        with self._connection() as connection:
+            task_rows = connection.execute("SELECT id FROM web_tasks").fetchall()
+            for row in task_rows:
+                task_id = str(row["id"])
+                count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM web_task_logs WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if count is None or int(count["count"]) <= log_capacity:
+                    continue
+                connection.execute(
+                    """
+                    DELETE FROM web_task_logs
+                    WHERE task_id = ? AND sequence NOT IN (
+                        SELECT sequence FROM web_task_logs
+                        WHERE task_id = ?
+                        ORDER BY sequence DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (task_id, task_id, log_capacity),
+                )
+
+            # ``json_valid`` prevents a malformed legacy JSON blob from
+            # aborting the entire cleanup.  Valid task rows use the closed
+            # state set, and ties are deterministic by id.
+            connection.execute(
+                """
+                DELETE FROM web_tasks
+                WHERE id IN (
+                    SELECT id FROM web_tasks
+                    WHERE json_valid(snapshot_json)
+                      AND json_extract(snapshot_json, '$.state')
+                          IN ('completed', 'failed', 'stopped')
+                    ORDER BY COALESCE(started_at, 0) DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (terminal_task_capacity,),
+            )
+        return True
 
     def delete_web_tasks(self, task_ids: list[str] | tuple[str, ...]) -> None:
         """Delete exact task records selected by the bounded manager."""
