@@ -6,6 +6,8 @@ import main
 from api.base import StudyResult
 from api.live_process import LiveProcessor
 from api.live_process import StudyCancelled
+from api.logger import logger
+from webapp.task_logging import run_with_task_context
 
 
 class FakeLive:
@@ -171,3 +173,40 @@ def test_process_job_stops_waiting_for_noncooperative_live_worker_on_cancel(
     assert not caller.is_alive()
     assert len(captured) == 1
     assert isinstance(captured[0], StudyCancelled)
+
+
+def test_live_worker_inherits_task_logging_context(monkeypatch):
+    secret = "LIVESECRET"
+    seen: list[tuple[str, str | None]] = []
+
+    def run_live(*_args, **_kwargs):
+        logger.info("live secret {}", secret)
+        return True
+
+    monkeypatch.setattr(main, "Live", lambda **_kwargs: object())
+    monkeypatch.setattr(main.LiveProcessor, "run_live", run_live)
+    chaoxing = SimpleNamespace(get_uid=lambda: "uid", session=object())
+    sink_id = logger.add(
+        lambda message: seen.append(
+            (message.record["message"], message.record["extra"].get("task_id"))
+        ),
+        enqueue=False,
+    )
+    try:
+        run_with_task_context(
+            "live-context-task",
+            main.process_job,
+            chaoxing,
+            {"title": "course", "clazzId": "class", "courseId": "course"},
+            {"type": "live", "jobid": "job", "property": {"title": "live"}},
+            {"knowledgeid": "knowledge"},
+            1,
+            config={"task_id": "live-context-task"},
+            log_secrets=(secret,),
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert seen
+    assert all(secret not in message for message, _task_id in seen)
+    assert all(task_id == "live-context-task" for _message, task_id in seen)

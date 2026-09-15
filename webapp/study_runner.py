@@ -410,6 +410,10 @@ class ChaoxingStudyRunner:
             "task_id": context.task_id,
             "cancel_event": context.cancel_event,
             "ocr_config": dict(preferences.ocr_config),
+            # JobProcessor's nested workers use this explicit value when
+            # entering task-log context.  It also covers dedicated workers
+            # whose contextvars must be captured at their thread boundary.
+            "_log_secrets": self._secret_values(context),
         }
 
         counts: dict[str, Any] = {

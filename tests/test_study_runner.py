@@ -179,6 +179,11 @@ def test_runner_propagates_account_and_answer_context(
     assert call.auth.cookies == {"_uid": "account-a"}
     assert call.course_ids == ["math"]
     assert call.answer_semaphore is fake_context.answer_semaphore
+    assert call.common_config["_log_secrets"] == (
+        "password-a",
+        "account-a",
+        "bearer-a",
+    )
     assert call.tiku_config["submit"] == "false"
     assert call.tiku_config["cache_file"].endswith("answer-cache.json")
 

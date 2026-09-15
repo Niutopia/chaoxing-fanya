@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from collections.abc import Mapping
 from queue import PriorityQueue
@@ -78,6 +79,21 @@ def _notify_callback(
 
     if not config:
         return
+    # Course-level terminal callbacks run in the owning course thread after
+    # ``JobProcessor.run`` has joined/observed its workers.  Only callbacks
+    # that can be emitted by a chapter worker need the late-worker gate.
+    if name in {
+        "chapter_start_callback",
+        "chapter_status_callback",
+        "chapter_done_callback",
+        "job_list_callback",
+        "job_start_callback",
+        "job_done_callback",
+    }:
+        stop_event = config.get("_worker_stop_event")
+        is_set = getattr(stop_event, "is_set", None)
+        if callable(is_set) and is_set():
+            raise StudyCancelled()
     callback = config.get(name)
     if not callable(callback):
         return
@@ -560,7 +576,16 @@ def process_job(
                 except BaseException as exc:
                     live_error.append(exc)
 
-            thread = threading.Thread(target=run_live_and_capture, daemon=True)
+            # ``threading.Thread`` does not inherit contextvars.  Capture the
+            # caller's task-log/OCR context before starting this dedicated
+            # live worker so task_id and scoped secrets remain attached to
+            # records emitted by LiveProcessor.
+            live_context = contextvars.copy_context()
+            thread = threading.Thread(
+                target=live_context.run,
+                args=(run_live_and_capture,),
+                daemon=True,
+            )
             thread.start()
             # The live worker normally observes the same cancel event itself,
             # but a socket/client implementation may block until its timeout.
@@ -591,6 +616,17 @@ class ChapterTask:
     tries: int = 0
 
 class JobProcessor:
+    _WORKER_CALLBACK_NAMES = frozenset(
+        {
+            "chapter_start_callback",
+            "chapter_status_callback",
+            "chapter_done_callback",
+            "job_list_callback",
+            "job_start_callback",
+            "job_done_callback",
+        }
+    )
+
     def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
         self.chaoxing = chaoxing
         self.course = course
@@ -608,6 +644,24 @@ class JobProcessor:
         self.worker_errors: Queue[BaseException] = Queue()
         self._worker_error_event = threading.Event()
         self._worker_stop_event = threading.Event()
+        # Expose the processor lifetime to callback boundaries.  A daemon
+        # worker may outlive a bounded cancellation join; callbacks from that
+        # late worker must not mutate a task that the owning runner has
+        # already finalized.
+        self.config.setdefault("_worker_stop_event", self._worker_stop_event)
+        for name in self._WORKER_CALLBACK_NAMES:
+            callback = self.config.get(name)
+            if not callable(callback):
+                continue
+
+            def guarded_callback(*args: Any, _callback=callback, **kwargs: Any):
+                if self._worker_stop_event.is_set():
+                    raise StudyCancelled()
+                return _callback(*args, **kwargs)
+
+            self.config[name] = guarded_callback
+
+    _WORKER_JOIN_TIMEOUT = 0.5
 
     def _record_worker_error(self, error: BaseException) -> None:
         """Publish a worker failure without logging its raw exception text."""
@@ -618,11 +672,25 @@ class JobProcessor:
         self._worker_error_event.set()
         self._worker_stop_event.set()
 
-    def _join_workers(self) -> None:
-        for thread in self.threads:
-            thread.join()
+    def _join_workers(self, timeout: float | None = None) -> bool:
+        """Join workers up to one bounded deadline.
+
+        Python cannot safely kill a running thread.  A timed join lets the
+        owning task reach its terminal state while cooperative workers still
+        unwind in the background; the stop event prevents them from taking
+        new work or publishing late results.
+        """
+
+        if timeout is None:
+            timeout = self._WORKER_JOIN_TIMEOUT
+        deadline = time.monotonic() + max(0.0, timeout)
+        handles = [*self.threads]
         if self.retry_thread_handle is not None:
-            self.retry_thread_handle.join()
+            handles.append(self.retry_thread_handle)
+        for thread in handles:
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+        return not any(thread.is_alive() for thread in handles)
 
     def _first_worker_error(self) -> BaseException | None:
         try:
@@ -735,6 +803,10 @@ class JobProcessor:
                 # requested.  Check before scheduling retries or reporting it
                 # as completed.
                 raise_if_cancelled(self.config)
+                if self._worker_stop_event.is_set():
+                    self.task_queue.task_done()
+                    task_finished = True
+                    return
 
                 match task.result:
                     case ChapterResult.SUCCESS:
@@ -887,7 +959,8 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
     job_results:list[StudyResult]=[]
     video_progress_callback = config.get("video_progress_callback") if config else None
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    executor = ThreadPoolExecutor(max_workers=5)
+    try:
         def process_one_job(job):
             # Each executor worker starts with a fresh context, so both task
             # logging and task-local OCR settings must be re-entered here.
@@ -920,8 +993,27 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             for job in jobs
         ]
         for future in futures:
-            raise_if_cancelled(config)
-            job_results.append(future.result())
+            while True:
+                raise_if_cancelled(config)
+                try:
+                    job_results.append(future.result(timeout=0.1))
+                    break
+                except FutureTimeoutError:
+                    # ``Future.result()`` must remain interruptible while a
+                    # provider/transport is blocked.  The next bounded poll
+                    # observes cancellation and unwinds the chapter.
+                    continue
+    finally:
+        cancel_event = config.get("cancel_event") if config else None
+        is_cancelled = getattr(cancel_event, "is_set", None)
+        cancellation_requested = callable(is_cancelled) and is_cancelled()
+        # A running Python thread cannot be killed safely.  On cancellation,
+        # stop waiting for executor workers and cancel only work not yet
+        # started; JobProcessor's stop event gates late callbacks/retries.
+        executor.shutdown(
+            wait=not cancellation_requested,
+            cancel_futures=cancellation_requested,
+        )
     
     for result in job_results:
         if result.is_failure():
