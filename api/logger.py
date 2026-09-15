@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections import deque
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -32,20 +31,97 @@ MAX_EXTRA_STRING_LENGTH = 4_096
 _LOG_LEVELS = frozenset(
     {"trace", "debug", "info", "success", "warning", "error", "critical"}
 )
-_SENSITIVE_KEY_MARKERS = (
-    "password",
-    "passwd",
-    "cookie",
-    "token",
-    "secret",
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "push_key",
-    "pushkey",
-    "app_key",
-    "appkey",
+# Keep this classifier aligned with ``webapp.config_security`` without
+# importing the webapp package from the process-wide logger (which would
+# create an import cycle during app startup).  Exact aliases and normalized
+# segments avoid turning metadata such as ``app_key_id`` into credentials.
+_EXTRA_SECRET_ALIASES = frozenset(
+    {
+        "key",
+        "api_key",
+        "apikey",
+        "access_key",
+        "access_token",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "credentials",
+        "cookie",
+        "cookies",
+        "authorization",
+        "private_key",
+        "push_key",
+        "app_key",
+        "auth",
+        "sign",
+        "signature",
+    }
+)
+_EXTRA_DESTINATION_ALIASES = frozenset(
+    {"url", "uri", "endpoint", "webhook", "chat", "chat_id", "chatid"}
+)
+_EXTRA_COMPACT_DESTINATION_VARIANTS = frozenset(
+    {
+        "baseurl",
+        "callbackurl",
+        "callbackuri",
+        "fallbackendpoint",
+        "httpendpoint",
+        "notifyurl",
+        "ocrendpoint",
+        "resourceuri",
+        "serviceendpoint",
+        "serviceurl",
+        "tgchatid",
+        "webhookurl",
+    }
+)
+_EXTRA_COMPACT_ALIASES = frozenset(
+    alias.replace("_", "")
+    for alias in _EXTRA_SECRET_ALIASES | _EXTRA_DESTINATION_ALIASES
+) | _EXTRA_COMPACT_DESTINATION_VARIANTS
+_EXTRA_SECRET_MARKERS = frozenset(
+    {
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "credentials",
+        "cookie",
+        "cookies",
+        "authorization",
+        "private",
+        "auth",
+        "sign",
+        "signature",
+    }
+)
+_EXTRA_DESTINATION_MARKERS = frozenset(
+    {"url", "uri", "endpoint", "webhook", "chat"}
+)
+_EXTRA_METADATA_SUFFIXES = frozenset(
+    {
+        "count",
+        "description",
+        "enabled",
+        "field",
+        "id",
+        "index",
+        "label",
+        "method",
+        "mode",
+        "name",
+        "number",
+        "scheme",
+        "title",
+        "type",
+    }
 )
 
 _URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?)://[^\s<>\[\]{}\"']+")
@@ -127,16 +203,43 @@ _HISTORICAL_JSON_PATTERN = re.compile(r"(?s)^\s*[\[{].{0,16384}[\]}]\s*$")
 # Explicit allowlist for harmless legacy runtime labels.  Dynamic values must
 # be structured (and contain a digit); arbitrary prose after ``progress`` or
 # another operational prefix is replaced as a whole by the marker below.
-_HISTORICAL_SAFE_PATTERN = re.compile(
-    r"(?x)^(?:"
-    r"服务重启导致任务中断，超星进度保留，可重新开始继续|"
-    r"(?:completed\s+)?checkpoint(?:[\s_-]+[a-z0-9_.:/-]+)*|"
-    r"(?:first|second)-only|entry-[0-9]+|kept|ignored|"
-    r"(?:progress|retry|attempt|queued|running|stopping|worker|task|job|"
-    r"chapter|course)(?:[\s_:#/().+%=-]+(?=[a-z0-9_.:/%+-]*\d)[a-z0-9_.:/%+-]+)*|"
-    r"(?:任务进度|任务开始|任务完成|任务停止|任务失败|队列状态|工作线程状态)"
-    r"(?:[：: /_-]+(?=[0-9a-z_.:/%+-]*\d)[0-9a-z_.:/%+-]+)*"
-    r")$"
+#
+# These are parsed below instead of using a repeated separator/value regex:
+# the two character classes intentionally overlap (``.`` and ``-``), and a
+# backtracking regex over a long legacy message would otherwise be quadratic.
+_HISTORICAL_OPERATION_PREFIXES = (
+    "progress",
+    "retry",
+    "attempt",
+    "queued",
+    "running",
+    "stopping",
+    "worker",
+    "task",
+    "job",
+    "chapter",
+    "course",
+)
+_HISTORICAL_CHINESE_PREFIXES = (
+    "任务进度",
+    "任务开始",
+    "任务完成",
+    "任务停止",
+    "任务失败",
+    "队列状态",
+    "工作线程状态",
+)
+_HISTORICAL_OPERATION_SEPARATORS = frozenset(" \t\r\n_:#/().+%=-")
+_HISTORICAL_OPERATION_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_.:/%+-"
+)
+_HISTORICAL_CHECKPOINT_SEPARATORS = frozenset(" \t\r\n_-")
+_HISTORICAL_CHECKPOINT_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_.:/-"
+)
+_HISTORICAL_CHINESE_SEPARATORS = frozenset("：: /_-")
+_HISTORICAL_CHINESE_VALUE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_.:/%+-"
 )
 
 _TRUNCATION_MARKER = "[truncated]"
@@ -218,57 +321,67 @@ def _coerce_message(value: Any) -> str:
         text = str(value)
     else:
         return "[redacted-object]"
-    if len(text) > MAX_LOG_MESSAGE_LENGTH:
-        limit = MAX_LOG_MESSAGE_LENGTH - len(_TRUNCATION_MARKER)
-        return text[:limit] + _TRUNCATION_MARKER
     return text
 
 
-def _replace_known_secrets(text: str, secrets: tuple[str, ...]) -> str:
-    """Replace literal secrets in one bounded Aho-Corasick pass."""
+def _secret_scan_limit(secrets: tuple[str, ...]) -> int:
+    """Return the largest raw prefix that can affect a bounded log output.
 
+    A secret beginning in the retained ``MAX_LOG_MESSAGE_LENGTH`` prefix may
+    extend past that boundary.  Include one complete normalized secret after
+    the boundary so a literal match is found before the output is truncated.
+    Anything beyond this window is discarded, never copied into the result.
+    """
+
+    longest = max((len(secret) for secret in secrets), default=0)
+    if not longest:
+        return MAX_LOG_MESSAGE_LENGTH
+    return MAX_LOG_MESSAGE_LENGTH + longest - 1
+
+
+def _replace_known_secrets(
+    text: str,
+    secrets: tuple[str, ...],
+    *,
+    output_limit: int | None = None,
+) -> str:
+    """Replace literal secrets with bounded per-secret searches.
+
+    The message passed by :func:`sanitize_log_message` is already limited to
+    ``_secret_scan_limit``.  Searching each of at most 64 literals avoids an
+    Aho-Corasick trie whose node count scales with the sum of secret lengths;
+    both working memory and worst-case scan work remain bounded by the input
+    window and the configured secret count.  ``output_limit`` truncates by
+    source position, before replacements can shift a suffix into view.
+    """
+
+    source_limit = len(text)
+    if output_limit is not None:
+        source_limit = min(source_limit, max(0, output_limit))
     if not text or not secrets:
-        return text
-    transitions: list[dict[str, int]] = [{}]
-    failures = [0]
-    longest = [0]
+        return text[:source_limit]
+
+    # Difference marks keep memory proportional to the bounded text window,
+    # even when many short secrets overlap repeatedly in the same input.
+    coverage = [0] * (len(text) + 1)
+    found = False
     for secret in secrets:
-        state = 0
-        for char in secret:
-            next_state = transitions[state].get(char)
-            if next_state is None:
-                next_state = len(transitions)
-                transitions[state][char] = next_state
-                transitions.append({})
-                failures.append(0)
-                longest.append(0)
-            state = next_state
-        longest[state] = max(longest[state], len(secret))
-
-    queue: deque[int] = deque(transitions[0].values())
-    while queue:
-        state = queue.popleft()
-        for char, child in transitions[state].items():
-            queue.append(child)
-            fallback = failures[state]
-            while fallback and char not in transitions[fallback]:
-                fallback = failures[fallback]
-            failures[child] = transitions[fallback].get(char, 0)
-            longest[child] = max(longest[child], longest[failures[child]])
-
-    matches: dict[int, int] = {}
-    state = 0
-    for index, char in enumerate(text):
-        while state and char not in transitions[state]:
-            state = failures[state]
-        state = transitions[state].get(char, 0)
-        length = longest[state]
-        if length:
-            start = index - length + 1
-            if start >= 0:
-                matches[start] = max(matches.get(start, 0), length)
-    if not matches:
-        return text
+        secret_length = len(secret)
+        if not secret_length or secret_length > len(text):
+            continue
+        start = 0
+        while True:
+            match = text.find(secret, start)
+            if match < 0:
+                break
+            coverage[match] += 1
+            coverage[match + secret_length] -= 1
+            found = True
+            # Include overlapping occurrences.  The interval merge below
+            # collapses runs such as ``aaaa`` with secret ``aa`` safely.
+            start = match + 1
+    if not found:
+        return text[:source_limit]
 
     # Generated markers are already safe.  Keeping their spans immutable is
     # what makes a second sanitizer pass stable even when a secret is a
@@ -277,28 +390,41 @@ def _replace_known_secrets(text: str, secrets: tuple[str, ...]) -> str:
 
     redactions: list[tuple[int, int]] = []
     protected_index = 0
-    for start, length in sorted(matches.items()):
-        end = start + length
-        while protected_index < len(protected) and protected[protected_index][1] <= start:
+    active = 0
+    redaction_start: int | None = None
+    for index in range(len(text)):
+        active += coverage[index]
+        while (
+            protected_index < len(protected)
+            and protected[protected_index][1] <= index
+        ):
             protected_index += 1
-        if protected_index < len(protected):
-            protected_start, protected_end = protected[protected_index]
-            if start < protected_end and end > protected_start:
-                continue
-        if redactions and start <= redactions[-1][1]:
-            redactions[-1] = (redactions[-1][0], max(redactions[-1][1], end))
-        else:
-            redactions.append((start, end))
+        is_protected = (
+            protected_index < len(protected)
+            and protected[protected_index][0] <= index < protected[protected_index][1]
+        )
+        should_redact = active > 0 and not is_protected
+        if should_redact and redaction_start is None:
+            redaction_start = index
+        elif not should_redact and redaction_start is not None:
+            redactions.append((redaction_start, index))
+            redaction_start = None
+    if redaction_start is not None:
+        redactions.append((redaction_start, len(text)))
 
     if not redactions:
-        return text
+        return text[:source_limit]
     output: list[str] = []
     cursor = 0
     for start, end in redactions:
+        if start >= source_limit:
+            break
         output.append(text[cursor:start])
         output.append("[redacted]")
-        cursor = end
-    output.append(text[cursor:])
+        cursor = min(end, source_limit)
+        if end > source_limit:
+            break
+    output.append(text[cursor:source_limit])
     return "".join(output)
 
 
@@ -335,16 +461,110 @@ def _replace_secret_assignments(text: str) -> str:
 def _bound_log_message(text: str) -> str:
     """Keep sanitizer output bounded without cutting a generated marker."""
 
-    if len(text) <= MAX_LOG_MESSAGE_LENGTH:
+    return _bound_text(text, MAX_LOG_MESSAGE_LENGTH)
+
+
+def _bound_text(text: str, limit: int) -> str:
+    """Bound text while preserving complete generated markers."""
+
+    if len(text) <= limit:
         return text
-    limit = MAX_LOG_MESSAGE_LENGTH - len(_TRUNCATION_MARKER)
-    prefix = text[:limit]
+    prefix = text[: limit - len(_TRUNCATION_MARKER)]
     # A partial marker would be eligible for replacement on a later pass and
     # would violate idempotence.  Discard that incomplete tail before adding
     # the complete truncation marker.
     if prefix.rfind("[") > prefix.rfind("]"):
         prefix = prefix[: prefix.rfind("[")]
     return prefix + _TRUNCATION_MARKER
+
+
+def _consume_historical_suffix(
+    text: str,
+    index: int,
+    *,
+    separators: frozenset[str],
+    value_chars: frozenset[str],
+    require_digit: bool,
+) -> bool:
+    """Consume legacy ``separator + value`` groups in one linear pass."""
+
+    length = len(text)
+    while index < length:
+        separator_start = index
+        while index < length and text[index] in separators:
+            index += 1
+        if index == separator_start:
+            return False
+
+        value_start = index
+        contains_digit = False
+        while index < length and text[index] in value_chars:
+            contains_digit = contains_digit or text[index] in "0123456789"
+            index += 1
+        if index == value_start or (require_digit and not contains_digit):
+            return False
+    return True
+
+
+def _historical_safe_message(text: str) -> bool:
+    """Return whether an old message is a harmless operational label."""
+
+    if text == "服务重启导致任务中断，超星进度保留，可重新开始继续":
+        return True
+
+    folded = text.casefold()
+    for prefix in ("first-only", "second-only", "kept", "ignored"):
+        if folded == prefix:
+            return True
+    if folded.startswith("entry-"):
+        suffix = folded[len("entry-") :]
+        if suffix and suffix.isascii() and suffix.isdecimal():
+            return True
+
+    checkpoint_index = 0
+    if folded.startswith("completed"):
+        checkpoint_index = len("completed")
+        while checkpoint_index < len(folded) and folded[checkpoint_index] in " \t\r\n":
+            checkpoint_index += 1
+        if checkpoint_index == len(folded):
+            return False
+    if folded[checkpoint_index:].startswith("checkpoint"):
+        checkpoint_index += len("checkpoint")
+        if checkpoint_index == len(folded):
+            return True
+        if _consume_historical_suffix(
+            folded,
+            checkpoint_index,
+            separators=_HISTORICAL_CHECKPOINT_SEPARATORS,
+            value_chars=_HISTORICAL_CHECKPOINT_VALUE_CHARS,
+            require_digit=False,
+        ):
+            return True
+
+    for prefix in _HISTORICAL_OPERATION_PREFIXES:
+        if folded == prefix:
+            return True
+        if folded.startswith(prefix) and _consume_historical_suffix(
+            folded,
+            len(prefix),
+            separators=_HISTORICAL_OPERATION_SEPARATORS,
+            value_chars=_HISTORICAL_OPERATION_VALUE_CHARS,
+            require_digit=True,
+        ):
+            return True
+
+    for prefix in _HISTORICAL_CHINESE_PREFIXES:
+        if folded == prefix:
+            return True
+        if folded.startswith(prefix) and _consume_historical_suffix(
+            folded,
+            len(prefix),
+            separators=_HISTORICAL_CHINESE_SEPARATORS,
+            value_chars=_HISTORICAL_CHINESE_VALUE_CHARS,
+            require_digit=True,
+        ):
+            return True
+    return False
 
 
 def _historical_has_sensitive_shape(text: str) -> bool:
@@ -379,24 +599,42 @@ def sanitize_log_message(
     replaced by a stable marker so a restart cannot expose its provenance.
     """
 
+    secret_values = _normalise_secrets(secrets)
     text = _coerce_message(value)
     if not text:
         return ""
     if text == HISTORICAL_SENSITIVE_LOG:
         return text
-    secret_values = _normalise_secrets(secrets)
+
+    source_over_limit = len(text) > MAX_LOG_MESSAGE_LENGTH
+    scan_limit = _secret_scan_limit(secret_values)
+    was_scan_truncated = len(text) > scan_limit
+    if was_scan_truncated:
+        # A secret can cross the public output boundary, so keep enough raw
+        # suffix to find it.  Never process or copy arbitrary data past this
+        # strict window.
+        text = text[:scan_limit]
+        if historical:
+            return HISTORICAL_SENSITIVE_LOG
+
     if historical and (
         any(secret in text for secret in secret_values)
         or _historical_has_sensitive_shape(text)
     ):
         return HISTORICAL_SENSITIVE_LOG
 
-    text = _replace_known_secrets(text, secret_values)
+    text = _replace_known_secrets(
+        text,
+        secret_values,
+        output_limit=MAX_LOG_MESSAGE_LENGTH if source_over_limit else None,
+    )
     text = _replace_urls(text)
     text = _replace_secret_assignments(text)
     text = _SECRET_WORD_PATTERN.sub("[redacted]", text)
-    if historical and not _HISTORICAL_SAFE_PATTERN.fullmatch(text):
+    if historical and not _historical_safe_message(text):
         return HISTORICAL_SENSITIVE_LOG
+    if source_over_limit:
+        text += _TRUNCATION_MARKER
     return _bound_log_message(text)
 
 
@@ -420,6 +658,36 @@ def _safe_extra_key(value: Any) -> str:
     return text[:MAX_EXTRA_STRING_LENGTH]
 
 
+def _normalise_extra_key(value: str) -> str:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value.strip())
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _is_sensitive_extra_key(value: str) -> bool:
+    """Classify credential and private-destination extra keys safely."""
+
+    normalized = _normalise_extra_key(value)
+    compact = normalized.replace("_", "")
+    if not normalized:
+        return False
+    if normalized in _EXTRA_SECRET_ALIASES | _EXTRA_DESTINATION_ALIASES:
+        return True
+    if compact in _EXTRA_COMPACT_ALIASES:
+        return True
+
+    parts = tuple(part for part in normalized.split("_") if part)
+    suffix = parts[-1] if parts else ""
+    for marker in _EXTRA_SECRET_MARKERS | _EXTRA_DESTINATION_MARKERS:
+        if marker not in parts:
+            continue
+        if marker == "chat" and suffix == "id":
+            return True
+        if suffix in _EXTRA_METADATA_SUFFIXES and suffix != marker:
+            continue
+        return True
+    return False
+
+
 def _sanitize_extra(
     value: Any,
     secrets: tuple[str, ...],
@@ -432,22 +700,21 @@ def _sanitize_extra(
 
     if state is None:
         state = {"nodes": 0, "active": set()}
-    key_name = key.strip().lower().replace("-", "_")
+    key_name = _normalise_extra_key(key)
     if key_name == "task_id":
         try:
             return validate_task_id(value)
         except (TypeError, ValueError):
             return None
-    if any(marker in key_name for marker in _SENSITIVE_KEY_MARKERS):
+    if _is_sensitive_extra_key(key):
         return "[redacted]"
     if depth > MAX_EXTRA_DEPTH or state["nodes"] >= MAX_EXTRA_NODES:
         return "[redacted-depth]"
     state["nodes"] += 1
 
     if isinstance(value, str):
-        if len(value) > MAX_EXTRA_STRING_LENGTH:
-            value = value[:MAX_EXTRA_STRING_LENGTH] + "[truncated]"
-        return sanitize_log_message(value, secrets=secrets)
+        value = sanitize_log_message(value, secrets=secrets)
+        return _bound_text(value, MAX_EXTRA_STRING_LENGTH)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "[redacted-bytes]"
     if value is None or isinstance(value, (bool, int)):

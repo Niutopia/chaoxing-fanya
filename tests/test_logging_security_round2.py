@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import signal
 import time
 from types import SimpleNamespace
 
@@ -81,27 +80,26 @@ def test_sanitizer_long_punctuation_input_is_bounded():
     assert elapsed < 1.0
 
 
-def test_secret_word_scan_does_not_backtrack_on_separator_runs():
+def test_secret_word_scan_handles_separator_runs():
     value = "a_" * 24
-    timed_out = False
-    previous_handler = signal.getsignal(signal.SIGALRM)
 
-    def fail_fast(_signum, _frame):
-        raise TimeoutError("secret-word scan exceeded the bounded budget")
+    assert sanitize_log_message(value) == value
 
-    signal.signal(signal.SIGALRM, fail_fast)
-    signal.setitimer(signal.ITIMER_REAL, 0.75)
-    try:
-        cleaned = sanitize_log_message(value)
-    except TimeoutError:
-        timed_out = True
-        cleaned = None
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
 
-    assert not timed_out
-    assert cleaned == value
+def test_historical_progress_scan_scales_with_input_size():
+    def measure(size: int) -> float:
+        started = time.perf_counter()
+        cleaned = sanitize_log_message("progress " + ("." * size), historical=True)
+        elapsed = time.perf_counter() - started
+        assert cleaned == HISTORICAL_SENSITIVE_LOG
+        return elapsed
+
+    small = measure(2_000)
+    large = measure(16_000)
+
+    # A bounded linear scan should be close to the 8x input-size ratio.  Keep
+    # enough slack for a loaded CI host while rejecting the quadratic shape.
+    assert large <= (small * 16) + 0.03
 
 
 def test_sanitizer_is_idempotent_when_secret_matches_redaction_marker_text():
@@ -148,6 +146,79 @@ def test_oversized_secret_is_not_dropped_from_message_or_extra():
     assert secret[:32] not in message
     assert extra == {"push_key": "[redacted]", "app_key": "[redacted]"}
     assert sanitize_log_message(message, secrets=(secret,)) == message
+
+
+def test_oversized_secret_is_redacted_before_unmarked_extra_string_bound():
+    secret = "ordinary-value-prefix-" + ("x" * 5_010)
+
+    cleaned = sanitize_log_extra({"value": secret}, secrets=(secret,))
+
+    assert cleaned == {"value": "[redacted]"}
+
+
+def test_secret_crossing_message_bound_is_redacted_before_final_truncation():
+    secret = "cross-boundary-secret-" + ("x" * 5_010)
+    value = ("safe-" * ((MAX_LOG_MESSAGE_LENGTH - 64) // 5)) + secret
+
+    cleaned = sanitize_log_message(value, secrets=(secret,))
+
+    assert len(cleaned) <= MAX_LOG_MESSAGE_LENGTH
+    assert secret not in cleaned
+    assert secret[:32] not in cleaned
+    assert sanitize_log_message(cleaned, secrets=(secret,)) == cleaned
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("Progress 42/100", "Progress 42/100"),
+        ("PROGRESS 42/100", "PROGRESS 42/100"),
+        ("progress JOB-ABC123", "progress JOB-ABC123"),
+    ),
+)
+def test_historical_structured_progress_accepts_case_and_uppercase_ids(message, expected):
+    assert sanitize_log_message(message, historical=True) == expected
+
+
+def test_historical_unknown_progress_remains_a_marker_with_uppercase_prefix():
+    assert (
+        sanitize_log_message("PROGRESS LIVESECRET", historical=True)
+        == HISTORICAL_SENSITIVE_LOG
+    )
+
+
+def test_sensitive_extra_key_detection_respects_metadata_suffixes():
+    value = {
+        "app_key_id": "public-app-id",
+        "push_key_count": 2,
+        "app_key_label": "display label",
+        "pushkey_id": "public-push-id",
+        "auth_mode": "header",
+        "token_type": "Bearer",
+        "push_key": "push-secret",
+        "app_key": "app-secret",
+        "auth": "auth-secret",
+        "sign": "sign-secret",
+        "signature": "signature-secret",
+        "url": "https://example.invalid/private-secret",
+    }
+
+    cleaned = sanitize_log_extra(value)
+
+    assert cleaned == {
+        "app_key_id": "public-app-id",
+        "push_key_count": 2,
+        "app_key_label": "display label",
+        "pushkey_id": "public-push-id",
+        "auth_mode": "header",
+        "token_type": "Bearer",
+        "push_key": "[redacted]",
+        "app_key": "[redacted]",
+        "auth": "[redacted]",
+        "sign": "[redacted]",
+        "signature": "[redacted]",
+        "url": "[redacted]",
+    }
 
 
 def test_record_extra_is_bounded_and_task_id_is_preserved():
