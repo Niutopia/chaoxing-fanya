@@ -223,6 +223,29 @@ test('appends unique log sequences and expands course details', async () => {
   })
 })
 
+test('keeps desktop task panels stable and scrolls changing jobs inside the jobs panel', async () => {
+  getTaskDetails.mockResolvedValue({
+    courses: [],
+    active_jobs: Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+      `video-${index + 1}`,
+      { job_name: `视频任务 ${index + 1}`, progress: index * 10 },
+    ])),
+  })
+
+  renderPage('/tasks/task-a')
+
+  expect(await screen.findByText('视频任务 8')).toBeInTheDocument()
+  expect(screen.getByRole('region', { name: '任务进度' })).toHaveClass('md:h-96')
+  expect(screen.getByRole('region', { name: '当前作业' })).toHaveClass('md:h-96')
+  expect(screen.getByRole('region', { name: '当前作业列表' })).toHaveClass(
+    'md:flex-1',
+    'md:overflow-y-auto',
+    'md:overscroll-contain',
+    'md:[scrollbar-gutter:stable]',
+  )
+  expect(screen.getByText('8 项')).toHaveClass('tabular-nums')
+})
+
 test('resets cursor and logs when the selected task route changes', async () => {
   getTask.mockImplementation((taskId) => Promise.resolve({
     id: taskId,

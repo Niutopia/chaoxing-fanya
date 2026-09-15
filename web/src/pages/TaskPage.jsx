@@ -719,12 +719,12 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       {snapshot.error ? <Alert className="mt-5" variant="danger" aria-live="polite">{snapshot.error}</Alert> : null}
 
       <div className="mt-7 grid items-start gap-6 md:grid-cols-[minmax(0,1.1fr)_minmax(260px,0.9fr)]">
-        <section className="min-w-0 border-y border-separator bg-surface" aria-labelledby="task-progress-title">
-          <div className="border-b border-separator px-4 py-3">
-            <h2 id="task-progress-title" className="font-semibold">任务进度</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">当前账户的实时学习快照。</p>
+        <section className="min-w-0 border-y border-separator bg-surface md:flex md:h-96 md:flex-col" aria-labelledby="task-progress-title">
+          <div className="shrink-0 border-b border-separator px-4 py-3">
+            <h2 id="task-progress-title" className="text-balance font-semibold">任务进度</h2>
+            <p className="mt-0.5 text-pretty text-xs text-label-secondary">当前账户的实时学习快照。</p>
           </div>
-          <div className="space-y-5 px-4 py-4">
+          <div className="min-h-0 space-y-5 px-4 py-4 md:flex-1 md:overflow-y-auto md:[scrollbar-gutter:stable]">
             <TaskProgress progress={snapshot.progress} total={snapshot.total} label="总进度" />
             <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 border-t border-separator pt-4 text-sm">
               <dt className="text-label-secondary">账户</dt>
@@ -741,32 +741,42 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
           </div>
         </section>
 
-        <section className="min-w-0 border-y border-separator bg-surface" aria-labelledby="task-jobs-title">
-          <div className="border-b border-separator px-4 py-3">
-            <h2 id="task-jobs-title" className="font-semibold">当前作业</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">视频和章节任务的细节。</p>
-          </div>
-          {jobs.length === 0 ? (
-            <p className="px-4 py-6 text-sm text-label-secondary">暂无进行中的作业</p>
-          ) : (
-            <div className="divide-y divide-separator">
-              {jobs.map(([key, job]) => {
-                const label = jobName(job, key)
-                const currentTime = job.current_time ?? job.currentTime
-                const duration = job.duration
-                return (
-                  <div key={key} className="space-y-2 px-4 py-4">
-                    <TaskProgress value={job.progress} label={label} showCount={false} />
-                    {currentTime !== undefined || duration !== undefined ? (
-                      <p className="text-right text-xs tabular-nums text-label-secondary">
-                        {formatDuration(currentTime)} / {formatDuration(duration)}
-                      </p>
-                    ) : null}
-                  </div>
-                )
-              })}
+        <section className="min-w-0 border-y border-separator bg-surface md:flex md:h-96 md:flex-col" aria-labelledby="task-jobs-title">
+          <div className="flex shrink-0 items-start justify-between gap-4 border-b border-separator px-4 py-3">
+            <div className="min-w-0">
+              <h2 id="task-jobs-title" className="text-balance font-semibold">当前作业</h2>
+              <p className="mt-0.5 text-pretty text-xs text-label-secondary">视频和章节任务的细节。</p>
             </div>
-          )}
+            <span className="shrink-0 pt-0.5 text-xs tabular-nums text-label-tertiary">{jobs.length} 项</span>
+          </div>
+          <div
+            role="region"
+            aria-label="当前作业列表"
+            tabIndex={0}
+            className="min-h-0 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue md:flex-1 md:overflow-y-auto md:overscroll-contain md:[scrollbar-gutter:stable]"
+          >
+            {jobs.length === 0 ? (
+              <p className="px-4 py-6 text-pretty text-sm text-label-secondary">暂无进行中的作业</p>
+            ) : (
+              <div className="divide-y divide-separator">
+                {jobs.map(([key, job]) => {
+                  const label = jobName(job, key)
+                  const currentTime = job.current_time ?? job.currentTime
+                  const duration = job.duration
+                  return (
+                    <div key={key} className="space-y-2 px-4 py-4">
+                      <TaskProgress value={job.progress} label={label} showCount={false} />
+                      {currentTime !== undefined || duration !== undefined ? (
+                        <p className="text-right text-xs tabular-nums text-label-secondary">
+                          {formatDuration(currentTime)} / {formatDuration(duration)}
+                        </p>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         </section>
       </div>
 
