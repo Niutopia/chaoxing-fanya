@@ -35,6 +35,172 @@ from api.vision_ocr import (
 )
 
 
+_OPTION_PREFIX_RE = re.compile(
+    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)"
+    r"(?:\s*[\.．,，、:：\)）]\s*|(\s+))"
+)
+_OPTION_LABEL_RE = re.compile(
+    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)\s*"
+    r"(?:[\.．,，、:：\)）]\s*)?(?:[\]\)】]\s*)?$"
+)
+_TEXT_PUNCTUATION_RE = re.compile(r"[，。！？；：,.!?;:()（）\[\]【】\"“”‘’\-_\/\\|]")
+
+
+def _option_label_for_index(index: int) -> str:
+    """Return Excel-style A-Z, AA... labels for a zero-based index."""
+
+    number = index + 1
+    label = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        label = chr(ord("A") + remainder) + label
+    return label
+
+
+def _option_lines(options) -> list[str]:
+    """Return non-empty option lines without changing their display order."""
+
+    if not options:
+        return []
+    if isinstance(options, str):
+        raw_options = options.splitlines()
+    elif isinstance(options, (list, tuple)):
+        raw_options = options
+    else:
+        raw_options = [options]
+    return [str(option).strip() for option in raw_options if str(option).strip()]
+
+
+def _strip_explicit_option_prefix(value) -> str:
+    """Strip only a real option prefix, never the first letter of a word."""
+
+    text = str(value or "").strip()
+    match = _OPTION_PREFIX_RE.match(text)
+    if not match:
+        return text
+    # A whitespace-only separator is accepted for conventional uppercase
+    # labels (A, B, ... AA), but not for ordinary words such as ``cat dog``.
+    if match.group(2) and (
+        not match.group(1).isupper() or len(match.group(1)) > 2
+    ):
+        return text
+    return text[match.end():].strip()
+
+
+def _normalise_choice_text(value, *, strip_prefix: bool = True) -> str:
+    """Normalise answer/option text while retaining Chinese characters."""
+
+    text = str(value or "").strip()
+    if strip_prefix:
+        text = _strip_explicit_option_prefix(text)
+    text = text.casefold()
+    text = re.sub(r"\s+", "", text)
+    return _TEXT_PUNCTUATION_RE.sub("", text)
+
+
+def _option_entries(options):
+    """Return ``(label, display_text, normalised_text)`` option entries."""
+
+    entries = []
+    for index, option in enumerate(_option_lines(options)):
+        match = _OPTION_PREFIX_RE.match(option)
+        if match and match.group(2) and (
+            not match.group(1).isupper() or len(match.group(1)) > 2
+        ):
+            match = None
+        label = match.group(1).upper() if match else ""
+        if not label:
+            # A malformed/label-less form can still be handled safely by
+            # assigning the conventional A-Z (then AA...) label by DOM order.
+            label = _option_label_for_index(index)
+        text = _strip_explicit_option_prefix(option)
+        entries.append((label, text, _normalise_choice_text(text, strip_prefix=False)))
+    return entries
+
+
+def _label_from_token(value, valid_labels):
+    """Return a legal option label for a standalone token, if present."""
+
+    match = _OPTION_LABEL_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return ""
+    label = match.group(1).upper()
+    return label if label in valid_labels else ""
+
+
+def _answer_parts(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(part).strip() for part in value]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if re.search(r"[\n\r,，、|;；/]", text):
+        return [part.strip() for part in re.split(r"[\n\r,，、|;；/]+", text) if part.strip()]
+    # A whitespace-separated list is a label list only when every token is a
+    # standalone label.  Ordinary option text is kept as one complete value.
+    whitespace_parts = text.split()
+    return whitespace_parts if len(whitespace_parts) > 1 else [text]
+
+
+def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
+    """Map strict labels or complete option text to the form's labels.
+
+    In particular, do not scan every alphabetic character in a normal word:
+    providers such as TikuLike return option text rather than option letters.
+    """
+
+    entries = _option_entries(options)
+    valid_labels = {label for label, _, _ in entries if label}
+    if not entries or not valid_labels:
+        return ""
+
+    raw_text = str(result or "").strip()
+    parts = _answer_parts(result)
+
+    # A single-character token or a delimited list is unambiguously a label
+    # answer.  This covers AI responses such as ["A", "C"] after joining.
+    if not multiple:
+        label = _label_from_token(raw_text, valid_labels)
+        if label:
+            return label
+    else:
+        label_parts = [_label_from_token(part, valid_labels) for part in parts]
+        if parts and all(label_parts):
+            return "".join(sorted(set(label_parts)))
+
+    # Prefer complete, normalised option-text matching.  This is deliberately
+    # exact rather than an arbitrary substring/subsequence search so a short
+    # answer cannot match several unrelated options.
+    if not isinstance(result, (list, tuple)):
+        whole_text = _normalise_choice_text(raw_text)
+        whole_matches = [
+            label for label, _, text in entries if label and text == whole_text
+        ]
+        if len(whole_matches) == 1:
+            return whole_matches[0]
+
+    matched = []
+    for part in parts:
+        normalised = _normalise_choice_text(part)
+        if not normalised:
+            continue
+        candidates = [label for label, _, text in entries if label and text == normalised]
+        if len(candidates) == 1:
+            matched.append(candidates[0])
+    if matched:
+        unique = sorted(set(matched))
+        return "".join(unique) if multiple else unique[0]
+
+    # Preserve compatibility with compact uppercase forms such as "ACD",
+    # but only after text matching and only when every character is a real
+    # label.  Lowercase/ordinary words therefore never become letters.
+    if multiple and re.fullmatch(r"[A-Z]{2,}", raw_text):
+        compact = list(raw_text)
+        if all(label in valid_labels for label in compact):
+            return "".join(sorted(set(compact)))
+    return ""
+
+
 def get_timestamp():
     return str(int(time.time() * 1000))
 
@@ -603,62 +769,53 @@ class Chaoxing:
             return StudyResult.SUCCESS
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
-        def random_answer(options: str) -> str:
-            answer = ""
-            if not options:
+        def random_answer(options: str, q_type: str) -> str:
+            """Return a type-aware fallback without depending on question scope."""
+
+            if q_type == "judgement":
+                answer = "true" if random.choice([True, False]) else "false"
+                logger.info(f"随机选择 -> {answer}")
                 return answer
+            if q_type == "completion":
+                # There is no meaningful random fill-in text.  An empty value
+                # keeps coverage accounting honest and lets the caller save
+                # the known answers only.
+                return ""
 
-            if q["type"] == "multiple":
-                logger.debug(f"当前选项列表[cut前] -> {options}")
-                _op_list = multi_cut(options)
-                logger.debug(f"当前选项列表[cut后] -> {_op_list}")
+            entries = _option_entries(options)
+            labels = [label for label, _, _ in entries if label]
+            if not labels:
+                return ""
 
-                if not _op_list:
-                    logger.error(
-                        "选项为空, 未能正确提取题目选项信息! 请反馈并提供以上信息"
-                    )
-                    return answer
-
-                available_options = len(_op_list)
-                select_count = 0
-
-                # 根据可用选项数量调整可能选择的选项数
+            if q_type == "multiple":
+                available_options = len(labels)
                 if available_options <= 1:
                     select_count = available_options
                 else:
                     max_possible = min(4, available_options)
                     min_possible = min(2, available_options)
-
                     weights_map = {
                         2: [1.0],
                         3: [0.3, 0.7],
                         4: [0.1, 0.5, 0.4],
                         5: [0.1, 0.4, 0.3, 0.2],
                     }
-
                     weights = weights_map.get(max_possible, [0.3, 0.4, 0.3])
                     possible_counts = list(range(min_possible, max_possible + 1))
-
-                    weights = weights[:len(possible_counts)]
-
+                    weights = weights[: len(possible_counts)]
                     weights_sum = sum(weights)
                     if weights_sum > 0:
-                        weights = [w / weights_sum for w in weights]
+                        weights = [weight / weights_sum for weight in weights]
+                    select_count = random.choices(
+                        possible_counts, weights=weights, k=1
+                    )[0]
+                selected = random.sample(labels, select_count) if select_count else []
+                answer = "".join(sorted(selected))
+            elif q_type == "single":
+                answer = random.choice(labels)
+            else:
+                return ""
 
-                    select_count = random.choices(possible_counts, weights=weights, k=1)[0]
-
-                selected_options = random.sample(_op_list, select_count) if select_count > 0 else []
-
-                for option in selected_options:
-                    answer += option[:1]  # 取首字为答案，例如A或B
-
-                answer = "".join(sorted(answer))
-            elif q["type"] == "single":
-                answer = random.choice(options.split("\n"))[:1]  # 取首字为答案, 例如A或B
-            # 判断题处理
-            elif q["type"] == "judgement":
-                # answer = self.tiku.jugement_select(_answer)
-                answer = "true" if random.choice([True, False]) else "false"
             logger.info(f"随机选择 -> {answer}")
             return answer
 
@@ -709,20 +866,6 @@ class Chaoxing:
                 return None
             else:
                 return res
-
-        def clean_res(res):
-            cleaned_res = []
-            if isinstance(res, str):
-                res = [res]
-            for c in res:
-                cleaned = re.sub(r'^[A-Za-z]|[.,!?;:，。！？；：]', '', c)
-                cleaned_res.append(cleaned.strip())
-
-            return cleaned_res
-
-        def is_subsequence(a, o):
-            iter_o = iter(o)
-            return all(c in iter_o for c in a)
 
         # FIXME: Use tenacity for retrying
         def with_retry(max_retries=3, delay=1):
@@ -814,67 +957,31 @@ class Chaoxing:
             res = self.tiku.query(q)
             _raise_if_cancelled(cancel_event)
             answer = ""
+            parts = []
             if not res:
                 # 随机答题
-                answer = random_answer(q["options"])
+                answer = random_answer(q["options"], q["type"])
                 q[f'answerSource{q["id"]}'] = "random"
             else:
                 # 根据响应结果选择答案
                 if q["type"] == "multiple":
-                    # 多选处理
-                    options_list = multi_cut(q["options"])
-                    if options_list is not None:
-                        # 1) 优先尝试直接使用 AI 返回的选项字母（例如 "ACD" 或 ["A", "C"]）
-                        opt_letters = "".join(o[:1] for o in options_list)
-                        letters_raw = "".join(ch for ch in str(res) if ch.isalpha()).upper()
-                        letters_filtered = "".join(ch for ch in letters_raw if ch in opt_letters)
-                        if letters_filtered:
-                            # 去重并排序，保证提交格式稳定
-                            unique_letters = []
-                            for ch in letters_filtered:
-                                if ch not in unique_letters:
-                                    unique_letters.append(ch)
-                            answer = "".join(sorted(unique_letters))
-                        else:
-                            # 2) 回退到基于选项内容的子序列匹配
-                            res_list = multi_cut(res)
-                            if res_list is not None:
-                                for _a in clean_res(res_list):
-                                    for o in options_list:
-                                        if is_subsequence(_a, o):  # 去掉各种符号和前面ABCD的答案应当是选项的子序列
-                                            answer += o[:1]
-                                # 对答案进行排序, 否则会提交失败
-                                answer = "".join(sorted(answer))
-                    # else 如果分割失败那么就直接到下面去随机选
+                    answer = _resolve_choice_answer(res, q["options"], multiple=True)
                 elif q["type"] == "single":
-                    # 单选题：优先解析为选项字母，其次再根据选项文本匹配
-                    options_list = multi_cut(q["options"])
-                    if options_list is not None:
-                        opt_letters = "".join(o[:1] for o in options_list)
-                        letters_raw = "".join(ch for ch in str(res) if ch.isalpha()).upper()
-                        letters_filtered = "".join(ch for ch in letters_raw if ch in opt_letters)
-                        if len(letters_filtered) == 1:
-                            # AI 已经明确给出单个选项字母
-                            answer = letters_filtered
-                        else:
-                            # 回退到基于选项文本的匹配逻辑
-                            t_res = clean_res(res)
-                            if t_res:
-                                for o in options_list:
-                                    if is_subsequence(t_res[0], o):
-                                        answer = o[:1]
-                                        break
+                    answer = _resolve_choice_answer(res, q["options"], multiple=False)
                 elif q["type"] == "judgement":
                     answer = "true" if self.tiku.judgement_select(res) else "false"
                 elif q["type"] == "completion":
                     # 填空题 / 完成题：直接使用题库返回的文本；如果是列表则拼接，避免答案被清空
                     if isinstance(res, list):
-                        # 将多个空的答案用换行拼接，确保每个空的内容都被保留
-                        parts = [str(part).strip() for part in res if str(part).strip()]
+                        # 保留空字符串的位置，避免后续 indexed 字段发生错位
+                        parts = [str(part).strip() for part in res]
                         answer = "\n".join(parts)
                     elif isinstance(res, str):
-                        answer = res.strip()
+                        parts = res.splitlines() if any(char in res for char in "\r\n") else [res]
+                        parts = [part.strip() for part in parts]
+                        answer = "\n".join(parts).strip()
                     else:
+                        parts = [str(res).strip()]
                         answer = str(res).strip()
                 else:
                     # 其他类型直接使用答案 （目前仅知有简答题，待补充处理）
@@ -882,14 +989,26 @@ class Chaoxing:
 
                 if not answer:  # 检查 answer 是否为空
                     logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                    answer = random_answer(q["options"])  # 如果为空，则随机选择答案
+                    answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
                     q[f'answerSource{q["id"]}'] = "random"
                 else:
                     logger.info(f"成功获取到答案：{answer}")
                     q[f'answerSource{q["id"]}'] = "cover"
                     inc_found()
             # 填充答案
-            q["answerField"][f'answer{q["id"]}'] = answer
+            answer_key = f'answer{q["id"]}'
+            q["answerField"][answer_key] = answer
+            if q["type"] == "completion":
+                indexed_fields = []
+                for key in q["answerField"]:
+                    match = re.fullmatch(rf"{re.escape(answer_key)}_(\d+)", str(key))
+                    if match:
+                        indexed_fields.append((int(match.group(1)), key))
+                indexed_fields.sort(key=lambda item: item[0])
+                for position, (_, key) in enumerate(indexed_fields):
+                    q["answerField"][key] = (
+                        parts[position] if position < len(parts) else ""
+                    )
             logger.info(f'{q["title"]} 填写答案为 {answer}')
 
         # 若使用 AI 题库，则在同一张卷内并发搜题，避免单题串行阻塞

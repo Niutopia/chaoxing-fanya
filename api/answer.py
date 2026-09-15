@@ -59,8 +59,69 @@ def _prepare_option_lines(options) -> list[str]:
     return cleaned
 
 
+_OPTION_LABEL_PREFIX_RE = re.compile(
+    r"^\s*(?:[\(\[【]\s*)?([A-Za-z]+)"
+    r"(?:\s*[\.．,，、:：\)）]\s*|(\s+))"
+)
+
+
 def _clean_option_prefix(option: str) -> str:
-    return re.sub(r"^[A-Za-z]\.?,?、?\s*", "", option).strip()
+    """Remove an explicit option prefix without trimming ordinary words."""
+
+    text = str(option or "").strip()
+    match = _OPTION_LABEL_PREFIX_RE.match(text)
+    if not match:
+        return text
+    # A whitespace-only separator is accepted for conventional uppercase
+    # labels (A, B, ... AA), but not for ordinary words such as ``cat dog``.
+    if match.group(2) and (
+        not match.group(1).isupper() or len(match.group(1)) > 2
+    ):
+        return text
+    return text[match.end():].strip()
+
+
+def _option_label_for_index(index: int) -> str:
+    """Return Excel-style A-Z, AA... labels for a zero-based index."""
+
+    number = index + 1
+    label = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        label = chr(ord("A") + remainder) + label
+    return label
+
+
+def _labeled_option_lines(options) -> tuple[list[str], list[str]]:
+    """Preserve existing option labels or generate stable A-Z labels."""
+
+    raw_lines = _prepare_option_lines(options)
+    labeled_lines: list[str] = []
+    labels: list[str] = []
+    used_labels: set[str] = set()
+    for index, raw_line in enumerate(raw_lines):
+        match = _OPTION_LABEL_PREFIX_RE.match(raw_line)
+        if match and match.group(2) and (
+            not match.group(1).isupper() or len(match.group(1)) > 2
+        ):
+            match = None
+        label = match.group(1).upper() if match else ""
+        if not label or label in used_labels:
+            label = _option_label_for_index(index)
+            while label in used_labels:
+                label = _option_label_for_index(len(labels))
+        used_labels.add(label)
+        text = _clean_option_prefix(raw_line)
+        labeled_lines.append(f"{label}. {text}" if text else f"{label}.")
+        labels.append(label)
+    return labeled_lines, labels
+
+
+def _with_choice_label_instruction(prompt: str, q_type: str, labels: list[str]) -> str:
+    if q_type not in {"single", "multiple"} or not labels:
+        return prompt
+    label_hint = "、".join(labels)
+    return f"{prompt}\n本题合法选项标签：{label_hint}。答案只能使用这些标签。"
 
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
@@ -946,7 +1007,7 @@ class AI(Tiku):
         self._system_prompts = {
             "single": (
                 "单选题答题。直接输出JSON，禁止解释、思考过程或Markdown。\n"
-                "格式：{\"Answer\": [\"B\"]}  （B为正确选项字母，仅填A/B/C/D之一）"
+                "格式：{\"Answer\": [\"B\"]}  （填题目中提供的一个合法选项字母）"
             ),
             "multiple": (
                 "多选题答题。直接输出JSON，禁止解释、思考过程或Markdown。\n"
@@ -1030,9 +1091,10 @@ class AI(Tiku):
             self.last_request_time = time.time()
 
     def _build_messages(self, q_info: dict) -> list[dict]:
-        options = [_clean_option_prefix(opt) for opt in _prepare_option_lines(q_info.get('options', []))]
         q_type = q_info.get('type', 'single')
+        options, labels = _labeled_option_lines(q_info.get('options', []))
         system_prompt = self._system_prompts.get(q_type, self._system_prompts['default'])
+        system_prompt = _with_choice_label_instruction(system_prompt, q_type, labels)
         user_content = f"题目：{q_info.get('title', '')}".strip()
         if options:
             user_content = f"{user_content}\n选项：{chr(10).join(options)}"
@@ -1211,16 +1273,20 @@ class SiliconFlow(Tiku):
         }
 
         prompt_map = {
-            "single": "单选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"B\"]}（仅填选项字母）",
+            "single": "单选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"B\"]}（填写题目提供的一个合法选项字母）",
             "multiple": "多选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"A\", \"C\"]}（填所有正确选项字母）",
             "completion": "填空题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}",
             "judgement": "判断题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"正确\"]} 或 {\"Answer\": [\"错误\"]}"
         }
 
-        system_prompt = prompt_map.get(q_info.get('type'),
-                                       "直接输出JSON答案，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}")
+        q_type = q_info.get('type')
+        system_prompt = prompt_map.get(
+            q_type,
+            "直接输出JSON答案，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}",
+        )
 
-        cleaned_options = [_clean_option_prefix(opt) for opt in _prepare_option_lines(q_info.get('options', []))]
+        cleaned_options, labels = _labeled_option_lines(q_info.get('options', []))
+        system_prompt = _with_choice_label_instruction(system_prompt, q_type, labels)
         user_content = f"题目：{q_info.get('title', '')}".strip()
         if cleaned_options:
             user_content = f"{user_content}\n选项：{chr(10).join(cleaned_options)}"
