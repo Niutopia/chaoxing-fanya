@@ -343,3 +343,112 @@ def test_video_progress_is_reported_before_processor_stop():
         main.process_chapter = original
 
     assert video_updates == [(2.0, 10.0)]
+
+
+def test_later_job_failure_closes_gate_before_earlier_video_reports(monkeypatch):
+    """A later submitted failure blocks progress from an earlier job."""
+
+    video_started = threading.Event()
+    failing_started = threading.Event()
+    failed_job_done = threading.Event()
+    release_video = threading.Event()
+    video_finished = threading.Event()
+    video_updates: list[tuple[float, float]] = []
+    job_events: list[tuple[str, str]] = []
+    run_errors: list[BaseException] = []
+
+    class Engine:
+        rate_limiter = SimpleNamespace(limit_rate=lambda **_kwargs: None)
+
+        def get_job_list(self, _course, _point):
+            return (
+                [
+                    {"type": "video", "jobid": "video-job"},
+                    {"type": "document", "jobid": "failed-job"},
+                ],
+                {},
+            )
+
+    def fail_or_report(_chaoxing, course, job, _job_info, _speed, **kwargs):
+        if job["jobid"] == "video-job":
+            video_started.set()
+            assert release_video.wait(timeout=2)
+            try:
+                kwargs["progress_callback"](course, job, 8.0, 10.0)
+            finally:
+                video_finished.set()
+            return StudyResult.SUCCESS
+        failing_started.set()
+        raise RuntimeError("job failed")
+
+    def job_done(_course, _point, job, result):
+        job_events.append((job["jobid"], result))
+        if job["jobid"] == "failed-job":
+            failed_job_done.set()
+
+    monkeypatch.setattr(main, "process_job", fail_or_report)
+    processor = main.JobProcessor(
+        Engine(),
+        {"courseId": "course", "title": "course"},
+        [main.ChapterTask(index=0, point={"id": "chapter"})],
+        _processor_config(
+            video_progress_callback=lambda _course, _job, progress, total: video_updates.append(
+                (progress, total)
+            ),
+            job_done_callback=job_done,
+        ),
+    )
+
+    def invoke():
+        try:
+            processor.run()
+        except BaseException as exc:
+            run_errors.append(exc)
+
+    runner = threading.Thread(target=invoke)
+    runner.start()
+    assert video_started.wait(timeout=1)
+    assert failing_started.wait(timeout=1)
+    assert failed_job_done.wait(timeout=1)
+    assert processor._worker_stop_event.wait(timeout=1)
+
+    release_video.set()
+    assert video_finished.wait(timeout=1)
+    runner.join(timeout=1.5)
+
+    assert not runner.is_alive()
+    assert run_errors and isinstance(run_errors[0], RuntimeError)
+    assert ("failed-job", "failed") in job_events
+    assert video_updates == []
+
+
+def test_cancel_event_blocks_late_video_progress_before_stop_gate():
+    """Cancellation rejects a late progress callback even before stop is set."""
+
+    cancel_event = threading.Event()
+    video_updates: list[tuple[float, float]] = []
+    processor = main.JobProcessor(
+        SimpleNamespace(),
+        {"courseId": "course"},
+        [],
+        _processor_config(
+            cancel_event=cancel_event,
+            video_progress_callback=lambda _course, _job, progress, total: video_updates.append(
+                (progress, total)
+            ),
+        ),
+    )
+
+    cancel_event.set()
+    assert not processor._worker_stop_event.is_set()
+    try:
+        processor.config["video_progress_callback"](
+            {"courseId": "course"},
+            {"id": "video-job", "type": "video"},
+            9.0,
+            10.0,
+        )
+    except main.StudyCancelled:
+        pass
+
+    assert video_updates == []

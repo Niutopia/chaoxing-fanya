@@ -85,6 +85,19 @@ def _request_worker_stop(config: Mapping[str, Any] | None) -> None:
         setter()
 
 
+def _worker_callback_stop_requested(config: Mapping[str, Any] | None) -> bool:
+    """Return whether worker callbacks must reject late updates."""
+
+    if not config:
+        return False
+    for key in ("_worker_stop_event", "cancel_event"):
+        event = config.get(key)
+        is_set = getattr(event, "is_set", None)
+        if callable(is_set) and is_set():
+            return True
+    return False
+
+
 def _notify_callback(
     config: Mapping[str, Any] | None,
     name: str,
@@ -106,9 +119,7 @@ def _notify_callback(
         "job_done_callback",
         "video_progress_callback",
     }:
-        stop_event = config.get("_worker_stop_event")
-        is_set = getattr(stop_event, "is_set", None)
-        if callable(is_set) and is_set():
+        if _worker_callback_stop_requested(config):
             raise StudyCancelled()
     callback = config.get(name)
     if not callable(callback):
@@ -679,7 +690,10 @@ class JobProcessor:
                 continue
 
             def guarded_callback(*args: Any, _callback=callback, **kwargs: Any):
-                if self._worker_stop_event.is_set():
+                if (
+                    self._worker_stop_event.is_set()
+                    or self._cancel_requested()
+                ):
                     raise StudyCancelled()
                 return _callback(*args, **kwargs)
 
@@ -1047,9 +1061,22 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                     config=config,
                 )
             except StudyCancelled:
+                _request_worker_stop(config)
                 raise
             except BaseException:
-                _notify_callback(config, "job_done_callback", course, point, job, "failed")
+                try:
+                    # Preserve the failed terminal callback before closing the
+                    # worker gate; the callback itself is a worker boundary.
+                    _notify_callback(
+                        config,
+                        "job_done_callback",
+                        course,
+                        point,
+                        job,
+                        "failed",
+                    )
+                finally:
+                    _request_worker_stop(config)
                 raise
             _notify_callback(config, "job_done_callback", course, point, job, result)
             return result
@@ -1072,10 +1099,25 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                     # provider/transport is blocked.  The next bounded poll
                     # observes cancellation and unwinds the chapter.
                     continue
-                except BaseException:
+                except BaseException as error:
                     # Close the processor-local callback gate before sibling
                     # executor jobs can publish progress after this failure.
                     _request_worker_stop(config)
+                    # A sibling may have already failed while this future was
+                    # still blocked.  Do not let the gate's StudyCancelled
+                    # from that sibling hide an already-completed real error.
+                    cancel_event = config.get("cancel_event") if config else None
+                    cancel_is_set = getattr(cancel_event, "is_set", None)
+                    cancellation_requested = callable(cancel_is_set) and cancel_is_set()
+                    if isinstance(error, StudyCancelled) and not cancellation_requested:
+                        for sibling in futures:
+                            if sibling is future or not sibling.done() or sibling.cancelled():
+                                continue
+                            sibling_error = sibling.exception()
+                            if sibling_error is not None and not isinstance(
+                                sibling_error, StudyCancelled
+                            ):
+                                raise sibling_error
                     raise
     finally:
         cancel_event = config.get("cancel_event") if config else None
