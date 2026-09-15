@@ -4,7 +4,7 @@ import { cn } from '../../lib/utils'
 
 const Titlebar = React.forwardRef(function Titlebar(
   {
-    title = '超星学习助手',
+    title = 'Niutopia答题助手',
     onMenuToggle,
     sidebarOpen = false,
     className,
@@ -30,9 +30,11 @@ const Titlebar = React.forwardRef(function Titlebar(
         <Menu aria-hidden="true" size={17} strokeWidth={1.8} />
       </button>
       <div className="flex min-w-0 items-center gap-2 md:pl-1">
-        <span
+        <img
+          src="/niutopia-assistant.png"
+          alt=""
           aria-hidden="true"
-          className="size-2 rounded-full bg-accent-blue"
+          className="size-7 shrink-0 object-contain"
         />
         <span className="truncate text-sm font-semibold text-label-primary">{title}</span>
       </div>
