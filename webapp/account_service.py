@@ -111,6 +111,47 @@ class AccountService:
         return self._client_with_auth(account_id)[1]
 
     @staticmethod
+    def _close_client_resources(client: Any) -> None:
+        """Best-effort cleanup for a per-operation client and its session.
+
+        Production clients expose both a ``close`` method and an owned
+        requests session.  Lightweight test/integration doubles may expose
+        either one—or neither—so cleanup deliberately uses capability checks
+        instead of requiring a concrete Chaoxing type.  A client close hook
+        is allowed to close its session too; identity de-duplication avoids a
+        second call in that case.
+        """
+
+        closed: set[int] = set()
+
+        def close_once(resource: Any) -> None:
+            if resource is None or id(resource) in closed:
+                return
+            try:
+                close = getattr(resource, "close", None)
+            except Exception:
+                return
+            if not callable(close):
+                return
+            closed.add(id(resource))
+            try:
+                close()
+            except Exception:
+                # Cleanup must not hide a validation/course error, and fake
+                # clients are not required to implement a perfectly behaved
+                # close method.
+                return
+
+        try:
+            session = getattr(client, "session", None)
+        except Exception:
+            session = None
+        # Capture the session before closing the client: some client
+        # implementations clear their ``session`` attribute in ``close``.
+        close_once(client)
+        close_once(session)
+
+    @staticmethod
     def _use_cookies(client: Any, auth: AccountAuth | None = None) -> bool:
         # The selected account mode is authoritative.  Password accounts may
         # have refreshed session cookies after a request, but those cookies
@@ -180,11 +221,14 @@ class AccountService:
         """Validate one account and persist the result."""
 
         auth, client = self._client_with_auth(account_id)
-        self._login(account_id, client, auth)
-        profile = self.store.get_account(account_id)
-        if profile is None:
-            raise KeyError(str(account_id))
-        return profile
+        try:
+            self._login(account_id, client, auth)
+            profile = self.store.get_account(account_id)
+            if profile is None:
+                raise KeyError(str(account_id))
+            return profile
+        finally:
+            self._close_client_resources(client)
 
     def get_courses(self, account_id: str, refresh: bool = False) -> list[dict]:
         """Return a cached course list or fetch a fresh one for one account.
@@ -205,37 +249,40 @@ class AccountService:
                 return copy.deepcopy(self._course_cache[account_id])
 
         auth, client = self._client_with_auth(account_id)
-        self._login(account_id, client, auth)
         try:
-            courses = client.get_course_list()
-        except AccountServiceError:
-            raise
-        except Exception:
-            # The exception text from a requests/parser stack is not safe to
-            # expose because it can include request details or cookies.
-            raise CourseRetrievalError("course retrieval failed") from None
-        if courses is None:
-            courses = []
-        if not isinstance(courses, list):
+            self._login(account_id, client, auth)
             try:
-                courses = list(courses)
-            except TypeError:
+                courses = client.get_course_list()
+            except AccountServiceError:
+                raise
+            except Exception:
+                # The exception text from a requests/parser stack is not safe
+                # to expose because it can include request details or cookies.
                 raise CourseRetrievalError("course retrieval failed") from None
-        # Validate/copy before replacing the cache.  A failed deepcopy leaves
-        # the prior successful entry intact and is reported as a retrieval
-        # failure rather than becoming a Flask 500 response.
-        try:
-            copied_courses = copy.deepcopy(courses)
-        except Exception:
-            raise CourseRetrievalError("course retrieval failed") from None
-        with self._cache_lock:
-            self._course_cache[account_id] = copied_courses
-        try:
-            return copy.deepcopy(copied_courses)
-        except Exception:
-            # The cache is already a valid successful result.  A caller-side
-            # copy failure must not discard it or expose the original object.
-            raise CourseRetrievalError("course retrieval failed") from None
+            if courses is None:
+                courses = []
+            if not isinstance(courses, list):
+                try:
+                    courses = list(courses)
+                except TypeError:
+                    raise CourseRetrievalError("course retrieval failed") from None
+            # Validate/copy before replacing the cache.  A failed deepcopy leaves
+            # the prior successful entry intact and is reported as a retrieval
+            # failure rather than becoming a Flask 500 response.
+            try:
+                copied_courses = copy.deepcopy(courses)
+            except Exception:
+                raise CourseRetrievalError("course retrieval failed") from None
+            with self._cache_lock:
+                self._course_cache[account_id] = copied_courses
+            try:
+                return copy.deepcopy(copied_courses)
+            except Exception:
+                # The cache is already a valid successful result.  A caller-side
+                # copy failure must not discard it or expose the original object.
+                raise CourseRetrievalError("course retrieval failed") from None
+        finally:
+            self._close_client_resources(client)
 
     def invalidate_courses(self, account_id: str) -> None:
         """Forget cached courses after an account credential mutation."""

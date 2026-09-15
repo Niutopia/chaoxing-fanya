@@ -2,36 +2,41 @@ import apiClient, { apiRequest } from './client'
 
 const accountPath = (accountId) => `/accounts/${encodeURIComponent(accountId)}`
 
-export function listAccounts() {
-  return apiRequest(apiClient.get('/accounts'))
+function requestConfig(options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined
+  return signal ? { signal } : {}
 }
 
-export function createAccount(payload) {
-  return apiRequest(apiClient.post('/accounts', payload))
+export function listAccounts(options = {}) {
+  return apiRequest(apiClient.get('/accounts', requestConfig(options)))
 }
 
-export function getAccount(accountId) {
-  return apiRequest(apiClient.get(accountPath(accountId)))
+export function createAccount(payload, options = {}) {
+  return apiRequest(apiClient.post('/accounts', payload, requestConfig(options)))
 }
 
-export function updateAccount(accountId, payload) {
-  return apiRequest(apiClient.patch(accountPath(accountId), payload))
+export function getAccount(accountId, options = {}) {
+  return apiRequest(apiClient.get(accountPath(accountId), requestConfig(options)))
 }
 
-export function setAccountEnabled(accountId, enabled) {
-  return updateAccount(accountId, { enabled: Boolean(enabled) })
+export function updateAccount(accountId, payload, options = {}) {
+  return apiRequest(apiClient.patch(accountPath(accountId), payload, requestConfig(options)))
 }
 
-export function patchAccount(accountId, payload) {
-  return updateAccount(accountId, payload)
+export function setAccountEnabled(accountId, enabled, options = {}) {
+  return updateAccount(accountId, { enabled: Boolean(enabled) }, options)
 }
 
-export function deleteAccount(accountId) {
-  return apiRequest(apiClient.delete(accountPath(accountId)))
+export function patchAccount(accountId, payload, options = {}) {
+  return updateAccount(accountId, payload, options)
 }
 
-export function verifyAccount(accountId) {
-  return apiRequest(apiClient.post(`${accountPath(accountId)}/verify`))
+export function deleteAccount(accountId, options = {}) {
+  return apiRequest(apiClient.delete(accountPath(accountId), requestConfig(options)))
+}
+
+export function verifyAccount(accountId, options = {}) {
+  return apiRequest(apiClient.post(`${accountPath(accountId)}/verify`, undefined, requestConfig(options)))
 }
 
 function refreshValue(options) {
@@ -43,6 +48,7 @@ export function getCourses(accountId, options = {}) {
   return apiRequest(
     apiClient.get(`${accountPath(accountId)}/courses`, {
       params: { refresh: refreshValue(options) ? 1 : 0 },
+      ...requestConfig(options),
     }),
   )
 }
@@ -50,12 +56,12 @@ export function getCourses(accountId, options = {}) {
 export const listCourses = getCourses
 export const getAccountCourses = getCourses
 
-export function getPreferences(accountId) {
-  return apiRequest(apiClient.get(`${accountPath(accountId)}/preferences`))
+export function getPreferences(accountId, options = {}) {
+  return apiRequest(apiClient.get(`${accountPath(accountId)}/preferences`, requestConfig(options)))
 }
 
-export function updatePreferences(accountId, payload) {
-  return apiRequest(apiClient.put(`${accountPath(accountId)}/preferences`, payload))
+export function updatePreferences(accountId, payload, options = {}) {
+  return apiRequest(apiClient.put(`${accountPath(accountId)}/preferences`, payload, requestConfig(options)))
 }
 
 export const savePreferences = updatePreferences

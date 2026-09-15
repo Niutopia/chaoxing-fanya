@@ -84,7 +84,7 @@ test('tests the edited connection and preserves a saved key when replacement is 
   expect(testAnswerConnection).toHaveBeenCalledWith(expect.objectContaining({
     base_url: 'http://localhost:8849/v1',
     model: 'gemini-3.8-flash-high',
-  }))
+  }), { signal: expect.any(AbortSignal) })
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   expect(saveAnswerConnection.mock.calls[0][0]).not.toHaveProperty('api_key')
 })
@@ -129,7 +129,10 @@ test('clears the draft key after a successful connection save', async () => {
   const key = await screen.findByLabelText('替换 API Key')
   await user.type(key, 'new-secret')
   await user.click(screen.getByRole('button', { name: '保存连接' }))
-  expect(saveAnswerConnection).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'new-secret' }))
+  expect(saveAnswerConnection).toHaveBeenCalledWith(
+    expect.objectContaining({ api_key: 'new-secret' }),
+    { signal: expect.any(AbortSignal) },
+  )
   expect(key).toHaveValue('')
 })
 
@@ -344,7 +347,11 @@ test('does not let an older combined save overwrite a switched account load erro
 
   await screen.findByText('账号 A')
   await user.click(screen.getByRole('button', { name: '保存设置' }))
-  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith('account-a', expect.any(Object)))
+  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith(
+    'account-a',
+    expect.any(Object),
+    { signal: expect.any(AbortSignal) },
+  ))
 
   await user.selectOptions(screen.getByLabelText('当前账户'), 'account-b')
   expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
@@ -538,9 +545,13 @@ test('does not render notification or OCR secrets and uses endpoint for OCR draf
   await user.type(replacement, 'new-ocr-secret')
   await user.click(screen.getByRole('button', { name: '保存设置' }))
 
-  expect(savePreferences).toHaveBeenCalledWith('account-a', expect.objectContaining({
-    ocr_config: expect.objectContaining({ endpoint: 'http://ocr.example.invalid/v1', api_key: 'new-ocr-secret' }),
-  }))
+  expect(savePreferences).toHaveBeenCalledWith(
+    'account-a',
+    expect.objectContaining({
+      ocr_config: expect.objectContaining({ endpoint: 'http://ocr.example.invalid/v1', api_key: 'new-ocr-secret' }),
+    }),
+    { signal: expect.any(AbortSignal) },
+  )
   const payloadText = JSON.stringify(savePreferences.mock.calls[0][1])
   expect(payloadText).not.toContain(notificationUrl)
   expect(payloadText).not.toContain(notificationToken)
@@ -549,4 +560,40 @@ test('does not render notification or OCR secrets and uses endpoint for OCR draf
   expect(payloadText).not.toContain(nestedNotificationSecret)
   expect(payloadText).not.toContain(nestedOcrSecret)
   expect(payloadText).not.toContain('nested-ocr-secret-2')
+})
+
+test('keeps newer account replacement input when the account save resolves late', async () => {
+  const user = userEvent.setup()
+  let resolveAccountSave
+  getPreferences.mockResolvedValue({
+    notification_config: { enabled: true, provider: 'webhook', has_token: true },
+    ocr_config: { enabled: false, provider: '', endpoint: '', model: '', has_api_key: true },
+  })
+  savePreferences.mockImplementation(() => new Promise((resolve) => {
+    resolveAccountSave = resolve
+  }))
+
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
+    </MemoryRouter>,
+  )
+
+  await screen.findByText('账号 A')
+  await user.click(screen.getByText('通知'))
+  const token = screen.getByLabelText('通知 Token')
+  await user.type(token, 'first-token')
+  await user.click(screen.getByRole('button', { name: '保存设置' }))
+  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith(
+    'account-a',
+    expect.any(Object),
+    { signal: expect.any(AbortSignal) },
+  ))
+
+  await user.clear(token)
+  await user.type(token, 'newer-token')
+  resolveAccountSave({})
+  await screen.findByText('设置已保存')
+
+  expect(token).toHaveValue('newer-token')
 })

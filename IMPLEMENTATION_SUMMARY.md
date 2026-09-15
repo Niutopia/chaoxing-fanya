@@ -82,7 +82,7 @@
 chaoxing/
 ├── app.py                    # ✅ Flask API服务
 ├── main.py                   # ✅ 命令行主程序
-├── requirements.txt          # ✅ Python依赖（已添加flask-cors）
+├── requirements.txt          # ✅ 固定版本的 Python 生产依赖
 ├── start.bat                 # ✅ Windows启动脚本
 └── api/                      # ✅ API模块
 ```
@@ -177,7 +177,7 @@ Lucide React 0.263  // 图标库
 ```
 
 ### 依赖管理
-- ✅ **自动检查**: start.bat 自动检查 flask-cors 和 node_modules
+- ✅ **依赖同步**: start.bat 按 requirements.txt 与 package-lock.json 安装
 - ✅ **自动安装**: 检测到缺失时自动安装依赖
 - ✅ **依赖清单**: 完整的 [DEPENDENCIES.md](DEPENDENCIES.md) 文档
 - ✅ **版本控制**: requirements.txt 和 package.json 管理版本

@@ -70,6 +70,10 @@ class FakeAccountService:
 class FakeSession:
     def __init__(self, cookies):
         self.cookies = dict(cookies)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class FakeChaoxingClient:
@@ -81,6 +85,10 @@ class FakeChaoxingClient:
         self.session = FakeSession(auth.cookies)
         self.plan = dict(plan)
         self.login_calls: list[bool] = []
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def login(self, login_with_cookies=False):
         self.login_calls.append(login_with_cookies)
@@ -284,7 +292,7 @@ def test_partial_preferences_preserve_omitted_and_blank_advanced_secrets(
         f"/api/accounts/{saved_account.id}/preferences",
         json={
             "notification_config": {"provider": "telegram", "url": "", "token": "", "tg_chat_id": ""},
-            "ocr_config": {"endpoint": "http://ocr.example.invalid/v2", "api_key": ""},
+            "ocr_config": {"endpoint": "http://ocr.example.invalid/v1", "api_key": ""},
         },
     )
     assert blank_secret_update.status_code == 200
@@ -294,8 +302,37 @@ def test_partial_preferences_preserve_omitted_and_blank_advanced_secrets(
     assert stored.notification_config["url"] == notification_url
     assert stored.notification_config["token"] == notification_token
     assert stored.notification_config["tg_chat_id"] == notification_chat
-    assert stored.ocr_config["endpoint"] == "http://ocr.example.invalid/v2"
+    assert stored.ocr_config["endpoint"] == "http://ocr.example.invalid/v1"
     assert stored.ocr_config["api_key"] == ocr_key
+
+
+def test_ocr_endpoint_change_requires_explicit_key(client, store, saved_account):
+    store.save_preferences(
+        saved_account.id,
+        AccountPreferences(
+            ocr_config={
+                "provider": "openai",
+                "endpoint": "http://ocr.example.invalid/v1",
+                "api_key": "ocr-api-key-secret",
+            }
+        ),
+    )
+
+    response = client.put(
+        f"/api/accounts/{saved_account.id}/preferences",
+        json={
+            "ocr_config": {
+                "endpoint": "http://ocr.example.invalid/v2",
+                "api_key": "",
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "invalid_preferences"
+    stored = store.get_preferences(saved_account.id)
+    assert stored.ocr_config["endpoint"] == "http://ocr.example.invalid/v1"
+    assert stored.ocr_config["api_key"] == "ocr-api-key-secret"
 
 
 def test_patch_without_password_preserves_secret(client, store, saved_account):
@@ -431,6 +468,31 @@ def test_account_service_redacts_login_failure_and_records_invalid(tmp_path):
         service.verify(account.id)
     assert "known-password" not in str(error.value)
     assert store.get_account(account.id).verification_status == "invalid"
+
+
+def test_account_service_closes_owned_client_and_session_on_success_and_error(
+    tmp_path,
+):
+    store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
+    account = store.create_account("账号", "100", "password")
+    factory = FakeChaoxingFactory(
+        [
+            {"courses": [{"id": "course"}]},
+            {"course_exception": "temporary outage"},
+            {"login_exception": "temporary outage"},
+        ]
+    )
+    service = AccountService(store, factory)
+
+    assert service.get_courses(account.id) == [{"id": "course"}]
+    with pytest.raises(CourseRetrievalError):
+        service.get_courses(account.id, refresh=True)
+    with pytest.raises(AccountValidationError):
+        service.verify(account.id)
+
+    assert len(factory.clients) == 3
+    assert all(client.closed for client in factory.clients)
+    assert all(client.session.closed for client in factory.clients)
 
 
 def test_account_service_keeps_last_successful_courses_after_refresh_failure(

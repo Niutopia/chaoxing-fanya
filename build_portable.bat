@@ -79,9 +79,6 @@ if errorlevel 1 (
     echo    ⚠️  部分依赖安装可能失败，继续打包...
 )
 
-REM 安装 Flask-CORS
-"%PYTHON_EXE%" -m pip install --no-warn-script-location flask-cors
-
 "%PYTHON_EXE%" -m pip install --no-warn-script-location paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 if errorlevel 1 (
     echo    ⚠️  OCR 依赖 paddlepaddle 安装失败，便携版将无法使用本地 OCR

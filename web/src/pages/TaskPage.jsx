@@ -13,6 +13,7 @@ import { cn } from '../lib/utils'
 
 const ACTIVE_STATES = new Set(['running', 'stopping'])
 const TERMINAL_STATES = new Set(['completed', 'failed', 'stopped'])
+const KNOWN_TASK_STATES = new Set([...ACTIVE_STATES, ...TERMINAL_STATES])
 
 function unwrap(value, keys = []) {
   if (value && typeof value === 'object') {
@@ -149,8 +150,14 @@ function formatElapsed(value) {
 function normalizeSnapshot(value, taskId = '') {
   const source = unwrap(value, ['task', 'snapshot'])
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null
-  const id = scalarText(source.id ?? source.task_id ?? source.taskId) ?? String(taskId)
-  const state = scalarText(source.state) ?? 'running'
+  const id = scalarText(source.id) ?? scalarText(source.task_id) ?? scalarText(source.taskId)
+  const routeId = scalarText(taskId)
+  const state = scalarText(source.state)?.toLowerCase()
+  // A task response is only useful when it identifies the task that the
+  // route is currently displaying. Never synthesize an id from the route or
+  // a running state from an empty/partial response: doing so can make `{}`
+  // look like a live task and keep polling forever.
+  if (!id || !routeId || id !== routeId || !state || !KNOWN_TASK_STATES.has(state)) return null
   return {
     id,
     account_id: scalarText(source.account_id ?? source.accountId),
@@ -203,6 +210,12 @@ function normalizeLogPage(value) {
 
 function isNotFound(error) {
   return error?.status === 404 || error?.code === 'task_not_found'
+}
+
+function invalidSnapshotError() {
+  const error = new Error('任务状态响应格式异常')
+  error.code = 'task_response_invalid'
+  return error
 }
 
 function safeErrorMessage(error, fallback) {
@@ -422,6 +435,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const [logs, setLogs] = useState([])
   const [notFound, setNotFound] = useState(false)
   const [snapshotError, setSnapshotError] = useState(false)
+  const [snapshotFormatError, setSnapshotFormatError] = useState(false)
   const [detailsError, setDetailsError] = useState(false)
   const [logsError, setLogsError] = useState(false)
   const [requestError, setRequestError] = useState('')
@@ -435,6 +449,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const cancelRequestedRef = useRef(false)
   const cancelTriggerRef = useRef(null)
   const monitorBackLinkRef = useRef(null)
+  const cancelControllerRef = useRef(null)
 
   const currentGeneration = taskGenerationRef.current.generation
 
@@ -444,6 +459,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     setLogs([])
     setNotFound(false)
     setSnapshotError(false)
+    setSnapshotFormatError(false)
     setDetailsError(false)
     setLogsError(false)
     setRequestError('')
@@ -455,6 +471,12 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     cursorRef.current = 0
     seenSequencesRef.current = new Set()
     cancelRequestedRef.current = false
+    cancelControllerRef.current?.abort()
+    cancelControllerRef.current = null
+    return () => {
+      cancelControllerRef.current?.abort()
+      cancelControllerRef.current = null
+    }
   }, [taskId])
 
   useEffect(() => {
@@ -463,20 +485,32 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     return () => window.clearInterval(timer)
   }, [snapshot?.state])
 
-  const loadSnapshotAndDetails = useCallback(async () => {
-    const [snapshotResult, detailsResult] = await Promise.allSettled([
-      getTask(taskId),
-      getTaskDetails(taskId),
-    ])
-    if (snapshotResult.status === 'rejected') throw snapshotResult.reason
+  const loadSnapshotAndDetails = useCallback(async (signal) => {
+    // Start both requests together so the details panel keeps its existing
+    // latency, but validate the authoritative snapshot as soon as it settles.
+    // A malformed snapshot therefore stops this polling round immediately
+    // instead of waiting for a potentially stalled details request.
+    const snapshotPromise = getTask(taskId, { signal })
+    const detailsPromise = Promise.resolve(getTaskDetails(taskId, { signal }))
+      .then(
+        (value) => ({ status: 'fulfilled', value }),
+        (reason) => ({ status: 'rejected', reason }),
+      )
+    const snapshotValue = await snapshotPromise
+    const nextSnapshot = normalizeSnapshot(snapshotValue, taskId)
+    if (!nextSnapshot) throw invalidSnapshotError()
+    const detailsResult = await detailsPromise
     return {
-      snapshot: normalizeSnapshot(snapshotResult.value, taskId),
+      snapshot: nextSnapshot,
       details: detailsResult.status === 'fulfilled' ? normalizeDetails(detailsResult.value) : null,
       detailsError: detailsResult.status === 'rejected' ? detailsResult.reason : null,
     }
   }, [taskId])
 
-  const monitorEnabled = Boolean(taskId) && !notFound && (snapshot === null || ACTIVE_STATES.has(snapshot.state))
+  const monitorEnabled = Boolean(taskId)
+    && !notFound
+    && !snapshotFormatError
+    && (snapshot === null || ACTIVE_STATES.has(snapshot.state))
 
   const handleSnapshotData = useCallback((result) => {
     const nextSnapshot = result?.snapshot
@@ -502,6 +536,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     }
     setSnapshotError(true)
     setRequestError(safeErrorMessage(error, '任务状态加载失败'))
+    if (error?.code === 'task_response_invalid') setSnapshotFormatError(true)
   }, [])
 
   usePolling(loadSnapshotAndDetails, {
@@ -511,8 +546,8 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     onError: handleSnapshotError,
   })
 
-  const loadLogs = useCallback(async () => {
-    const page = await getTaskLogs(taskId, { after: cursorRef.current })
+  const loadLogs = useCallback(async (signal) => {
+    const page = await getTaskLogs(taskId, { after: cursorRef.current, signal })
     return normalizeLogPage(page)
   }, [taskId])
 
@@ -594,10 +629,13 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     cancelRequestedRef.current = true
     setCancelling(true)
     setCancelError('')
+    const controller = new AbortController()
+    cancelControllerRef.current = controller
     try {
-      const result = await cancelTask(requestTaskId)
+      const result = await cancelTask(requestTaskId, { signal: controller.signal })
       if (!isCurrentRequest()) return
-      const nextSnapshot = normalizeSnapshot(result, taskId) ?? { ...snapshot, state: 'stopping' }
+      const nextSnapshot = normalizeSnapshot(result, requestTaskId)
+      if (!nextSnapshot) throw invalidSnapshotError()
       setSnapshot(nextSnapshot)
       onSnapshot?.(nextSnapshot)
       setConfirmCancel(false)
@@ -612,7 +650,11 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
         setCancelError(safeErrorMessage(error, '停止任务失败，请重试'))
       }
     } finally {
-      if (!isCurrentRequest()) return
+      if (cancelControllerRef.current === controller) cancelControllerRef.current = null
+      if (isCurrentRequest()) {
+        cancelRequestedRef.current = false
+        setCancelling(false)
+      }
     }
   }
 
@@ -673,6 +715,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       </header>
 
       {reconnecting ? <Alert className="mt-5" variant="warning" aria-live="polite">正在重新连接</Alert> : null}
+      {snapshotFormatError && requestError ? <Alert className="mt-5" variant="danger" aria-live="polite">{requestError}</Alert> : null}
       {snapshot.error ? <Alert className="mt-5" variant="danger" aria-live="polite">{snapshot.error}</Alert> : null}
 
       <div className="mt-7 grid items-start gap-6 md:grid-cols-[minmax(0,1.1fr)_minmax(260px,0.9fr)]">
@@ -784,6 +827,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
 export {
   ACTIVE_STATES,
   TERMINAL_STATES,
+  KNOWN_TASK_STATES,
   normalizeDetails,
   normalizeLogPage,
   normalizeSnapshot,

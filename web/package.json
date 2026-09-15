@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -12,12 +15,12 @@
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.23",
-    "axios": "^1.7.2",
+    "axios": "^1.20.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.263.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.6",
+    "react-router-dom": "^7.18.3",
     "tailwind-merge": "^2.3.0"
   },
   "devDependencies": {
@@ -26,12 +29,12 @@
     "@testing-library/user-event": "^14.6.7",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^5.2.0",
     "autoprefixer": "^10.4.19",
     "jsdom": "^25.0.1",
-    "postcss": "^8.4.38",
+    "postcss": "^8.5.28",
     "tailwindcss": "^3.4.4",
-    "vite": "^5.3.1",
-    "vitest": "^2.1.9"
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
   }
 }

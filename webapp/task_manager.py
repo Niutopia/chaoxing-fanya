@@ -35,6 +35,7 @@ from .models import (
 
 
 DEFAULT_LOG_CAPACITY = 5_000
+DEFAULT_TERMINAL_TASK_CAPACITY = 100
 _UNSET = object()
 
 
@@ -434,6 +435,7 @@ class TaskManager:
         *,
         answer_semaphore: threading.Semaphore | None = None,
         log_capacity: int = DEFAULT_LOG_CAPACITY,
+        terminal_task_capacity: int = DEFAULT_TERMINAL_TASK_CAPACITY,
     ) -> None:
         if (
             isinstance(max_active_accounts, bool)
@@ -447,10 +449,17 @@ class TaskManager:
             or log_capacity < 1
         ):
             raise ValueError("log_capacity must be a positive integer")
+        if (
+            isinstance(terminal_task_capacity, bool)
+            or not isinstance(terminal_task_capacity, int)
+            or terminal_task_capacity < 1
+        ):
+            raise ValueError("terminal_task_capacity must be a positive integer")
         self.runner = runner
         self.max_active_accounts = max_active_accounts
         self.answer_semaphore = answer_semaphore
         self.log_capacity = log_capacity
+        self.terminal_task_capacity = terminal_task_capacity
         self._lock = threading.RLock()
         # Keep this name public-ish: account routes use the manager as their
         # active-task guard, and diagnostics benefit from a simple mapping.
@@ -700,7 +709,39 @@ class TaskManager:
         if not record.slot_released:
             record.slot_released = True
             self._active_slots.release()
+        # The runner has unwound and no longer needs decrypted credentials.
+        # Retain only non-secret metadata needed by the monitor UI.
+        record.context = replace(
+            record.context,
+            auth=AccountAuth(
+                username="",
+                password="",
+                cookies={},
+                auth_mode=record.context.auth.auth_mode,
+            ),
+            answer=(
+                replace(record.context.answer, api_key=None, has_api_key=False)
+                if record.context.answer is not None
+                else None
+            ),
+            preferences=replace(
+                record.context.preferences,
+                notification_config={},
+                ocr_config={},
+            ),
+            answer_semaphore=None,
+        )
         record.done.set()
+        terminal = [
+            item
+            for item in self._tasks.values()
+            if item.snapshot.state not in {"running", "stopping"}
+        ]
+        terminal.sort(
+            key=lambda item: item.snapshot.finished_at or item.snapshot.started_at or 0
+        )
+        for stale in terminal[: -self.terminal_task_capacity]:
+            self._tasks.pop(stale.snapshot.id, None)
 
     def cancel(self, task_id: str) -> TaskSnapshot:
         """Request cooperative cancellation and return the new snapshot."""
@@ -847,7 +888,7 @@ class TaskManager:
 
         with self._lock:
             record = self._tasks.get(str(task_id))
-            if record is None:
+            if record is None or record.snapshot.state not in {"running", "stopping"}:
                 return None
             record.next_sequence += 1
             entry = TaskLogEntry(
@@ -887,6 +928,7 @@ from .task_logging import run_with_task_context
 __all__ = [
     "AccountTaskConflict",
     "DEFAULT_LOG_CAPACITY",
+    "DEFAULT_TERMINAL_TASK_CAPACITY",
     "StudyRunContext",
     "TaskCapacityReached",
     "TaskDetails",

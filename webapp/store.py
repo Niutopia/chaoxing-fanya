@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import uuid
@@ -13,6 +14,25 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .crypto import SecretBox
+from .answer_connection import (
+    DEFAULT_MAX_CONCURRENCY,
+    MAX_API_KEY_LENGTH,
+    MAX_BASE_URL_LENGTH,
+    MAX_CONCURRENCY,
+    MAX_MODEL_LENGTH,
+    MAX_RETRIES,
+    MAX_TIMEOUT_SECONDS,
+)
+from .limits import (
+    MAX_ACCOUNT_NAME_LENGTH,
+    MAX_ACCOUNT_PASSWORD_LENGTH,
+    MAX_ACCOUNT_USERNAME_LENGTH,
+    MAX_COURSE_ID_LENGTH,
+    MAX_SELECTED_COURSE_IDS,
+    validate_config_shape,
+    validate_cookie_mapping,
+    validate_text,
+)
 from .models import (
     AccountAuth,
     AccountPreferences,
@@ -31,6 +51,7 @@ _RUNTIME_SETTINGS_KEY = "runtime"
 _ANSWER_SECRET_KEY = "answer_api_key"
 _ANSWER_TEST_STATUS = "_last_test_status"
 _ANSWER_TEST_FINGERPRINT = "_last_test_fingerprint"
+_PREFERENCE_SECRET_PREFIX = "fernet:v1:"
 
 
 _SCHEMA = """
@@ -97,6 +118,56 @@ def _json_load(value: str, default: Any) -> Any:
         return default
 
 
+def _validate_account_text(value: Any, max_length: int, field_name: str) -> str:
+    text = validate_text(value, max_length, field_name=field_name)
+    if not text.strip():
+        raise ValueError(f"{field_name} must not be blank")
+    return text
+
+
+def _validate_secret_text(value: Any, max_length: int, field_name: str) -> str:
+    return validate_text(value, max_length, field_name=field_name)
+
+
+def _validate_preferences(value: AccountPreferences) -> None:
+    selected = value.selected_course_ids
+    if not isinstance(selected, list):
+        raise ValueError("selected_course_ids must be a list")
+    if len(selected) > MAX_SELECTED_COURSE_IDS:
+        raise ValueError("too many selected courses")
+    if any(
+        not isinstance(course_id, str) or len(course_id) > MAX_COURSE_ID_LENGTH
+        for course_id in selected
+    ):
+        raise ValueError("invalid selected course id")
+    try:
+        speed = float(value.speed)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid speed") from None
+    if not math.isfinite(speed) or not 1.0 <= speed <= 2.0:
+        raise ValueError("invalid speed")
+    if (
+        isinstance(value.jobs, bool)
+        or not isinstance(value.jobs, int)
+        or not 1 <= value.jobs <= 10
+    ):
+        raise ValueError("invalid jobs")
+    if value.notopen_action not in {"retry", "continue"}:
+        raise ValueError("invalid notopen_action")
+    if not isinstance(value.answer_enabled, bool) or not isinstance(
+        value.answer_auto_submit, bool
+    ):
+        raise ValueError("invalid answer preference")
+    try:
+        cover_rate = float(value.answer_cover_rate)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid answer_cover_rate") from None
+    if not math.isfinite(cover_rate) or not 0.0 <= cover_rate <= 1.0:
+        raise ValueError("invalid answer_cover_rate")
+    validate_config_shape(value.notification_config, field_name="notification_config")
+    validate_config_shape(value.ocr_config, field_name="ocr_config")
+
+
 class SQLiteStore:
     """Encrypted account/settings store backed by SQLite.
 
@@ -109,7 +180,9 @@ class SQLiteStore:
         self.db_path = Path(db_path)
         self.secret_box = secret_box
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.chmod(0o700)
         self._initialize_schema()
+        self.db_path.chmod(0o600)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -129,6 +202,7 @@ class SQLiteStore:
     def _initialize_schema(self) -> None:
         # DDL is serialized so two app instances starting against the same
         # persistent volume cannot race while creating the schema.
+        migrated_preferences = False
         with _SCHEMA_LOCK:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)
@@ -192,6 +266,61 @@ class SQLiteStore:
                         "last_verified_at = NULL, updated_at = ? WHERE id = ?",
                         (mode, password_token, cookies_token, _utc_now(), row["id"]),
                     )
+                migrated_preferences = self._migrate_preference_configs(connection)
+
+            if migrated_preferences:
+                # Updating a SQLite row does not guarantee that the previous
+                # plaintext disappears from free pages or the WAL.  Compact the
+                # database once after the one-time migration so an old webhook
+                # token or OCR key is not recoverable from the volume bytes.
+                with self._connection() as connection:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    connection.execute("VACUUM")
+
+    def _encrypt_preference_config(self, value: Mapping[str, Any]) -> str:
+        validate_config_shape(value)
+        plaintext = _json_dump(dict(value))
+        return _PREFERENCE_SECRET_PREFIX + self.secret_box.encrypt(plaintext)
+
+    def _decrypt_preference_config(self, value: str) -> dict[str, Any]:
+        if not isinstance(value, str):
+            return {}
+        if value.startswith(_PREFERENCE_SECRET_PREFIX):
+            token = value[len(_PREFERENCE_SECRET_PREFIX) :]
+            decoded = _json_load(self.secret_box.decrypt(token), {})
+        else:
+            # Read compatibility for databases created before preference
+            # configs were encrypted.  Startup migrates these values in place.
+            decoded = _json_load(value, {})
+        return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+    def _migrate_preference_configs(self, connection: sqlite3.Connection) -> bool:
+        rows = connection.execute(
+            "SELECT account_id, notification_config, ocr_config "
+            "FROM account_preferences"
+        ).fetchall()
+        migrated = False
+        for row in rows:
+            notification = row["notification_config"]
+            ocr = row["ocr_config"]
+            next_notification = notification
+            next_ocr = ocr
+            if not str(notification).startswith(_PREFERENCE_SECRET_PREFIX):
+                next_notification = self._encrypt_preference_config(
+                    self._decrypt_preference_config(notification)
+                )
+            if not str(ocr).startswith(_PREFERENCE_SECRET_PREFIX):
+                next_ocr = self._encrypt_preference_config(
+                    self._decrypt_preference_config(ocr)
+                )
+            if next_notification != notification or next_ocr != ocr:
+                connection.execute(
+                    "UPDATE account_preferences SET notification_config = ?, "
+                    "ocr_config = ?, updated_at = ? WHERE account_id = ?",
+                    (next_notification, next_ocr, _utc_now(), row["account_id"]),
+                )
+                migrated = True
+        return migrated
 
     @staticmethod
     def _profile_from_row(row: sqlite3.Row) -> AccountProfile:
@@ -223,9 +352,7 @@ class SQLiteStore:
 
     @staticmethod
     def _normalize_cookies(cookies: Mapping[str, Any]) -> dict[str, str]:
-        if not isinstance(cookies, Mapping):
-            raise TypeError("cookies must be a mapping")
-        return {str(key): str(value) for key, value in cookies.items()}
+        return validate_cookie_mapping(cookies)
 
     def _encrypt_cookies(self, cookies: Mapping[str, Any] | None) -> str | None:
         if cookies is None:
@@ -247,17 +374,14 @@ class SQLiteStore:
     def _default_preferences() -> AccountPreferences:
         return AccountPreferences()
 
-    @staticmethod
-    def _preferences_from_row(row: sqlite3.Row) -> AccountPreferences:
+    def _preferences_from_row(self, row: sqlite3.Row) -> AccountPreferences:
         selected_course_ids = _json_load(row["selected_course_ids"], [])
         if not isinstance(selected_course_ids, list):
             selected_course_ids = []
-        notification_config = _json_load(row["notification_config"], {})
-        if not isinstance(notification_config, Mapping):
-            notification_config = {}
-        ocr_config = _json_load(row["ocr_config"], {})
-        if not isinstance(ocr_config, Mapping):
-            ocr_config = {}
+        notification_config = self._decrypt_preference_config(
+            row["notification_config"]
+        )
+        ocr_config = self._decrypt_preference_config(row["ocr_config"])
         return AccountPreferences(
             selected_course_ids=[str(course_id) for course_id in selected_course_ids],
             speed=float(row["speed"]),
@@ -359,6 +483,19 @@ class SQLiteStore:
         cookies: Mapping[str, Any] | None = None,
         auth_mode: Literal["password", "cookies"] | None = None,
     ) -> AccountProfile:
+        name = _validate_account_text(name, MAX_ACCOUNT_NAME_LENGTH, "name")
+        username = _validate_account_text(
+            username, MAX_ACCOUNT_USERNAME_LENGTH, "username"
+        )
+        if password is not None:
+            password = _validate_secret_text(
+                password, MAX_ACCOUNT_PASSWORD_LENGTH, "password"
+            )
+        if cookies is not None:
+            # Validate before generating an encrypted token so oversized
+            # values never reach the database or consume unnecessary crypto
+            # work.  ``_encrypt_cookies`` repeats normalization defensively.
+            self._normalize_cookies(cookies)
         status = self._validate_verification_status(verification_status)
         if auth_mode is None:
             # Legacy callers supplied cookies without a mode and expected the
@@ -439,9 +576,13 @@ class SQLiteStore:
             )
 
             if name is not None:
+                name = _validate_account_text(name, MAX_ACCOUNT_NAME_LENGTH, "name")
                 updates.append("name = ?")
                 values.append(str(name))
             if username is not None:
+                username = _validate_account_text(
+                    username, MAX_ACCOUNT_USERNAME_LENGTH, "username"
+                )
                 updates.append("username = ?")
                 values.append(str(username))
                 if str(username) != str(existing["username"]):
@@ -456,6 +597,10 @@ class SQLiteStore:
                 else ""
             )
             current_cookies = self._decrypt_cookies(existing["cookies_token"])
+            if password is not _UNSET and password is not None:
+                password = _validate_secret_text(
+                    password, MAX_ACCOUNT_PASSWORD_LENGTH, "password"
+                )
             password_supplied = (
                 password is not _UNSET
                 and password is not None
@@ -617,6 +762,7 @@ class SQLiteStore:
             preferences = AccountPreferences(**dict(preferences))
         if not isinstance(preferences, AccountPreferences):
             raise TypeError("preferences must be AccountPreferences")
+        _validate_preferences(preferences)
         account_id = str(account_id)
         now = _utc_now()
         with self._connection() as connection:
@@ -653,8 +799,8 @@ class SQLiteStore:
                     int(bool(preferences.answer_enabled)),
                     float(preferences.answer_cover_rate),
                     int(bool(preferences.answer_auto_submit)),
-                    _json_dump(dict(preferences.notification_config)),
-                    _json_dump(dict(preferences.ocr_config)),
+                    self._encrypt_preference_config(preferences.notification_config),
+                    self._encrypt_preference_config(preferences.ocr_config),
                     now,
                 ),
             )
@@ -729,6 +875,39 @@ class SQLiteStore:
                 max_retries = int(source["max_retries"])
             if max_concurrency is None and "max_concurrency" in source:
                 max_concurrency = int(source["max_concurrency"])
+
+        # Direct store integrations must obey the same bounds as the HTTP
+        # settings route.  Otherwise a caller could bypass Flask's 1 MiB
+        # request guard and persist arbitrarily large provider settings.
+        for field_name, value, maximum in (
+            ("base_url", base_url, MAX_BASE_URL_LENGTH),
+            ("model", model, MAX_MODEL_LENGTH),
+            ("api_key", api_key, MAX_API_KEY_LENGTH),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or len(value) > maximum
+            ):
+                raise ValueError(f"{field_name} is too long")
+        if timeout_seconds is not None:
+            try:
+                timeout_value = float(timeout_seconds)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("invalid timeout_seconds") from None
+            if not math.isfinite(timeout_value) or not 0 < timeout_value <= MAX_TIMEOUT_SECONDS:
+                raise ValueError("invalid timeout_seconds")
+            timeout_seconds = timeout_value
+        if max_retries is not None and (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or not 0 <= max_retries <= MAX_RETRIES
+        ):
+            raise ValueError("invalid max_retries")
+        if max_concurrency is not None and (
+            isinstance(max_concurrency, bool)
+            or not isinstance(max_concurrency, int)
+            or not 1 <= max_concurrency <= MAX_CONCURRENCY
+        ):
+            raise ValueError("invalid max_concurrency")
 
         with self._connection() as db:
             current = self._setting_value(db, _ANSWER_SETTINGS_KEY)

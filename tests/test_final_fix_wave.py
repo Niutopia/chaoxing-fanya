@@ -15,6 +15,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import main
 
 from webapp import create_app
 from webapp.crypto import SecretBox
@@ -23,6 +24,17 @@ from webapp.study_runner import ChaoxingStudyRunner, StudyRunError
 from webapp.store import SQLiteStore
 from webapp.task_logging import install_task_log_sink, remove_task_log_sink
 from webapp.task_manager import TaskManager, TaskNotRunning
+
+
+def test_worker_context_wrapper_forwards_target_config_keyword():
+    target_config = {"cancel_event": threading.Event(), "marker": "forwarded"}
+
+    def target(*, config):
+        return config
+
+    assert main._run_worker_with_context(
+        {"ocr_config": {}}, target, config=target_config
+    ) is target_config
 
 
 @pytest.fixture
@@ -161,8 +173,13 @@ def test_runner_reports_real_course_tree_counts_and_active_jobs(tmp_path):
 def test_task_log_sink_unregisters_one_manager_without_orphaning_other():
     from webapp.task_logging import _route_record, unregister_task_log_sink
 
-    manager_a = TaskManager(runner=lambda _context: None)
-    manager_b = TaskManager(runner=lambda _context: None)
+    release = threading.Event()
+
+    def runner(_context):
+        release.wait(timeout=2)
+
+    manager_a = TaskManager(runner=runner)
+    manager_b = TaskManager(runner=runner)
     inputs = dict(
         course_ids=["course"],
         preferences=AccountPreferences(selected_course_ids=["course"]),
@@ -184,6 +201,7 @@ def test_task_log_sink_unregisters_one_manager_without_orphaning_other():
         assert [entry.message for entry in manager_b.get_logs(task_b.id).items] == ["kept"]
     finally:
         remove_task_log_sink()
+        release.set()
 
 
 class RacingCancelManager:

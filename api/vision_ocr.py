@@ -273,7 +273,7 @@ def _call_openai_compatible(config: Dict[str, str], image_bytes: bytes) -> str:
             timeout=30
         )
         if resp.status_code != 200:
-            logger.debug(f"OpenAI 兼容 API 返回异常: {resp.status_code} - {resp.text[:200]}")
+            logger.debug(f"OpenAI 兼容 API 返回异常: {resp.status_code}")
             return ""
 
         data = resp.json()
@@ -334,7 +334,7 @@ def _call_claude(config: Dict[str, str], image_bytes: bytes) -> str:
             timeout=30
         )
         if resp.status_code != 200:
-            logger.debug(f"Claude API 返回异常: {resp.status_code} - {resp.text[:200]}")
+            logger.debug(f"Claude API 返回异常: {resp.status_code}")
             return ""
 
         data = resp.json()

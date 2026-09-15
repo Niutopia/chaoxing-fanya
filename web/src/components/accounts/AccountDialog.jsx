@@ -40,6 +40,12 @@ function errorMessage(error, fallback) {
   return typeof message === 'string' && message.trim() ? message : fallback
 }
 
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
+}
+
 const PUBLIC_ACCOUNT_FIELDS = [
   'id',
   'name',
@@ -84,21 +90,61 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const nameRef = useRef(null)
+  const generationRef = useRef(0)
+  const requestControllerRef = useRef(null)
+
+  const nextGeneration = () => {
+    generationRef.current += 1
+    return generationRef.current
+  }
 
   useEffect(() => {
+    const generation = nextGeneration()
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = null
     if (open) {
       setCreatedProfile(null)
       setForm(formForAccount(account))
       setError('')
       setSuccess('')
+      // A closed/reopened dialog is a new editing session.  Reset the busy
+      // flags as well, otherwise a stale request from the previous session
+      // could leave the new form permanently disabled.
+      setSaving(false)
+      setVerifying(false)
+    }
+    return () => {
+      requestControllerRef.current?.abort()
+      requestControllerRef.current = null
+      // The cleanup runs before the next account/session effect.  Bumping the
+      // generation here makes a result that resolves between those effects
+      // stale too, without relying on the parent to have rendered yet.
+      if (generationRef.current === generation) nextGeneration()
     }
   }, [account, open])
+
+  const isCurrentGeneration = (generation) => generation === generationRef.current
+
+  const handleOpenChange = (nextOpen) => {
+    // Radix invokes this callback synchronously for both the X button and the
+    // Escape/overlay paths.  Invalidate async work before notifying the
+    // parent, so the close button remains usable while a request is pending.
+    nextGeneration()
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = null
+    if (!nextOpen) {
+      setSaving(false)
+      setVerifying(false)
+    }
+    onOpenChange?.(nextOpen)
+  }
 
   // A successfully created profile becomes the editing target immediately.
   // This prevents a failed verification retry from creating a duplicate row.
   const activeAccount = account ?? createdProfile
   const isEditing = Boolean(activeAccount?.id)
   const title = isEditing ? '编辑账户' : '添加账户'
+  const formBusy = saving || verifying
 
   const setField = (field) => (event) => {
     const value = event.target.value
@@ -151,10 +197,10 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     return values
   }
 
-  const savedAccount = async () => {
+  const savedAccount = async (signal) => {
     const values = payload()
-    if (isEditing) return updateAccount(activeAccount.id, values)
-    return createAccount(values)
+    if (isEditing) return updateAccount(activeAccount.id, values, { signal })
+    return createAccount(values, { signal })
   }
 
   const notifySaved = (saved, meta = {}) => {
@@ -181,9 +227,14 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     setSaving(true)
     setError('')
     setSuccess('')
+    const generation = generationRef.current
+    const controller = new AbortController()
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = controller
     let persistedProfile = null
     try {
-      const saved = await savedAccount()
+      const saved = await savedAccount(controller.signal)
+      if (!isCurrentGeneration(generation)) return
       const safeSaved = notifySaved(saved, { persisted: true, verified: false })
       persistedProfile = safeSaved
       if (!safeSaved?.id) {
@@ -197,7 +248,8 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
         setCreatedProfile(safeSaved)
         clearSecrets()
         try {
-          const verified = await verifyAccount(safeSaved.id)
+          const verified = await verifyAccount(safeSaved.id, { signal: controller.signal })
+          if (!isCurrentGeneration(generation)) return
           const safeVerified = publicAccount(verified)
           if (safeVerified?.verification_status !== 'valid') {
             throw new Error('账户验证失败，请重试')
@@ -207,6 +259,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
           notifySaved(nextProfile, { persisted: true, verified: true })
           setSuccess('账户验证成功')
         } catch (verificationError) {
+          if (!isCurrentGeneration(generation)) return
           clearSecrets()
           setSuccess('')
           setError(errorMessage(verificationError, '账户验证失败，请重试'))
@@ -216,12 +269,15 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
         setSuccess('账户已保存')
       }
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return
+      if (isAborted(requestError, controller.signal)) return
       // If persistence already succeeded, do not leave a typed secret in the
       // form even when the response was malformed or a later operation failed.
       if (persistedProfile) clearSecrets()
       setError(errorMessage(requestError, '保存账户失败，请重试'))
     } finally {
-      setSaving(false)
+      if (requestControllerRef.current === controller) requestControllerRef.current = null
+      if (isCurrentGeneration(generation)) setSaving(false)
     }
   }
 
@@ -237,8 +293,13 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
     setVerifying(true)
     setError('')
     setSuccess('')
+    const generation = generationRef.current
+    const controller = new AbortController()
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = controller
     try {
-      const verified = await verifyAccount(activeAccount.id)
+      const verified = await verifyAccount(activeAccount.id, { signal: controller.signal })
+      if (!isCurrentGeneration(generation)) return
       const safeVerified = publicAccount(verified)
       if (safeVerified?.verification_status !== 'valid') {
         throw new Error('账户验证失败，请重试')
@@ -249,15 +310,18 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
       setSuccess('账户验证成功')
       clearSecrets()
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return
+      if (isAborted(requestError, controller.signal)) return
       clearSecrets()
       setError(errorMessage(requestError, '账户验证失败，请重试'))
     } finally {
-      setVerifying(false)
+      if (requestControllerRef.current === controller) requestControllerRef.current = null
+      if (isCurrentGeneration(generation)) setVerifying(false)
     }
   }
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <Dialog.Root open={open} onOpenChange={handleOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-black/25" />
         <Dialog.Content
@@ -309,6 +373,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 id="account-name"
                 value={form.name}
                 onChange={setField('name')}
+                disabled={formBusy}
                 autoComplete="organization"
                 placeholder="例如：张三"
               />
@@ -319,6 +384,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 id="account-username"
                 value={form.username}
                 onChange={setField('username')}
+                disabled={formBusy}
                 inputMode="tel"
                 autoComplete="username"
                 placeholder="用于登录超星学习通"
@@ -334,6 +400,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 id="account-auth-mode"
                 value={form.authMode}
                 onChange={setAuthMode}
+                disabled={formBusy}
                 className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               >
                 <option value="password">密码登录</option>
@@ -357,7 +424,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 onChange={setField('password')}
                 autoComplete={isEditing ? 'new-password' : 'current-password'}
                 placeholder={isEditing ? '留空表示不修改' : '输入密码'}
-                disabled={form.authMode !== 'password'}
+                disabled={formBusy || form.authMode !== 'password'}
               />
             </Field>
 
@@ -378,7 +445,7 @@ function AccountDialog({ open = false, account = null, onOpenChange, onSaved }) 
                 autoComplete="off"
                 spellCheck="false"
                 placeholder="留空或粘贴 Cookie Header"
-                disabled={form.authMode !== 'cookies'}
+                disabled={formBusy || form.authMode !== 'cookies'}
                 className="touch-target flex min-h-20 w-full resize-y rounded-md border border-separator bg-surface px-2.5 py-2 text-sm leading-5 text-label-primary outline-none placeholder:text-label-tertiary focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               />
             </Field>

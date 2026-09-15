@@ -17,6 +17,16 @@ from ..account_service import (
     CourseRetrievalError,
 )
 from ..models import AccountPreferences
+from ..limits import (
+    MAX_ACCOUNT_NAME_LENGTH,
+    MAX_ACCOUNT_PASSWORD_LENGTH,
+    MAX_ACCOUNT_USERNAME_LENGTH,
+    MAX_COOKIE_HEADER_LENGTH,
+    MAX_COURSE_ID_LENGTH,
+    MAX_SELECTED_COURSE_IDS,
+    validate_config_shape,
+    validate_cookie_mapping,
+)
 
 
 accounts = Blueprint("accounts", __name__, url_prefix="/api/accounts")
@@ -284,6 +294,75 @@ def _merge_config(
     return result
 
 
+_OCR_ENDPOINT_KEYS = frozenset(
+    {"endpoint", "ocrendpoint", "httpendpoint", "fallbackendpoint", "url"}
+)
+
+
+def _ocr_endpoint(config: Any) -> str | None:
+    """Return the configured OCR endpoint from a provider mapping.
+
+    OCR integrations in the wild use both ``endpoint`` and the legacy
+    ``ocr_endpoint``/``http_endpoint`` spellings.  We compare only the
+    endpoint value; loopback and private-network addresses remain valid and
+    are deliberately not blocked here.
+    """
+
+    if not isinstance(config, Mapping):
+        return None
+    for raw_key, value in config.items():
+        compact = _config_compact_key(raw_key)
+        if compact in _OCR_ENDPOINT_KEYS and isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                # A trailing slash does not identify a different OCR service.
+                return candidate.rstrip("/")
+    return None
+
+
+def _ocr_key_is_explicit(config: Any) -> bool:
+    """Whether an incoming OCR config contains a non-blank replacement key."""
+
+    if not isinstance(config, Mapping):
+        return False
+    for raw_key, value in config.items():
+        if _is_sensitive_config_key(raw_key, notification=False):
+            if value is not None and not isinstance(value, (Mapping, list)):
+                if str(value).strip():
+                    return True
+        elif isinstance(value, Mapping):
+            if _ocr_key_is_explicit(value):
+                return True
+        elif isinstance(value, list):
+            if any(_ocr_key_is_explicit(item) for item in value):
+                return True
+    return False
+
+
+def _validate_ocr_endpoint_change(
+    current: AccountPreferences, incoming: Any
+) -> None:
+    """Require a fresh OCR key when a saved custom endpoint changes.
+
+    Blank/omitted keys normally mean "keep the saved key" for partial
+    preference updates.  That rule is unsafe across endpoints, because the
+    old credential could be sent to an unrelated service.  Requiring a
+    non-blank key for an endpoint change preserves local/private endpoints
+    while preventing accidental cross-service credential reuse.
+    """
+
+    if not isinstance(incoming, Mapping):
+        return
+    old_endpoint = _ocr_endpoint(current.ocr_config)
+    new_endpoint = _ocr_endpoint(incoming)
+    if new_endpoint is None:
+        return
+    if (old_endpoint or "") == new_endpoint:
+        return
+    if not _ocr_key_is_explicit(incoming):
+        raise ValueError("a new OCR endpoint requires an explicit API key")
+
+
 def _json_mapping() -> Mapping[str, Any] | None:
     payload = request.get_json(silent=True)
     return payload if isinstance(payload, Mapping) else None
@@ -301,14 +380,13 @@ def _parse_cookies(value: Any) -> dict[str, str] | None:
     if value is None:
         return None
     if isinstance(value, Mapping):
-        parsed: dict[str, str] = {}
-        for key, item in value.items():
-            key_text = str(key).strip()
-            if not key_text:
-                raise ValueError("invalid cookies")
-            parsed[key_text] = str(item)
-        return parsed
+        try:
+            return validate_cookie_mapping(value)
+        except (TypeError, ValueError):
+            raise ValueError("invalid cookies") from None
     if not isinstance(value, str):
+        raise ValueError("invalid cookies")
+    if len(value) > MAX_COOKIE_HEADER_LENGTH:
         raise ValueError("invalid cookies")
 
     parsed = {}
@@ -323,7 +401,10 @@ def _parse_cookies(value: Any) -> dict[str, str] | None:
         if not key:
             raise ValueError("invalid cookies")
         parsed[key] = item.strip()
-    return parsed
+    try:
+        return validate_cookie_mapping(parsed)
+    except (TypeError, ValueError):
+        raise ValueError("invalid cookies") from None
 
 
 def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, Any]:
@@ -334,17 +415,28 @@ def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, 
     values: dict[str, Any] = {}
     if not partial or "name" in payload:
         name = payload.get("name")
-        if not isinstance(name, str) or not name.strip():
+        if (
+            not isinstance(name, str)
+            or len(name) > MAX_ACCOUNT_NAME_LENGTH
+            or not name.strip()
+        ):
             raise ValueError("invalid account name")
         values["name"] = name.strip()
     if not partial or "username" in payload:
         username = payload.get("username")
-        if not isinstance(username, str) or not username.strip():
+        if (
+            not isinstance(username, str)
+            or len(username) > MAX_ACCOUNT_USERNAME_LENGTH
+            or not username.strip()
+        ):
             raise ValueError("invalid account username")
         values["username"] = username.strip()
     if "password" in payload:
         password = payload["password"]
-        if password is not None and not isinstance(password, str):
+        if password is not None and (
+            not isinstance(password, str)
+            or len(password) > MAX_ACCOUNT_PASSWORD_LENGTH
+        ):
             raise ValueError("invalid account password")
         # Empty secret fields mean "keep the existing value" in the edit UI.
         # Omitting the field is also important for the active-task guard: a
@@ -407,10 +499,19 @@ def _preferences_payload(
     baseline["ocr_config"] = deepcopy(current.ocr_config)
     for field, value in payload.items():
         if field == "notification_config":
+            try:
+                validate_config_shape(value, field_name="notification_config")
+            except (TypeError, ValueError):
+                raise ValueError("invalid preference config") from None
             baseline[field] = _merge_config(
                 current.notification_config, value, notification=True
             )
         elif field == "ocr_config":
+            try:
+                validate_config_shape(value, field_name="ocr_config")
+            except (TypeError, ValueError):
+                raise ValueError("invalid preference config") from None
+            _validate_ocr_endpoint_change(current, value)
             baseline[field] = _merge_config(current.ocr_config, value)
         else:
             baseline[field] = value
@@ -418,6 +519,10 @@ def _preferences_payload(
     selected = baseline["selected_course_ids"]
     if not isinstance(selected, list) or not all(
         isinstance(course_id, str) for course_id in selected
+    ):
+        raise ValueError("invalid selected courses")
+    if len(selected) > MAX_SELECTED_COURSE_IDS or any(
+        len(course_id) > MAX_COURSE_ID_LENGTH for course_id in selected
     ):
         raise ValueError("invalid selected courses")
 
@@ -445,6 +550,11 @@ def _preferences_payload(
     ocr = baseline["ocr_config"]
     if not isinstance(notification, Mapping) or not isinstance(ocr, Mapping):
         raise ValueError("invalid preference config")
+    try:
+        validate_config_shape(notification, field_name="notification_config")
+        validate_config_shape(ocr, field_name="ocr_config")
+    except (TypeError, ValueError):
+        raise ValueError("invalid preference config") from None
 
     return AccountPreferences(
         selected_course_ids=list(selected),

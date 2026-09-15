@@ -61,6 +61,7 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
         DATABASE_PATH=data_dir / "chaoxing-web.sqlite3",
         RUNNING_IN_DOCKER=os.environ.get("CHAOXING_RUNNING_IN_DOCKER", False),
         STATIC_DIR=default_static_dir,
+        MAX_CONTENT_LENGTH=1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)
@@ -186,6 +187,14 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
+
+    @app.errorhandler(413)
+    def request_too_large(_error):
+        return jsonify(
+            status=False,
+            msg="Request body is too large",
+            code="request_too_large",
+        ), 413
 
     @app.errorhandler(Exception)
     def internal_error(error):

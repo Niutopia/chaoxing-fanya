@@ -1,5 +1,6 @@
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { useState } from 'react'
 import { beforeEach, vi } from 'vitest'
 import { ApiError } from '../../api/client'
 import { createAccount, updateAccount, verifyAccount } from '../../api/accounts'
@@ -14,6 +15,16 @@ vi.mock('../../api/accounts', () => ({
 beforeEach(() => {
   vi.clearAllMocks()
 })
+
+function ControlledDialog({ onSaved }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>重新打开</button>
+      <AccountDialog open={open} onOpenChange={setOpen} onSaved={onSaved} />
+    </>
+  )
+}
 
 test('editing an account never prefills its stored secret', async () => {
   render(
@@ -52,8 +63,8 @@ test('submits a new account and then verifies it', async () => {
     name: '张三',
     username: '13800000000',
     password: 'local-secret',
-  })
-  expect(verifyAccount).toHaveBeenCalledWith('a')
+  }, { signal: expect.any(AbortSignal) })
+  expect(verifyAccount).toHaveBeenCalledWith('a', { signal: expect.any(AbortSignal) })
 })
 
 test('editing with a blank password sends no replacement secret', async () => {
@@ -76,7 +87,7 @@ test('editing with a blank password sends no replacement secret', async () => {
   expect(updateAccount).toHaveBeenCalledWith('a', {
     name: '新名称',
     username: '13800000000',
-  })
+  }, { signal: expect.any(AbortSignal) })
 })
 
 test('cookie mode enables only Cookie Header and omits a password replacement', async () => {
@@ -104,7 +115,7 @@ test('cookie mode enables only Cookie Header and omits a password replacement', 
     name: '张三',
     username: '13800000000',
     cookies: 'session=known-cookie',
-  })
+  }, { signal: expect.any(AbortSignal) })
   expect(JSON.stringify(createAccount.mock.calls)).not.toContain('password')
 })
 
@@ -133,7 +144,7 @@ test('switching auth mode clears the inactive secret before a retry', async () =
     name: '张三',
     username: '13800000000',
     cookies: 'session=known-cookie',
-  })
+  }, { signal: expect.any(AbortSignal) })
   expect(JSON.stringify(createAccount.mock.calls)).not.toContain('known-password')
 })
 
@@ -259,4 +270,32 @@ test('an invalid verification response cannot mark an existing account verified'
   expect(await screen.findByRole('alert')).toHaveTextContent('账户验证失败，请重试')
   expect(screen.queryByText('账户验证成功')).not.toBeInTheDocument()
   expect(onSaved).not.toHaveBeenCalled()
+})
+
+test('ignores a save that resolves after the dialog was closed and reopened', async () => {
+  const user = userEvent.setup()
+  const onSaved = vi.fn()
+  let resolveCreate
+  createAccount.mockImplementation(() => new Promise((resolve) => {
+    resolveCreate = resolve
+  }))
+
+  render(<ControlledDialog onSaved={onSaved} />)
+  await user.type(screen.getByLabelText('账户名称'), '旧账户')
+  await user.type(screen.getByLabelText('手机号'), '13800000000')
+  await user.type(screen.getByLabelText('密码'), 'old-secret')
+  await user.click(screen.getByRole('button', { name: '验证并保存' }))
+  await user.click(screen.getByRole('button', { name: '关闭账户对话框' }))
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+  await user.click(screen.getByRole('button', { name: '重新打开' }))
+  resolveCreate({ id: 'old', name: '旧账户' })
+  await act(async () => {
+    await Promise.resolve()
+  })
+
+  expect(onSaved).not.toHaveBeenCalled()
+  expect(screen.getByRole('dialog')).toBeInTheDocument()
+  expect(screen.getByLabelText('账户名称')).toHaveValue('')
+  expect(verifyAccount).not.toHaveBeenCalled()
 })

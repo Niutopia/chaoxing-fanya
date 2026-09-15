@@ -431,3 +431,43 @@ def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
         manager.get_details(first.id)
     with pytest.raises(TaskNotFound):
         manager.get_logs(first.id)
+
+
+def test_terminal_task_releases_decrypted_credentials(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    task = manager.start(**task_inputs("scrub-account"))
+    assert manager.wait(task.id, timeout=1)
+    context = manager.get_context(task.id)
+    assert context.auth.username == ""
+    assert context.auth.password == ""
+    assert context.auth.cookies == {}
+    assert context.answer.api_key is None
+    assert context.preferences.notification_config == {}
+    assert context.preferences.ocr_config == {}
+
+
+def test_late_terminal_log_is_dropped_after_secret_scrub(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    task = manager.start(**task_inputs("late-log-account"))
+    assert manager.wait(task.id, timeout=1)
+
+    late_secret = "late-log-secret-that-must-not-be-retained"
+    assert manager.append_log(task.id, late_secret) is None
+    assert manager.get_logs(task.id).items == []
+
+
+def test_terminal_task_history_is_globally_bounded(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(
+        runner=runner,
+        max_active_accounts=1,
+        terminal_task_capacity=2,
+    )
+    ids = []
+    for account in ("a", "b", "c"):
+        task = manager.start(**task_inputs(account))
+        assert manager.wait(task.id, timeout=1)
+        ids.append(task.id)
+    assert [item.id for item in manager.list_tasks()] == ids[-2:]

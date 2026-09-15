@@ -13,6 +13,12 @@ from ..answer_connection import (
     AnswerConnectionDraft,
     AnswerConnectionService,
     ConnectionTestResult,
+    MAX_API_KEY_LENGTH,
+    MAX_BASE_URL_LENGTH,
+    MAX_CONCURRENCY,
+    MAX_MODEL_LENGTH,
+    MAX_RETRIES,
+    MAX_TIMEOUT_SECONDS,
     normalize_completion_url,
 )
 from ..models import AnswerConnection, RuntimeSettings
@@ -183,18 +189,9 @@ def _connection_data(connection: AnswerConnection) -> dict[str, Any]:
         }:
             data["last_test_status"] = metadata["status"]
     if connection.has_api_key:
-        # The public model intentionally exposes only presence.  A stable,
-        # short mask helps the settings UI distinguish a configured key while
-        # never carrying the plaintext value in the response.
-        try:
-            resolved = _services()["store"].resolve_answer_connection()
-            key = getattr(resolved, "api_key", None)
-        except Exception:
-            key = None
-        if isinstance(key, str) and len(key) > 4:
-            data["api_key_mask"] = "Configured (••••" + key[-4:] + ")"
-        else:
-            data["api_key_mask"] = "Configured (••••)"
+        # Never expose a stable suffix: even four characters are unnecessary
+        # credential material and can help correlate a reused key.
+        data["api_key_mask"] = "Configured (••••)"
     else:
         data["api_key_mask"] = None
     return data
@@ -227,7 +224,11 @@ def _answer_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         values["enabled"] = enabled
     if "base_url" in payload:
         base_url = payload["base_url"]
-        if not isinstance(base_url, str) or not base_url.strip():
+        if (
+            not isinstance(base_url, str)
+            or not base_url.strip()
+            or len(base_url) > MAX_BASE_URL_LENGTH
+        ):
             raise ValueError("invalid answer connection")
         # Keep exactly the user-visible base URL in storage; this call only
         # validates the scheme/credentials/query/fragment policy.
@@ -235,12 +236,18 @@ def _answer_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         values["base_url"] = base_url.strip()
     if "model" in payload:
         model = payload["model"]
-        if not isinstance(model, str) or not model.strip():
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or len(model) > MAX_MODEL_LENGTH
+        ):
             raise ValueError("invalid answer connection")
         values["model"] = model.strip()
     if "api_key" in payload:
         api_key = payload["api_key"]
-        if api_key is not None and not isinstance(api_key, str):
+        if api_key is not None and (
+            not isinstance(api_key, str) or len(api_key) > MAX_API_KEY_LENGTH
+        ):
             raise ValueError("invalid answer connection")
         # An omitted or blank key means "preserve".  Clear Key is explicit.
         if isinstance(api_key, str) and api_key.strip():
@@ -249,12 +256,21 @@ def _answer_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             values["api_key"] = None
     if "timeout_seconds" in payload:
         timeout = payload["timeout_seconds"]
-        if not _finite_number(timeout) or float(timeout) <= 0:
+        if (
+            not _finite_number(timeout)
+            or float(timeout) <= 0
+            or float(timeout) > MAX_TIMEOUT_SECONDS
+        ):
             raise ValueError("invalid answer connection")
         values["timeout_seconds"] = float(timeout)
     if "max_retries" in payload:
         retries = payload["max_retries"]
-        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        if (
+            isinstance(retries, bool)
+            or not isinstance(retries, int)
+            or retries < 0
+            or retries > MAX_RETRIES
+        ):
             raise ValueError("invalid answer connection")
         values["max_retries"] = retries
     if "max_concurrency" in payload:
@@ -263,6 +279,7 @@ def _answer_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             isinstance(concurrency, bool)
             or not isinstance(concurrency, int)
             or concurrency < 1
+            or concurrency > MAX_CONCURRENCY
         ):
             raise ValueError("invalid answer connection")
         values["max_concurrency"] = concurrency
@@ -273,7 +290,12 @@ def _test_draft(payload: Mapping[str, Any]) -> AnswerConnectionDraft:
     values = _answer_payload(payload)
     current = _services()["store"].resolve_answer_connection()
     key = values.pop("api_key", None)
+    candidate_base_url = values.get("base_url", current.base_url)
     if key is None:
+        if normalize_completion_url(candidate_base_url) != normalize_completion_url(
+            current.base_url
+        ):
+            raise ValueError("a new endpoint requires an explicit API key")
         key = getattr(current, "api_key", None)
     return AnswerConnectionDraft(
         enabled=values.pop("enabled", current.enabled),
@@ -314,6 +336,18 @@ def put_answer_connection():
                 return _settings_state_unavailable_error()
             if task_state:
                 return _settings_in_use_error()
+            current = _services()["store"].get_answer_connection()
+            candidate_base_url = values.get("base_url", current.base_url)
+            if (
+                values.get("api_key") is None
+                and normalize_completion_url(candidate_base_url)
+                != normalize_completion_url(current.base_url)
+            ):
+                return _error(
+                    "Enter an API key when changing the answer API address",
+                    "answer_key_required_for_endpoint_change",
+                    400,
+                )
             connection = _services()["store"].save_answer_connection(**values)
             invalidate_answer_test()
             service = _answer_service()

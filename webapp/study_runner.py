@@ -234,6 +234,11 @@ class ChaoxingStudyRunner:
         # custom reporters are treated as best-effort integrations here.
         try:
             method(*args, **kwargs)
+        except StudyCancelled:
+            # Cancellation is control flow, not an optional reporter failure.
+            # Let the owning JobProcessor/TaskManager stop the task instead of
+            # silently continuing after a reporter observes the event.
+            raise
         except TypeError:
             # A few legacy reporter doubles accept one mapping instead of
             # keyword fields.  Keep that compatibility without changing the
@@ -241,6 +246,8 @@ class ChaoxingStudyRunner:
             if kwargs:
                 try:
                     method(*args, dict(kwargs))
+                except StudyCancelled:
+                    raise
                 except Exception:
                     return
         except Exception:
@@ -257,8 +264,23 @@ class ChaoxingStudyRunner:
 
         callback: Callable[[Mapping[str, str]], None]
         if self.cookie_update_callback_factory is not None:
-            callback = self.cookie_update_callback_factory(str(context.account_id))
+            try:
+                callback = self.cookie_update_callback_factory(str(context.account_id))
+            except BaseException:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise
             if not callable(callback):
+                close = getattr(session, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
                 raise TypeError("cookie_update_callback_factory must return a callable")
         else:
             callback = partial(save_cookie_file, path=cookie_path)
@@ -355,6 +377,8 @@ class ChaoxingStudyRunner:
         if callable(is_failure):
             try:
                 return "failed" if is_failure() else "completed"
+            except StudyCancelled:
+                raise
             except Exception:
                 return "failed"
         if isinstance(result, Mapping):
@@ -768,6 +792,7 @@ class ChaoxingStudyRunner:
                 code = "study_run_error"
             raise StudyRunError(self._safe_error(context, exc), code=code) from None
 
+        engine = None
         try:
             with vision_ocr_context(preferences.ocr_config):
                 if context.cancel_event.is_set():
@@ -902,6 +927,52 @@ class ChaoxingStudyRunner:
             if not isinstance(code, str) or not code:
                 code = "study_run_error"
             raise StudyRunError(self._safe_error(context, exc), code=code) from None
+        finally:
+            self._close_resources(engine, session)
+
+    @staticmethod
+    def _close_resources(engine: Any, session: Any) -> None:
+        """Close per-task HTTP clients and sessions after the runner unwinds.
+
+        ``AI`` creates a fresh ``httpx.Client`` for every task.  Leaving that
+        client (and the account ``requests.Session``) alive would accumulate
+        connection pools and file descriptors in a long-running Web process.
+        Only explicit close methods are called; arbitrary engine doubles are
+        otherwise left untouched.
+        """
+
+        closed: set[int] = set()
+
+        def close_once(value: Any) -> None:
+            if value is None or id(value) in closed:
+                return
+            close = getattr(value, "close", None)
+            if not callable(close):
+                return
+            closed.add(id(value))
+            try:
+                close()
+            except StudyCancelled:
+                # Preserve control flow if an injected cleanup hook itself
+                # observes cancellation; never swallow StudyCancelled in a
+                # broad cleanup handler.
+                raise
+            except Exception:
+                return
+
+        # Chaoxing owns the account session; provider clients are commonly
+        # reachable through ``engine.tiku``.  Some integrations expose their
+        # provider directly, so check the engine as well without invoking a
+        # generic engine.close() hook.
+        provider = getattr(engine, "tiku", None) if engine is not None else None
+        for candidate in (
+            getattr(provider, "_httpx_client", None),
+            getattr(provider, "_session", None),
+            getattr(provider, "client", None),
+            getattr(engine, "_httpx_client", None) if engine is not None else None,
+        ):
+            close_once(candidate)
+        close_once(session)
 
 
 __all__ = [

@@ -18,6 +18,7 @@ from webapp import create_app
 from webapp.crypto import SecretBox
 from webapp.store import SQLiteStore
 from api.answer import AI
+from api.live_process import StudyCancelled
 from api.logger import logger
 
 
@@ -141,6 +142,8 @@ def test_connection_routes_mask_and_preserve_key(tmp_path: Path):
     assert body["data"]["has_api_key"] is True
     assert "api_key" not in body["data"]
     assert "route-secret-key" not in body_text
+    assert body["data"]["api_key_mask"] == "Configured (••••)"
+    assert "-key" not in body["data"]["api_key_mask"]
 
     client.put(
         "/api/settings/answer-connection",
@@ -248,6 +251,64 @@ def test_connection_test_route_reuses_saved_key_when_omitted(tmp_path: Path):
     assert "stored-only-secret" not in response.get_data(as_text=True)
 
 
+def test_saved_key_is_never_reused_for_a_different_endpoint(tmp_path: Path):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [{"id": "saved-model"}]})
+
+    app = create_app(
+        {
+            "TESTING": True,
+            "DATA_DIR": tmp_path,
+            "ANSWER_CONNECTION_TRANSPORT": httpx.MockTransport(handler),
+        }
+    )
+    client = app.test_client()
+    assert client.put(
+        "/api/settings/answer-connection",
+        json={"model": "saved-model", "api_key": "stored-only-secret"},
+    ).status_code == 200
+
+    probe = client.post(
+        "/api/settings/answer-connection/test",
+        json={"base_url": "https://example.invalid/v1", "model": "saved-model"},
+    )
+    assert probe.status_code == 400
+    assert seen == []
+
+    update = client.put(
+        "/api/settings/answer-connection",
+        json={"base_url": "https://example.invalid/v1"},
+    )
+    assert update.status_code == 400
+    assert update.get_json()["code"] == "answer_key_required_for_endpoint_change"
+    resolved = app.extensions["services"]["store"].resolve_answer_connection()
+    assert resolved.base_url == "http://localhost:8849/v1"
+    assert resolved.api_key == "stored-only-secret"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"timeout_seconds": 301},
+        {"max_retries": 11},
+        {"max_concurrency": 33},
+        {"model": "m" * 257},
+        {"base_url": "http://localhost/" + "x" * 2048},
+        {"api_key": "k" * 8193},
+    ],
+)
+def test_answer_connection_rejects_unbounded_values(tmp_path: Path, payload):
+    app = create_app({"TESTING": True, "DATA_DIR": tmp_path})
+    response = app.test_client().put(
+        "/api/settings/answer-connection",
+        json=payload,
+    )
+    assert response.status_code == 400
+
+
 def test_service_owns_one_shared_bounded_semaphore(tmp_path: Path):
     store = SQLiteStore(tmp_path / "app.sqlite3", SecretBox(tmp_path))
     store.save_answer_connection(max_concurrency=2)
@@ -341,3 +402,28 @@ def test_ai_completion_error_never_logs_response_body_secret():
 
     assert result is None
     assert response_secret not in visible_logs.getvalue()
+
+
+def test_ai_waiting_for_global_slot_can_be_cancelled():
+    semaphore = threading.Semaphore(1)
+    assert semaphore.acquire(timeout=0.1)
+    cancel_event = threading.Event()
+    provider = AI(request_semaphore=semaphore)
+    provider.set_cancel_event(cancel_event)
+    provider._httpx_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"choices": []})
+        )
+    )
+    provider.key = "fake"
+    provider.model = "fake"
+    provider.endpoint = "http://answer.invalid/v1/chat/completions"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(provider._invoke_completion, [])
+        cancel_event.set()
+        with pytest.raises(StudyCancelled):
+            future.result(timeout=1)
+
+    semaphore.release()
+    provider._httpx_client.close()

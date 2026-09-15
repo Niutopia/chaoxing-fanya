@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { useState } from 'react'
 import { beforeEach, expect, vi } from 'vitest'
 import { ApiError } from '../api/client'
 import { getPreferences, listCourses, savePreferences } from '../api/accounts'
@@ -31,6 +32,19 @@ const courseFixtures = [
 function LocationProbe() {
   const location = useLocation()
   return <output data-testid="location">{location.pathname}</output>
+}
+
+function SwitchableLaunch({ onSwitch }) {
+  const [accountId, setAccountId] = useState('account-a')
+  return (
+    <>
+      <button type="button" onClick={() => {
+        setAccountId('account-b')
+        onSwitch?.()
+      }}>切换账户</button>
+      <LaunchPage accountId={accountId} />
+    </>
+  )
 }
 
 function renderPage(path = '/accounts/account-a/launch', props = {}) {
@@ -75,8 +89,8 @@ test('keeps course choices scoped to the current account', async () => {
 
   expect(await screen.findByRole('checkbox', { name: '高等数学' })).toBeChecked()
   expect(screen.getByRole('checkbox', { name: '大学英语' })).not.toBeChecked()
-  expect(listCourses).toHaveBeenCalledWith('account-a')
-  expect(getPreferences).toHaveBeenCalledWith('account-a')
+  expect(listCourses).toHaveBeenCalledWith('account-a', { signal: expect.any(AbortSignal) })
+  expect(getPreferences).toHaveBeenCalledWith('account-a', { signal: expect.any(AbortSignal) })
 })
 
 test('blocks start when answering is enabled but connection is untested', async () => {
@@ -129,7 +143,11 @@ test('saves preferences and navigates after successful start', async () => {
   await user.click(screen.getByRole('button', { name: '开始学习' }))
 
   expect(savePreferences.mock.invocationCallOrder[0]).toBeLessThan(startTask.mock.invocationCallOrder[0])
-  expect(startTask).toHaveBeenCalledWith('account-a', { course_ids: ['math'] })
+  expect(startTask).toHaveBeenCalledWith(
+    'account-a',
+    { course_ids: ['math'] },
+    { signal: expect.any(AbortSignal) },
+  )
   expect(await screen.findByTestId('location')).toHaveTextContent('/tasks/task-a')
 })
 
@@ -220,4 +238,33 @@ test('keeps a selection when starting fails for a validation error', async () =>
 
   expect(await screen.findByText('请至少选择一门课程')).toBeInTheDocument()
   await waitFor(() => expect(startTask).not.toHaveBeenCalled())
+})
+
+test('does not start the old account after its preference save resolves late', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  savePreferences.mockImplementation(() => new Promise((resolve) => {
+    resolveSave = resolve
+  }))
+  render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <SwitchableLaunch />
+    </MemoryRouter>,
+  )
+
+  await user.click(await screen.findByRole('checkbox', { name: '高等数学' }))
+  await user.click(screen.getByRole('button', { name: '开始学习' }))
+  expect(savePreferences).toHaveBeenCalledWith(
+    'account-a',
+    expect.any(Object),
+    { signal: expect.any(AbortSignal) },
+  )
+  const oldAccountSignal = savePreferences.mock.calls[0][2].signal
+  expect(oldAccountSignal.aborted).toBe(false)
+
+  await user.click(screen.getByRole('button', { name: '切换账户' }))
+  expect(oldAccountSignal.aborted).toBe(true)
+  resolveSave({})
+  await waitFor(() => expect(startTask).not.toHaveBeenCalled())
+  expect(screen.queryByRole('checkbox', { name: '高等数学' })).not.toBeChecked()
 })

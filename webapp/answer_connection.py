@@ -25,6 +25,12 @@ DEFAULT_MODEL = "gemini-3.8-flash-high"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_MAX_CONCURRENCY = 4
+MAX_BASE_URL_LENGTH = 2048
+MAX_MODEL_LENGTH = 256
+MAX_API_KEY_LENGTH = 8192
+MAX_TIMEOUT_SECONDS = 300.0
+MAX_RETRIES = 10
+MAX_CONCURRENCY = 32
 
 
 @dataclass(frozen=True)
@@ -330,19 +336,38 @@ class AnswerConnectionService:
     def _valid_draft(draft: AnswerConnectionDraft) -> str | None:
         if not isinstance(draft.enabled, bool):
             return "enabled must be a boolean"
+        if not isinstance(draft.base_url, str) or len(draft.base_url) > MAX_BASE_URL_LENGTH:
+            return "base_url is too long"
         try:
             _parse_base_url(draft.base_url)
         except ValueError as exc:
             return str(exc)
-        if not isinstance(draft.model, str) or not draft.model.strip():
+        if (
+            not isinstance(draft.model, str)
+            or not draft.model.strip()
+            or len(draft.model) > MAX_MODEL_LENGTH
+        ):
             return "model must not be blank"
-        if not _is_finite_number(draft.timeout_seconds) or float(draft.timeout_seconds) <= 0:
-            return "timeout_seconds must be positive"
-        if _safe_int(draft.max_retries, minimum=0) is None:
-            return "max_retries must be a non-negative integer"
-        if _safe_int(draft.max_concurrency) is None:
-            return "max_concurrency must be a positive integer"
-        if draft.api_key is not None and not isinstance(draft.api_key, str):
+        if (
+            not _is_finite_number(draft.timeout_seconds)
+            or float(draft.timeout_seconds) <= 0
+            or float(draft.timeout_seconds) > MAX_TIMEOUT_SECONDS
+        ):
+            return "timeout_seconds is out of range"
+        if (
+            _safe_int(draft.max_retries, minimum=0) is None
+            or draft.max_retries > MAX_RETRIES
+        ):
+            return "max_retries is out of range"
+        if (
+            _safe_int(draft.max_concurrency) is None
+            or draft.max_concurrency > MAX_CONCURRENCY
+        ):
+            return "max_concurrency is out of range"
+        if draft.api_key is not None and (
+            not isinstance(draft.api_key, str)
+            or len(draft.api_key) > MAX_API_KEY_LENGTH
+        ):
             return "api_key must be a string"
         return None
 
@@ -351,6 +376,10 @@ class AnswerConnectionService:
             return draft.api_key
         try:
             resolved = self.store.resolve_answer_connection()
+            if normalize_completion_url(draft.base_url) != normalize_completion_url(
+                resolved.base_url
+            ):
+                return None
             key = getattr(resolved, "api_key", None)
             return key if isinstance(key, str) and key else None
         except Exception:

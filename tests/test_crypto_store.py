@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from webapp.crypto import SecretBox
@@ -22,6 +24,56 @@ def test_preferences_are_scoped_by_account(tmp_path):
     store.save_preferences(second.id, AccountPreferences(selected_course_ids=["english"]))
     assert store.get_preferences(first.id).selected_course_ids == ["math"]
     assert store.get_preferences(second.id).selected_course_ids == ["english"]
+
+
+def test_notification_and_ocr_secrets_are_encrypted_at_rest(tmp_path):
+    database = tmp_path / "app.sqlite3"
+    store = SQLiteStore(database, SecretBox(tmp_path))
+    account = store.create_account("A", "100", "one")
+    store.save_preferences(
+        account.id,
+        AccountPreferences(
+            notification_config={
+                "provider": "Telegram",
+                "token": "notification-secret-token",
+                "url": "https://notify.invalid/private-destination",
+            },
+            ocr_config={"provider": "openai", "api_key": "ocr-secret-key"},
+        ),
+    )
+
+    database_bytes = database.read_bytes()
+    assert b"notification-secret-token" not in database_bytes
+    assert b"private-destination" not in database_bytes
+    assert b"ocr-secret-key" not in database_bytes
+    preferences = store.get_preferences(account.id)
+    assert preferences.notification_config["token"] == "notification-secret-token"
+    assert preferences.ocr_config["api_key"] == "ocr-secret-key"
+    assert database.stat().st_mode & 0o777 == 0o600
+    assert tmp_path.stat().st_mode & 0o777 == 0o700
+
+
+def test_plaintext_preference_configs_are_migrated_and_compacted(tmp_path):
+    database = tmp_path / "app.sqlite3"
+    store = SQLiteStore(database, SecretBox(tmp_path))
+    account = store.create_account("A", "100", "one")
+    store.save_preferences(account.id, AccountPreferences())
+    legacy_notification = '{"token":"legacy-notification-secret"}'
+    legacy_ocr = '{"api_key":"legacy-ocr-secret"}'
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE account_preferences SET notification_config = ?, ocr_config = ? "
+            "WHERE account_id = ?",
+            (legacy_notification, legacy_ocr, account.id),
+        )
+
+    migrated = SQLiteStore(database, SecretBox(tmp_path))
+    preferences = migrated.get_preferences(account.id)
+    assert preferences.notification_config["token"] == "legacy-notification-secret"
+    assert preferences.ocr_config["api_key"] == "legacy-ocr-secret"
+    database_bytes = database.read_bytes()
+    assert b"legacy-notification-secret" not in database_bytes
+    assert b"legacy-ocr-secret" not in database_bytes
 
 
 def test_secret_key_is_reused_with_owner_only_permissions(tmp_path):

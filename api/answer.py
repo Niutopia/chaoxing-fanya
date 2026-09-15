@@ -20,6 +20,7 @@ from api.answer_check import *
 from api.logger import logger
 from api.decode import _ocr_image_to_text, ENABLE_LOCAL_OCR
 from api.vision_ocr import is_vision_ocr_enabled
+from api.live_process import StudyCancelled
 
 
 def _strip_json_block(md_str: str) -> str:
@@ -99,8 +100,10 @@ def _apply_ocr_to_title_if_needed(q_info: dict, *, session=None) -> None:
                 text = _ocr_image_to_text(src) or ""
             else:
                 text = _ocr_image_to_text(src, session=session) or ""
-        except Exception as exc:
-            logger.debug(f"题目图片 OCR 调用异常: {exc}")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.debug("题目图片 OCR 调用异常")
 
         if text:
             return f"[公式: {text}]"
@@ -256,6 +259,7 @@ class Tiku:
         # the configured provider.  Keeping this optional preserves direct
         # CLI/test Tiku usage and its legacy OCR fallback.
         self.session = None
+        self.cancel_event: Optional[threading.Event] = None
 
     @property
     def name(self):
@@ -335,6 +339,25 @@ class Tiku:
     def config_set(self,config):
         self._conf = config
 
+    def set_cancel_event(self, cancel_event: Optional[threading.Event]) -> None:
+        """Attach task cancellation to every provider implementation."""
+
+        self.cancel_event = cancel_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise StudyCancelled()
+
+    def _wait_or_cancel(self, seconds: float) -> None:
+        self._raise_if_cancelled()
+        if seconds <= 0:
+            return
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(seconds):
+                raise StudyCancelled()
+        else:
+            time.sleep(seconds)
+
     def _get_conf(self):
         """
         从默认配置文件查询配置, 如果未能查到, 停用题库
@@ -349,6 +372,7 @@ class Tiku:
             return None
         
     def query(self,q_info:dict) -> Optional[str]:
+        self._raise_if_cancelled()
         if self.DISABLE:
             return None
 
@@ -491,12 +515,12 @@ class TikuYanxi(Tiku):
                     self.load_token()
                     # 重新查询
                     return self._query(q_info)
-                logger.error(f'{self.name}查询失败:\n\t剩余查询数{res_json["data"].get("times",f"{self._times}(仅参考)")}:\n\t消息:{res_json["message"]}')
+                logger.error(f'{self.name}查询失败: HTTP 200 返回错误')
                 return None
             self._times = res_json["data"].get("times",self._times)
             return res_json['data']['answer'].strip()
         else:
-            logger.error(f'{self.name}查询失败:\n{res.text}')
+            logger.error(f'{self.name}查询失败: HTTP {res.status_code}')
         return None
 
     def load_token(self):
@@ -549,7 +573,7 @@ class TikuLike(Tiku):
         
         # 检查该token是否有余额
         if self._balance.get(token, 0) <= 0:
-            logger.error(f'{self.name}当前Token查询次数不足: ...{token[-5:]}')
+            logger.error(f'{self.name}当前Token查询次数不足')
             # 尝试选择其他有余额的token
             available_tokens = [t for t in self._tokens if self._balance.get(t, 0) > 0]
             if available_tokens:
@@ -567,10 +591,10 @@ class TikuLike(Tiku):
             try_times += 1
             if ans:  # 如果查询成功，减少余额
                 self._balance[token] -= 1
-                logger.info(f'使用Token ...{token[-5:]} 查询成功，剩余次数: {self._balance[token]}')
+                logger.info(f'Token 查询成功，剩余次数: {self._balance[token]}')
                 break
             elif try_times < self._retry_times:
-                logger.warning(f'使用Token ...{token[-5:]} 查询失败，进行第 {try_times + 1} 次重试...')
+                logger.warning(f'Token 查询失败，进行第 {try_times + 1} 次重试...')
         
         # 10次查询后更新余额
         self._count = (self._count + 1) % 10
@@ -626,11 +650,13 @@ class TikuLike(Tiku):
         except requests.exceptions.ConnectionError:
             logger.error(f'{self.name}网络连接错误: 无法连接到API服务器')
             return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f'{self.name}查询异常: \n{e}')
+        except requests.exceptions.RequestException:
+            logger.error(f'{self.name}查询网络请求失败')
             return None
-        except Exception as e:
-            logger.error(f'{self.name}查询发生未知错误: \n{e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}查询发生未知错误')
             return None
 
         # 处理HTTP响应
@@ -647,7 +673,7 @@ class TikuLike(Tiku):
         elif res.status_code == 403:
             logger.error(f'{self.name}访问被拒绝: 可能是Token权限不足')
         else:
-            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应内容: \n{res.text}')
+            logger.error(f'{self.name}查询失败: HTTP {res.status_code}')
         
         return None
     
@@ -666,20 +692,21 @@ class TikuLike(Tiku):
         except json.JSONDecodeError:
             logger.error(f'{self.name}响应解析失败: 响应不是有效的JSON格式')
             return None
-        except Exception as e:
-            logger.error(f'{self.name}响应解析异常: {e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}响应解析异常')
             return None
         
         # 记录响应消息
         msg = res_json.get('message', '')
         if msg:
-            logger.info(f'{self.name}响应消息: {msg}')
+            logger.info(f'{self.name}收到响应消息')
         
         # 检查API返回的code字段，判断请求是否成功
         code = res_json.get('code', 1)
         if code != 1:
-            error_msg = res_json.get('message', '未知错误')
-            logger.error(f'{self.name}API返回错误: {error_msg}')
+            logger.error(f'{self.name}API返回错误 (code={code})')
             return None
         
         results = res_json.get('results', {})
@@ -783,8 +810,7 @@ class TikuLike(Tiku):
                 if code == 1:
                     return int(res_json.get("balance", 0))
                 else:
-                    error_msg = res_json.get('message', '未知错误')
-                    logger.error(f'{self.name}获取余额失败: {error_msg}')
+                    logger.error(f'{self.name}获取余额失败 (HTTP 200 返回错误)')
                     return 0
             else:
                 logger.error(f'{self.name}请求余额接口失败，状态码: {res.status_code}')
@@ -798,8 +824,10 @@ class TikuLike(Tiku):
         except ValueError:  # json解析错误或int转换错误
             logger.error(f'{self.name}余额响应解析失败: 响应格式不正确')
             return 0
-        except Exception as e:
-            logger.error(f'{self.name}Token余额查询过程中出现错误: {e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}Token余额查询过程中出现错误')
             return 0
 
     def update_times(self) -> None:
@@ -809,7 +837,7 @@ class TikuLike(Tiku):
         for token in self._tokens:
             balance = self.get_api_balance(token)
             self._balance[token] = balance
-            logger.info(f"当前LIKE知识库Token: ...{token[-5:]} 的剩余查询次数为: {balance} (仅供参考, 实际次数以查询结果为准)")
+            logger.info(f"LIKE知识库Token剩余查询次数为: {balance} (仅供参考)")
 
     def load_tokens(self) -> None:
         tokens_str = self._conf.get('tokens')
@@ -878,7 +906,7 @@ class TikuAdapter(Tiku):
             # plat无论搜没搜到答案都返回0
             # 这个参数是tikuadapter用来设定自定义的平台类型
             if not len(res_json['answer']['bestAnswer']):
-                logger.error("查询失败, 返回：" + res.text)
+                logger.error("查询失败: API 返回空答案")
                 return None
             sep = "\n"
             return sep.join(res_json['answer']['bestAnswer']).strip()
@@ -913,6 +941,7 @@ class AI(Tiku):
         self.max_active_requests: int = 3
         self._request_semaphore: Optional[threading.Semaphore] = request_semaphore
         self._injected_request_semaphore = request_semaphore
+        self.cancel_event: Optional[threading.Event] = None
         # 精简提示词：直接输出 JSON，禁止多余内容
         self._system_prompts = {
             "single": (
@@ -945,6 +974,29 @@ class AI(Tiku):
         self._injected_request_semaphore = semaphore
         self._request_semaphore = semaphore
 
+    def set_cancel_event(self, cancel_event: Optional[threading.Event]) -> None:
+        """Attach the task cancellation signal to waits and retries."""
+
+        self.cancel_event = cancel_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise StudyCancelled()
+
+    def _wait_or_cancel(self, seconds: float) -> None:
+        self._raise_if_cancelled()
+        if seconds <= 0:
+            return
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(seconds):
+                raise StudyCancelled()
+        else:
+            time.sleep(seconds)
+
+    def _acquire_request_slot(self, semaphore: threading.Semaphore) -> None:
+        while not semaphore.acquire(timeout=0.2):
+            self._raise_if_cancelled()
+
     @property
     def request_semaphore(self) -> Optional[threading.Semaphore]:
         return self._request_semaphore
@@ -968,12 +1020,13 @@ class AI(Tiku):
 
     def _respect_interval(self):
         with self._interval_lock:
+            self._raise_if_cancelled()
             if self.last_request_time:
                 interval_time = time.time() - self.last_request_time
                 if interval_time < self.min_interval_seconds:
                     sleep_time = self.min_interval_seconds - interval_time
                     logger.debug(f"AI请求间隔过短, 等待 {sleep_time:.2f} 秒")
-                    time.sleep(sleep_time)
+                    self._wait_or_cancel(sleep_time)
             self.last_request_time = time.time()
 
     def _build_messages(self, q_info: dict) -> list[dict]:
@@ -994,14 +1047,16 @@ class AI(Tiku):
             return None
         last_error = None
         for attempt in range(1, self.max_retries + 1):
+            self._raise_if_cancelled()
             error_category = "request_error"
             rate_limited = False
             try:
                 # 全局并发控制：限制同时在请求中的题目数量
                 sem = self._request_semaphore
                 if sem is not None:
-                    sem.acquire()
+                    self._acquire_request_slot(sem)
                 try:
+                    self._raise_if_cancelled()
                     self._respect_interval()
                     headers = {
                         "Authorization": f"Bearer {self.key}",
@@ -1016,6 +1071,7 @@ class AI(Tiku):
                         headers=headers,
                         json=payload,
                     )
+                    self._raise_if_cancelled()
                 finally:
                     if sem is not None:
                         sem.release()
@@ -1088,6 +1144,8 @@ class AI(Tiku):
                     logger.warning("AI大模型返回空答案，将视为无答案处理")
                     return None
                 return "\n".join(answers).strip()
+            except StudyCancelled:
+                raise
             except Exception as exc:
                 if not rate_limited:
                     if isinstance(exc, httpx.TimeoutException):
@@ -1103,10 +1161,10 @@ class AI(Tiku):
                     logger.warning(
                         f"AI大模型请求失败 ({attempt}/{self.max_retries}) 且触发限流，将休眠 {cool_down:.2f} 秒: {safe_error}"
                     )
-                    time.sleep(cool_down)
+                    self._wait_or_cancel(cool_down)
                 else:
                     logger.warning(f"AI大模型请求失败 ({attempt}/{self.max_retries}): {safe_error}")
-                    time.sleep(self.retry_delay * attempt)
+                    self._wait_or_cancel(self.retry_delay * attempt)
         logger.error(f"AI大模型连续失败，最后错误: {last_error}")
         return None
 

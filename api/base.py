@@ -28,6 +28,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api.live_process import StudyCancelled
 from api.vision_ocr import (
     _capture_vision_ocr_context,
     vision_ocr_context,
@@ -36,6 +37,20 @@ from api.vision_ocr import (
 
 def get_timestamp():
     return str(int(time.time() * 1000))
+
+
+def _raise_if_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise StudyCancelled()
+
+
+def _wait_or_cancel(cancel_event, seconds: float) -> None:
+    _raise_if_cancelled(cancel_event)
+    if cancel_event is not None:
+        if cancel_event.wait(seconds):
+            raise StudyCancelled()
+    else:
+        time.sleep(seconds)
 
 
 def build_session(initial_cookies: Mapping[str, str] | None = None) -> requests.Session:
@@ -256,7 +271,6 @@ class Chaoxing:
             _resp = _session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params=cards_params)
             if _resp.status_code != 200:
                 logger.error(f"未知错误: {_resp.status_code} 正在跳过")
-                logger.error(_resp.text)
                 return [], {}
 
             _job_list, _job_info = decode_course_card(_resp.text)
@@ -300,7 +314,9 @@ class Chaoxing:
         self.video_log_limiter.limit_rate(random_time=True, random_max=2)
 
         if "courseId" in _job["otherinfo"]:
-            logger.error(_job["otherinfo"])
+            # ``otherinfo`` carries session/job tokens in normal responses;
+            # never dump it while diagnosing a malformed job.
+            logger.error("任务元数据格式异常: otherinfo 包含 courseId")
             raise RuntimeError("this is not possible")
 
         enc = self.get_enc(_course["clazzId"], _job["jobid"], _job["objectid"], _playingTime, _duration, self.get_uid())
@@ -358,7 +374,6 @@ class Chaoxing:
                                "_t": get_timestamp()})
                 resp = _session.get(_url, params=params, headers=headers)
                 if resp.status_code == 200:
-                    logger.trace(resp.text)
                     return resp.json()["isPassed"], 200
                 #elif resp.ok:
                 #    # TODO: 处理验证码
@@ -367,33 +382,23 @@ class Chaoxing:
                     logger.warning("出现403报错, 正常尝试切换rt")
 
                 else:
-                    logger.warning("未知错误 jobid={}, status_code={}, 摘要:\n{}",
+                    logger.warning("未知错误 jobid={}, status_code={}",
                                    _job.get("jobid"),
                                    resp.status_code,
-                                   resp.text[:200]
                     )
                     break
 
         if resp.status_code == 200:
-            logger.trace(resp.text)
             return resp.json()["isPassed"], 200
 
         elif resp.status_code == 403:
-            logger.debug(
-                "视频进度上报返回403, jobid={}, 摘要={}",
-                _job.get("jobid"),
-                resp.text[:200],
-            )
+            logger.debug("视频进度上报返回403, jobid={}", _job.get("jobid"))
 
             # 若出现两个rt参数都返回403的情况, 则跳过当前任务
             logger.error("出现403报错, 尝试修复无效, 正在跳过当前任务点...")
-            logger.error("请求url: {}", resp.url)
-            logger.error("请求头: {}", dict(_session.headers) | headers)
             return False, 403
 
         logger.error(f"未知错误: {resp.status_code}")
-        logger.error("请求url:", resp.url)
-        logger.error("请求头：", dict(_session.headers) | headers)
         return False, resp.status_code
 
 
@@ -411,8 +416,7 @@ class Chaoxing:
             return None
 
         if resp.status_code != 200:
-            logger.debug("刷新视频状态返回码异常: {}"% resp.status_code)
-            logger.debug(resp.text)
+            logger.debug("刷新视频状态返回码异常: {}", resp.status_code)
             return None
 
         try:
@@ -436,7 +440,7 @@ class Chaoxing:
             login_result = self.login(login_with_cookies=False)
             if login_result.get("status"):
                 return self._refresh_video_status(session, job, _type)
-            logger.warning("账号密码登录失败: {}", login_result.get("msg"))
+            logger.warning("账号密码登录失败")
 
         return None
 
@@ -449,8 +453,10 @@ class Chaoxing:
         _speed: float = 1.0,
         _type: Literal["Video", "Audio"] = "Video",
         progress_callback=None,
+        cancel_event=None,
     ) -> StudyResult:
         _session = self.session
+        _raise_if_cancelled(cancel_event)
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
         _info_url = f"https://mooc1.chaoxing.com/ananas/status/{_job['objectid']}?k={self.get_fid()}&flag=normal"
@@ -480,6 +486,8 @@ class Chaoxing:
         if callable(progress_callback):
             try:
                 progress_callback(_course, _job, float(play_time), float(duration))
+            except StudyCancelled:
+                raise
             except Exception as exc:
                 logger.debug(f"视频进度回调执行失败(初始): {exc}")
 
@@ -490,13 +498,16 @@ class Chaoxing:
         max_forbidden_retry = 2
 
         passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type,headers=headers)
+        _raise_if_cancelled(cancel_event)
         passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers=headers)
+        _raise_if_cancelled(cancel_event)
 
         if passed:
             logger.info("任务瞬间完成: {}", _job['name'])
             return StudyResult.SUCCESS
 
         while not passed:
+            _raise_if_cancelled(cancel_event)
             # Sometimes the last request needs to be sent several times to complete the task
             if play_time - last_log_time >= wait_time or play_time == duration:
 
@@ -512,7 +523,7 @@ class Chaoxing:
                         "出现403报错, 正在尝试刷新会话状态 (第{}次)",
                         forbidden_retry,
                     )
-                    time.sleep(random.uniform(2, 4))
+                    _wait_or_cancel(cancel_event, random.uniform(2, 4))
                     refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
                     if refreshed_meta:
                         # FIXME: Maybe it should be considered an error if those keys aren't present in the refreshed meta, so we perhaps shouldn't use get()
@@ -520,7 +531,7 @@ class Chaoxing:
                         _duration = refreshed_meta.get("duration", duration)
                         play_time = refreshed_meta.get("playTime", play_time)
 
-                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
+                        logger.debug("Refreshed video metadata, duration={}, play time={}", _duration, play_time)
                         continue
 
                 elif not passed and state != 200:
@@ -543,10 +554,12 @@ class Chaoxing:
             if callable(progress_callback):
                 try:
                     progress_callback(_course, _job, float(play_time), float(duration))
+                except StudyCancelled:
+                    raise
                 except Exception as exc:
                     logger.debug(f"视频进度回调执行失败: {exc}")
 
-            time.sleep(gc.THRESHOLD)
+            _wait_or_cancel(cancel_event, gc.THRESHOLD)
 
         logger.info("任务完成: {}", _job['name'])
         return StudyResult.SUCCESS
@@ -690,7 +703,7 @@ class Chaoxing:
             res = cut(answer)
             if res is None:
                 logger.warning(
-                    f"未能从网页中提取题目信息, 以下为相关信息：\n\t{answer}\n\n{_ORIGIN_HTML_CONTENT}\n"
+                    "未能从网页中提取题目选项信息 (响应内容已省略)"
                 )  # 尝试输出网页内容和选项信息
                 logger.warning("未能正确提取题目选项信息! 请反馈并提供以上信息")
                 return None
@@ -732,10 +745,12 @@ class Chaoxing:
                             logger.warning(
                                 f"无效响应 (Code: {getattr(_resp, 'status_code', 'Unknown')}), 重试中... ({retries + 1}/{max_retries})")
 
-                        except requests.exceptions.RequestException as e:
-                            logger.warning(f"请求失败: {str(e)[:50]}, 重试中... ({retries + 1}/{max_retries})")
+                        except requests.exceptions.RequestException:
+                            logger.warning(
+                                f"请求失败，重试中... ({retries + 1}/{max_retries})"
+                            )
                         retries += 1
-                        time.sleep(delay * (2 ** retries))
+                        _wait_or_cancel(self.kwargs.get("cancel_event"), delay * (2 ** retries))
                     raise MaxRetryExceeded(f"超过最大重试次数 ({max_retries})")
 
                 return wrapper
@@ -775,8 +790,10 @@ class Chaoxing:
 
         try:
             final_resp, questions = fetch_response()
-        except Exception as e:
-            logger.error(f"请求失败: {e}")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error("请求题目失败")
             return StudyResult.ERROR
 
         _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
@@ -784,15 +801,18 @@ class Chaoxing:
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0
+        cancel_event = self.kwargs.get("cancel_event")
 
         def _handle_question(q, inc_found):
             nonlocal found_answers
+            _raise_if_cancelled(cancel_event)
             logger.debug(f"当前题目信息 -> {q}")
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay", 0)
             if query_delay:
-                time.sleep(query_delay)
+                _wait_or_cancel(cancel_event, query_delay)
             res = self.tiku.query(q)
+            _raise_if_cancelled(cancel_event)
             answer = ""
             if not res:
                 # 随机答题
@@ -917,11 +937,17 @@ class Chaoxing:
                 return invoke()
 
             with ThreadPoolExecutor(max_workers=ai_concurrency) as executor:
+                futures = []
                 for q in questions["questions"]:
-                    executor.submit(_handle_question_in_context, q)
+                    _raise_if_cancelled(cancel_event)
+                    futures.append(executor.submit(_handle_question_in_context, q))
 
-            # 等待线程池中的任务全部结束
-            executor.shutdown(wait=True)
+                # Futures must be observed explicitly.  Otherwise worker
+                # exceptions (including cooperative cancellation) are stored
+                # in the Future and the caller proceeds to calculate coverage
+                # and submit an incomplete answer sheet.
+                for future in futures:
+                    future.result()
         else:
             def inc_found_seq():
                 nonlocal found_answers
@@ -929,6 +955,10 @@ class Chaoxing:
 
             for q in questions["questions"]:
                 _handle_question(q, inc_found_seq)
+        # A cancellation may arrive after the last question has completed but
+        # before coverage/submit bookkeeping.  Do not continue into either
+        # path once the task has been asked to stop.
+        _raise_if_cancelled(cancel_event)
         cover_rate = (found_answers / total_questions) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
 
@@ -971,6 +1001,9 @@ class Chaoxing:
 
         del questions["questions"]
 
+        # Re-check immediately before the side-effecting request.  The event
+        # can be set while filling the local form after the coverage check.
+        _raise_if_cancelled(cancel_event)
         res = _session.post(
             "https://mooc1.chaoxing.com/mooc-ans/work/addStudentWorkNew",
             data=questions,
@@ -1007,7 +1040,7 @@ class Chaoxing:
                 logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {msg}')
                 return StudyResult.ERROR
         else:
-            logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res.text}')
+            logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> HTTP {res.status_code}')
             return StudyResult.ERROR
         return StudyResult.SUCCESS
 
@@ -1027,7 +1060,7 @@ class Chaoxing:
             },
         )
         if _resp.status_code != 200:
-            logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text}")
+            logger.error(f"阅读任务学习失败 -> HTTP {_resp.status_code}")
             return StudyResult.ERROR
         else:
             _resp_json = _resp.json()

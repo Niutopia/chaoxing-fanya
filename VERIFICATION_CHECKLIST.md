@@ -316,7 +316,7 @@
 - [x] package.json
 - [x] vite.config.js
 - [x] tailwind.config.js
-- [x] requirements.txt (含flask-cors)
+- [x] requirements.txt（固定版本的生产依赖）
 
 **验收结果**: ✅ 通过
 

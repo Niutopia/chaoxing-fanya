@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import io
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from api.answer import AI
 from api.base import Account, Chaoxing, StudyResult
 from api.vision_ocr import _load_vision_ocr_config, vision_ocr_context
 from api.vision_ocr import reset_vision_ocr_config
+from api.logger import logger
 from webapp.models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
 from webapp.study_runner import ChaoxingStudyRunner, StudyCancelled, StudyRunError
 from webapp.task_manager import StudyRunContext
@@ -148,6 +150,24 @@ def test_runner_stops_at_next_safe_checkpoint(
     with pytest.raises(StudyCancelled):
         runner.run(fake_context)
     assert fake_engine_factory.processed_courses == []
+
+
+def test_refresh_video_status_handles_non_200_without_secondary_error():
+    engine = object.__new__(Chaoxing)
+    engine.rate_limiter = SimpleNamespace(limit_rate=lambda **_: None)
+    engine.get_fid = lambda: "fid"
+    response = SimpleNamespace(status_code=403, text="sensitive-response")
+    session = SimpleNamespace(get=lambda *_args, **_kwargs: response)
+    visible_logs = io.StringIO()
+    sink_id = logger.add(visible_logs, format="{message}", level="TRACE")
+    try:
+        assert engine._refresh_video_status(
+            session, {"objectid": "object"}, "Video"
+        ) is None
+    finally:
+        logger.remove(sink_id)
+    assert "403" in visible_logs.getvalue()
+    assert "sensitive-response" not in visible_logs.getvalue()
 
 
 def test_runner_propagates_account_and_answer_context(
@@ -334,6 +354,7 @@ class _AnswerSession:
         self.cookie = cookie
         self.headers = {}
         self.image_cookies = []
+        self.posted_urls = []
 
     def get(self, url, **_kwargs):
         if "mooc-ans/api/work" in url:
@@ -344,6 +365,7 @@ class _AnswerSession:
         raise AssertionError(f"unexpected account request: {url}")
 
     def post(self, _url, **_kwargs):
+        self.posted_urls.append(_url)
         return SimpleNamespace(
             status_code=200,
             text="ok",
@@ -436,3 +458,100 @@ def test_nested_ai_answer_workers_reenter_empty_ocr_context(monkeypatch):
     assert result is StudyResult.SUCCESS
     assert ocr_calls == []
     assert all("environment-ocr" not in title for title in tiku.titles)
+
+
+@pytest.mark.parametrize("failure", [StudyCancelled, RuntimeError])
+def test_ai_study_work_propagates_worker_future_failures(monkeypatch, failure):
+    monkeypatch.setattr(
+        base,
+        "decode_questions_info",
+        lambda *_args, **_kwargs: _nested_questions(),
+    )
+
+    class FailingAI(AI):
+        def query(self, _question):
+            raise failure("worker failure")
+
+    tiku = FailingAI()
+    session = _AnswerSession("cookie-account-failure")
+    chaoxing = Chaoxing(
+        Account("answer-user", "answer-password"),
+        tiku=tiku,
+        session=session,
+        ai_concurrency=2,
+    )
+
+    with pytest.raises(failure):
+        chaoxing.study_work(
+            {"courseId": "course", "clazzId": "clazz"},
+            {"jobid": "work-1", "enc": "enc"},
+            {"knowledgeid": "knowledge", "ktoken": "token", "cpi": "cpi"},
+        )
+    assert session.posted_urls == []
+
+
+def test_ai_study_work_cancellation_is_checked_before_coverage(monkeypatch):
+    monkeypatch.setattr(
+        base,
+        "decode_questions_info",
+        lambda *_args, **_kwargs: _nested_questions(),
+    )
+    cancel_event = threading.Event()
+
+    class CancellingAI(AI):
+        def query(self, _question):
+            cancel_event.set()
+            return "A"
+
+    tiku = CancellingAI()
+    session = _AnswerSession("cookie-account-cancel")
+    chaoxing = Chaoxing(
+        Account("answer-user", "answer-password"),
+        tiku=tiku,
+        session=session,
+        ai_concurrency=2,
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(StudyCancelled):
+        chaoxing.study_work(
+            {"courseId": "course", "clazzId": "clazz"},
+            {"jobid": "work-1", "enc": "enc"},
+            {"knowledgeid": "knowledge", "ktoken": "token", "cpi": "cpi"},
+        )
+    assert session.posted_urls == []
+
+
+def test_ai_study_work_rechecks_cancellation_before_submit(monkeypatch):
+    monkeypatch.setattr(
+        base,
+        "decode_questions_info",
+        lambda *_args, **_kwargs: _nested_questions(),
+    )
+    cancel_event = threading.Event()
+
+    class CancellingAI(AI):
+        def query(self, _question):
+            return "A"
+
+        def get_submit_params(self):
+            cancel_event.set()
+            return "1"
+
+    tiku = CancellingAI()
+    session = _AnswerSession("cookie-account-cancel-before-submit")
+    chaoxing = Chaoxing(
+        Account("answer-user", "answer-password"),
+        tiku=tiku,
+        session=session,
+        ai_concurrency=2,
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(StudyCancelled):
+        chaoxing.study_work(
+            {"courseId": "course", "clazzId": "clazz"},
+            {"jobid": "work-1", "enc": "enc"},
+            {"knowledgeid": "knowledge", "ktoken": "token", "cpi": "cpi"},
+        )
+    assert session.posted_urls == []

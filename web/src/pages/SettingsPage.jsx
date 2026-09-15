@@ -45,6 +45,12 @@ function errorMessage(error, fallback) {
   return typeof message === 'string' && message.trim() ? message : fallback
 }
 
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
+}
+
 function numberValue(value, fallback) {
   const number = Number(value)
   return Number.isFinite(number) ? number : fallback
@@ -274,6 +280,28 @@ function connectionDraftFingerprint(connection, apiKey) {
   })
 }
 
+// Account-level replacement inputs are intentionally kept in memory only.
+// Keep a small, explicit fingerprint so a response from a save started with
+// one draft cannot clear a newer secret typed while that request was pending.
+function accountDraftFingerprint(notification, ocr) {
+  return JSON.stringify({
+    notification: {
+      enabled: notification?.enabled === true,
+      provider: notification?.provider == null ? '' : String(notification.provider),
+      url: notification?.url == null ? '' : String(notification.url),
+      token: notification?.token == null ? '' : String(notification.token),
+      tg_chat_id: notification?.tg_chat_id == null ? '' : String(notification.tg_chat_id),
+    },
+    ocr: {
+      enabled: ocr?.enabled === true,
+      provider: ocr?.provider == null ? '' : String(ocr.provider),
+      endpoint: ocr?.endpoint == null ? '' : String(ocr.endpoint),
+      model: ocr?.model == null ? '' : String(ocr.model),
+      api_key: ocr?.api_key == null ? '' : String(ocr.api_key),
+    },
+  })
+}
+
 function validateConnection(connection) {
   if (!stringValue(connection.base_url).trim()) return '请输入基础地址'
   if (!stringValue(connection.model).trim()) return '请输入模型名称'
@@ -368,7 +396,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const connectionRef = useRef(connection)
   const apiKeyRef = useRef(apiKey)
   const connectionMutationRef = useRef(0)
+  const connectionMutationEpochRef = useRef(0)
+  const connectionMutationOperationRef = useRef(0)
   const settingsSaveOperationRef = useRef(0)
+  const mountedRef = useRef(false)
+  const loadControllerRef = useRef(null)
+  const testControllerRef = useRef(null)
+  const connectionMutationControllerRef = useRef(null)
+  const settingsSaveControllerRef = useRef(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [connectionError, setConnectionError] = useState('')
@@ -387,6 +422,28 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   selectedAccountIdRef.current = selectedAccountId
 
   useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      requestId.current += 1
+      loadGenerationRef.current += 1
+      testGeneration.current += 1
+      settingsSaveOperationRef.current += 1
+      connectionMutationOperationRef.current += 1
+      connectionMutationEpochRef.current += 1
+      connectionMutationRef.current = 0
+      loadControllerRef.current?.abort()
+      testControllerRef.current?.abort()
+      connectionMutationControllerRef.current?.abort()
+      settingsSaveControllerRef.current?.abort()
+      loadControllerRef.current = null
+      testControllerRef.current = null
+      connectionMutationControllerRef.current = null
+      settingsSaveControllerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
     connectionRef.current = connection
   }, [connection])
 
@@ -402,9 +459,28 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }, [accountFromQuery, accounts, explicitAccountId])
 
   const loadSettings = useCallback(async () => {
+    // A reload (including an account switch) starts a new settings session.
+    // Abort transports where possible and advance every mutation token so a
+    // response from the previous session cannot write into this one. Aborting
+    // a POST only affects this UI; it cannot roll back a server-side write.
+    loadControllerRef.current?.abort()
+    testControllerRef.current?.abort()
+    connectionMutationControllerRef.current?.abort()
+    settingsSaveControllerRef.current?.abort()
+    const controller = new AbortController()
+    loadControllerRef.current = controller
     const currentRequest = ++requestId.current
-    ++loadGenerationRef.current
+    const currentLoadGeneration = ++loadGenerationRef.current
     testGeneration.current += 1
+    settingsSaveOperationRef.current += 1
+    connectionMutationOperationRef.current += 1
+    connectionMutationEpochRef.current += 1
+    connectionMutationRef.current = 0
+    connectionMutationControllerRef.current = null
+    settingsSaveControllerRef.current = null
+    setSavingConnection(false)
+    setSavingSettings(false)
+    setClearingKey(false)
     setLoading(true)
     setLoadError('')
     setConnectionError('')
@@ -416,10 +492,18 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setTestMessage('')
     setAccountPrefsReady(!selectedAccountId)
 
-    const requests = [getAnswerConnection(), getRuntimeSettings()]
-    if (selectedAccountId) requests.push(getPreferences(selectedAccountId))
+    const requests = [getAnswerConnection({ signal: controller.signal }), getRuntimeSettings({ signal: controller.signal })]
+    if (selectedAccountId) requests.push(getPreferences(selectedAccountId, { signal: controller.signal }))
+    const isCurrentLoad = () => (
+      mountedRef.current
+      && !controller.signal.aborted
+      && loadControllerRef.current === controller
+      && currentRequest === requestId.current
+      && currentLoadGeneration === loadGenerationRef.current
+      && String(selectedAccountIdRef.current ?? '') === String(selectedAccountId ?? '')
+    )
     const [connectionResult, runtimeResult, accountResult] = await Promise.allSettled(requests)
-    if (currentRequest !== requestId.current) return
+    if (!isCurrentLoad()) return
 
     const failures = []
     if (connectionResult.status === 'fulfilled') {
@@ -453,6 +537,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           setSuccess('')
           setLoadError(failures.join('；'))
           setLoading(false)
+          if (loadControllerRef.current === controller) loadControllerRef.current = null
           return
         }
         const notificationSource = safeConfig(source.notification_config, { notification: true })
@@ -486,12 +571,15 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     }
     setLoadError(failures.join('；'))
     setLoading(false)
+    if (loadControllerRef.current === controller) loadControllerRef.current = null
   }, [selectedAccountId])
 
   useEffect(() => {
     loadSettings()
     return () => {
       requestId.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
     }
   }, [loadSettings])
 
@@ -502,22 +590,79 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
 
   const invalidateConnectionTest = () => {
     testGeneration.current += 1
+    testControllerRef.current?.abort()
+    testControllerRef.current = null
     setTestState('idle')
     setTestMessage('')
   }
 
   const beginConnectionMutation = () => {
+    connectionMutationControllerRef.current?.abort()
+    const controller = new AbortController()
+    const epoch = connectionMutationEpochRef.current
+    const operation = ++connectionMutationOperationRef.current
     connectionMutationRef.current += 1
+    connectionMutationControllerRef.current = controller
+    return { controller, epoch, operation }
   }
 
-  const endConnectionMutation = () => {
+  const endConnectionMutation = ({ epoch, operation, controller } = {}) => {
+    if (
+      epoch !== connectionMutationEpochRef.current
+      || operation !== connectionMutationOperationRef.current
+    ) return
     connectionMutationRef.current = Math.max(0, connectionMutationRef.current - 1)
+    if (connectionMutationControllerRef.current === controller) connectionMutationControllerRef.current = null
   }
+
+  const isCurrentMutation = (context) => (
+    Boolean(context)
+    && mountedRef.current
+    && context.epoch === connectionMutationEpochRef.current
+    && context.operation === connectionMutationOperationRef.current
+    && connectionMutationControllerRef.current === context.controller
+    && !context.controller.signal.aborted
+  )
 
   const isCurrentSettingsSave = (context) => (
-    context.loadGeneration === loadGenerationRef.current
+    isCurrentMutation(context?.mutation)
+    && context.operation === settingsSaveOperationRef.current
+    && settingsSaveControllerRef.current === context.controller
+    && !context.controller.signal.aborted
+    && context.loadGeneration === loadGenerationRef.current
     && String(context.accountId ?? '') === String(selectedAccountIdRef.current ?? '')
   )
+
+  const switchAccount = (nextAccountId) => {
+    const currentAccountId = selectedAccountIdRef.current
+    if (String(nextAccountId ?? '') === String(currentAccountId ?? '')) return
+
+    // Invalidate synchronously in the change handler. Waiting for the
+    // selectedAccountId effect would leave a microtask-sized window in which
+    // an old load/save response could still update the newly selected view.
+    selectedAccountIdRef.current = nextAccountId
+    requestId.current += 1
+    loadGenerationRef.current += 1
+    testGeneration.current += 1
+    settingsSaveOperationRef.current += 1
+    connectionMutationOperationRef.current += 1
+    connectionMutationEpochRef.current += 1
+    connectionMutationRef.current = 0
+    loadControllerRef.current?.abort()
+    testControllerRef.current?.abort()
+    connectionMutationControllerRef.current?.abort()
+    settingsSaveControllerRef.current?.abort()
+    loadControllerRef.current = null
+    testControllerRef.current = null
+    connectionMutationControllerRef.current = null
+    settingsSaveControllerRef.current = null
+    setLoading(true)
+    setAccountPrefsReady(!nextAccountId)
+    setSavingConnection(false)
+    setSavingSettings(false)
+    setClearingKey(false)
+    setSelectedAccountId(nextAccountId)
+  }
 
   const updateConnection = (field) => (event) => {
     const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value
@@ -556,15 +701,25 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     }
     const generation = ++testGeneration.current
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
+    testControllerRef.current?.abort()
+    const controller = new AbortController()
+    testControllerRef.current = controller
+    const isCurrentTest = () => (
+      mountedRef.current
+      && generation === testGeneration.current
+      && testControllerRef.current === controller
+      && !controller.signal.aborted
+      && fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
+    )
     setTestState('testing')
     setTestMessage('')
     setConnectionError('')
     try {
-      const result = unwrap(await testAnswerConnection(answerPayload(connection, apiKey)), ['result']) || {}
-      if (
-        generation !== testGeneration.current
-        || fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
-      ) return
+      const result = unwrap(
+        await testAnswerConnection(answerPayload(connection, apiKey), { signal: controller.signal }),
+        ['result'],
+      ) || {}
+      if (!isCurrentTest()) return
       if (result.ok === true && result.model_found !== false) {
         setTestState('success')
         setTestMessage('连接成功，模型可用')
@@ -573,12 +728,11 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setTestState('error')
       setTestMessage(errorMessage(result, '连接失败'))
     } catch (error) {
-      if (
-        generation !== testGeneration.current
-        || fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
-      ) return
+      if (!isCurrentTest() || isAborted(error, controller.signal)) return
       setTestState('error')
       setTestMessage(errorMessage(error, '连接失败'))
+    } finally {
+      if (testControllerRef.current === controller) testControllerRef.current = null
     }
   }
 
@@ -592,14 +746,19 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     }
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
     const submittedApiKey = apiKey
-    beginConnectionMutation()
+    const mutation = beginConnectionMutation()
     invalidateConnectionTest()
     setConnectionSuccess('')
     setSavingConnection(true)
     setConnectionError('')
     setSuccess('')
+    const isCurrentSave = () => isCurrentMutation(mutation)
     try {
-      const saved = await saveAnswerConnection(answerPayload(connection, apiKey))
+      const saved = await saveAnswerConnection(
+        answerPayload(connection, apiKey),
+        { signal: mutation.controller.signal },
+      )
+      if (!isCurrentSave()) return
       // Invalidate both before the mutation and as soon as its response
       // arrives, so a probe cannot become valid during a later save step.
       invalidateConnectionTest()
@@ -618,11 +777,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       }
       setConnectionSuccess('连接设置已保存')
     } catch (error) {
+      if (!isCurrentSave() || isAborted(error, mutation.controller.signal)) return
       setConnectionError(errorMessage(error, '连接设置保存失败，请重试'))
     } finally {
-      invalidateConnectionTest()
-      setSavingConnection(false)
-      endConnectionMutation()
+      if (isCurrentSave()) {
+        invalidateConnectionTest()
+        setSavingConnection(false)
+      }
+      endConnectionMutation(mutation)
     }
   }
 
@@ -630,14 +792,16 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     if (!confirmingClear || clearingKey || connectionMutationRef.current > 0) return
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
     const submittedApiKey = apiKey
-    beginConnectionMutation()
+    const mutation = beginConnectionMutation()
     invalidateConnectionTest()
     setSuccess('')
     setConnectionSuccess('')
     setClearingKey(true)
     setConnectionError('')
+    const isCurrentClear = () => isCurrentMutation(mutation)
     try {
-      const cleared = await clearAnswerKey()
+      const cleared = await clearAnswerKey({ signal: mutation.controller.signal })
+      if (!isCurrentClear()) return
       invalidateConnectionTest()
       const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
       const nextConnection = {
@@ -657,11 +821,14 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setConfirmingClear(false)
       setConnectionSuccess('API Key 已清除')
     } catch (error) {
+      if (!isCurrentClear() || isAborted(error, mutation.controller.signal)) return
       setConnectionError(errorMessage(error, 'API Key 清除失败，请重试'))
     } finally {
-      invalidateConnectionTest()
-      setClearingKey(false)
-      endConnectionMutation()
+      if (isCurrentClear()) {
+        invalidateConnectionTest()
+        setClearingKey(false)
+      }
+      endConnectionMutation(mutation)
     }
   }
 
@@ -689,12 +856,16 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
 
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
     const submittedApiKey = apiKey
+    const mutation = beginConnectionMutation()
     const saveContext = {
       accountId: selectedAccountId,
       loadGeneration: loadGenerationRef.current,
+      controller: mutation.controller,
+      mutation,
     }
     const operation = ++settingsSaveOperationRef.current
-    beginConnectionMutation()
+    saveContext.operation = operation
+    settingsSaveControllerRef.current = mutation.controller
     invalidateConnectionTest()
     setSavingSettings(true)
     setRuntimeError('')
@@ -702,9 +873,15 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setSuccess('')
     let accountSaveStarted = false
     try {
-      await saveRuntimeSettings({ max_active_accounts: Number(runtime.max_active_accounts) })
+      await saveRuntimeSettings(
+        { max_active_accounts: Number(runtime.max_active_accounts) },
+        { signal: mutation.controller.signal },
+      )
       if (!isCurrentSettingsSave(saveContext)) return
-      const savedConnection = await saveAnswerConnection(answerPayload(connection, apiKey))
+      const savedConnection = await saveAnswerConnection(
+        answerPayload(connection, apiKey),
+        { signal: mutation.controller.signal },
+      )
       // Invalidate at the response boundary as well as at mutation start;
       // combined saves still have account preference work to finish.
       invalidateConnectionTest()
@@ -730,12 +907,25 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
           originalNotificationRef.current,
           originalOcrRef.current,
         )
-        await savePreferences(selectedAccountId, accountPayload)
+        const submittedAccountDraft = accountDraftFingerprint(notification, ocr)
+        await savePreferences(selectedAccountId, accountPayload, { signal: mutation.controller.signal })
         if (isCurrentSettingsSave(saveContext)) {
           originalNotificationRef.current = safeConfig(accountPayload.notification_config, { notification: true })
           originalOcrRef.current = safeConfig(accountPayload.ocr_config)
-          setNotification((current) => ({ ...current, url: '', token: '', tg_chat_id: '' }))
-          setOcr((current) => ({ ...current, api_key: '' }))
+          // Only clear replacement secrets if the user has not changed this
+          // account draft since the request was sent.  This is the exact
+          // snapshot guard for a slow save response; newer input stays visible
+          // and will be sent by the next save.
+          setNotification((current) => (
+            accountDraftFingerprint(current, ocr) === submittedAccountDraft
+              ? { ...current, url: '', token: '', tg_chat_id: '' }
+              : current
+          ))
+          setOcr((current) => (
+            accountDraftFingerprint(notification, current) === submittedAccountDraft
+              ? { ...current, api_key: '' }
+              : current
+          ))
           setAccountError('')
         }
       }
@@ -753,9 +943,12 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
         setRuntimeError(errorMessage(error, '设置保存失败，请重试'))
       }
     } finally {
-      invalidateConnectionTest()
-      if (settingsSaveOperationRef.current === operation) setSavingSettings(false)
-      endConnectionMutation()
+      if (isCurrentSettingsSave(saveContext)) {
+        invalidateConnectionTest()
+        setSavingSettings(false)
+      }
+      if (settingsSaveControllerRef.current === mutation.controller) settingsSaveControllerRef.current = null
+      endConnectionMutation(mutation)
     }
   }
 
@@ -915,8 +1108,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                   id="settings-account"
                   value={selectedAccountId}
                   onChange={(event) => {
-                    selectedAccountIdRef.current = event.target.value
-                    setSelectedAccountId(event.target.value)
+                    switchAccount(event.target.value)
                   }}
                   className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
                 >

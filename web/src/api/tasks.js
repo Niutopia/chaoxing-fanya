@@ -2,23 +2,28 @@ import apiClient, { apiRequest } from './client'
 
 const taskPath = (taskId) => `/tasks/${encodeURIComponent(taskId)}`
 
-export function listTasks() {
-  return apiRequest(apiClient.get('/tasks'))
+function requestConfig(options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined
+  return signal ? { signal } : {}
 }
 
-export function startTask(accountId, payload = {}) {
+export function listTasks(options = {}) {
+  return apiRequest(apiClient.get('/tasks', requestConfig(options)))
+}
+
+export function startTask(accountId, payload = {}, options = {}) {
   const body = Array.isArray(payload) ? { course_ids: payload } : payload
   return apiRequest(
-    apiClient.post(`/accounts/${encodeURIComponent(accountId)}/tasks`, body),
+    apiClient.post(`/accounts/${encodeURIComponent(accountId)}/tasks`, body, requestConfig(options)),
   )
 }
 
-export function getTask(taskId) {
-  return apiRequest(apiClient.get(taskPath(taskId)))
+export function getTask(taskId, options = {}) {
+  return apiRequest(apiClient.get(taskPath(taskId), requestConfig(options)))
 }
 
-export function getTaskDetails(taskId) {
-  return apiRequest(apiClient.get(`${taskPath(taskId)}/details`))
+export function getTaskDetails(taskId, options = {}) {
+  return apiRequest(apiClient.get(`${taskPath(taskId)}/details`, requestConfig(options)))
 }
 
 function cursorValue(options) {
@@ -30,12 +35,13 @@ export function getTaskLogs(taskId, options = {}) {
   return apiRequest(
     apiClient.get(`${taskPath(taskId)}/logs`, {
       params: { after: cursorValue(options) },
+      ...requestConfig(options),
     }),
   )
 }
 
-export function cancelTask(taskId) {
-  return apiRequest(apiClient.post(`${taskPath(taskId)}/cancel`))
+export function cancelTask(taskId, options = {}) {
+  return apiRequest(apiClient.post(`${taskPath(taskId)}/cancel`, undefined, requestConfig(options)))
 }
 
 export const fetchTasks = listTasks

@@ -30,8 +30,10 @@ class LiveProcessor:
             if not duration:
                 logger.warning("无法获取直播总时长，默认按30分钟处理")
                 duration = 30 * 60  # 默认30分钟
-        except Exception as e:
-            logger.error(f"解析直播时长失败: {str(e)}")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error("解析直播时长失败")
             return False
 
         # 根据播放速度调整所需时间
@@ -47,13 +49,19 @@ class LiveProcessor:
             if not success:
                 logger.warning(f"第{i+1}分钟时长提交失败，将重试")
                 # 失败重试一次
-                time.sleep(5)
+                if cancel_event is not None and cancel_event.wait(5):
+                    raise StudyCancelled()
+                elif cancel_event is None:
+                    time.sleep(5)
                 _raise_if_cancelled(cancel_event)
                 live.do_finish()
 
             # 根据倍速调整间隔时间
             sleep_time = 59 / speed
-            time.sleep(sleep_time)
+            if cancel_event is not None and cancel_event.wait(sleep_time):
+                raise StudyCancelled()
+            elif cancel_event is None:
+                time.sleep(sleep_time)
 
         logger.success(f"直播'{live.name}'时长刷取完成")
         return True

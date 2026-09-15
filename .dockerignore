@@ -98,3 +98,11 @@ portable_build/
 **/portable_build/
 build_portable/
 **/build_portable/
+
+# Local PaddleOCR is an optional, explicitly enabled code path.  The default
+# Docker Web deployment uses external OCR and does not install PaddlePaddle,
+# so the source checkout and its model/development trees are not image input.
+# Keep this list explicit: it documents the optional boundary while avoiding
+# the ~139 MB repository-only OCR payload in the Docker build context.
+PaddleOCR/
+PaddleOCR/**

@@ -217,7 +217,10 @@ test('appends unique log sequences and expands course details', async () => {
   expect(screen.getAllByText('first')).toHaveLength(1)
   expect(screen.queryByText('first duplicate')).not.toBeInTheDocument()
   expect(screen.getByText('second')).toBeInTheDocument()
-  expect(getTaskLogs).toHaveBeenNthCalledWith(2, 'task-a', { after: 1 })
+  expect(getTaskLogs).toHaveBeenNthCalledWith(2, 'task-a', {
+    after: 1,
+    signal: expect.any(AbortSignal),
+  })
 })
 
 test('resets cursor and logs when the selected task route changes', async () => {
@@ -246,7 +249,10 @@ test('resets cursor and logs when the selected task route changes', async () => 
   expect(screen.queryByText('task-a-log')).not.toBeInTheDocument()
 
   const taskBCalls = getTaskLogs.mock.calls.filter(([taskId]) => taskId === 'task-b')
-  expect(taskBCalls[0]?.[1]).toEqual({ after: 0 })
+  expect(taskBCalls[0]?.[1]).toEqual({
+    after: 0,
+    signal: expect.any(AbortSignal),
+  })
 })
 
 test('ignores a stale cancel success after changing to another task', async () => {
@@ -268,7 +274,9 @@ test('ignores a stale cancel success after changing to another task', async () =
   onSnapshot.mockClear()
   await user.click(screen.getByRole('button', { name: '停止任务' }))
   await user.click(screen.getByRole('button', { name: '确认停止' }))
-  expect(cancelTask).toHaveBeenCalledWith('task-a')
+  expect(cancelTask).toHaveBeenCalledWith('task-a', {
+    signal: expect.any(AbortSignal),
+  })
 
   await navigate('/tasks/task-b')
   expect(await screen.findByLabelText('已完成课程数量')).toHaveTextContent('9 / 10')
@@ -406,4 +414,36 @@ test('unknown task links back to overview and launch', async () => {
   getTask.mockRejectedValue(new ApiError('不存在', 404, 'task_not_found'))
   renderPage('/tasks/missing')
   expect(await screen.findByRole('link', { name: '返回任务总览' })).toHaveAttribute('href', '/')
+})
+
+test('stops polling and reports malformed task snapshots', async () => {
+  vi.useFakeTimers()
+  getTask.mockResolvedValue({})
+  getTaskDetails.mockResolvedValue({ courses: [], active_jobs: {} })
+  const onSnapshot = vi.fn()
+  renderPage('/tasks/task-a', { onSnapshot })
+
+  await flushInitialPoll()
+  expect(screen.getByText('任务状态响应格式异常')).toBeInTheDocument()
+  expect(onSnapshot).not.toHaveBeenCalled()
+  const initialTaskCalls = getTask.mock.calls.length
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(6000)
+  })
+  expect(getTask).toHaveBeenCalledTimes(initialTaskCalls)
+  expect(getTask.mock.calls[0]?.[1]).toEqual({ signal: expect.any(AbortSignal) })
+  expect(getTaskDetails.mock.calls[0]?.[1]).toEqual({ signal: expect.any(AbortSignal) })
+  vi.useRealTimers()
+})
+
+test.each([
+  [{ id: 'task-a', state: 'mystery' }, 'unknown state'],
+  [{ id: 'another-task', state: 'running' }, 'mismatched id'],
+])('rejects a task snapshot with %s (%s)', async (malformedSnapshot) => {
+  getTask.mockResolvedValue(malformedSnapshot)
+  getTaskDetails.mockResolvedValue({ courses: [], active_jobs: {} })
+
+  renderPage('/tasks/task-a')
+
+  expect(await screen.findByText('任务状态响应格式异常')).toBeInTheDocument()
 })

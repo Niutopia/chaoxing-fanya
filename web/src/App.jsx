@@ -46,6 +46,12 @@ function errorMessage(error) {
     .replace(/((?:password|passwd|pass|api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|authori[sz]ation|cookie|cookies|key))\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^,;&\s}]+)/gi, '$1=[redacted]')
 }
 
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
+}
+
 function NotFoundPage() {
   return (
     <section className="mx-auto w-full max-w-4xl px-4 py-8 md:px-8" aria-labelledby="not-found-title">
@@ -177,20 +183,29 @@ function AppContent() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const requestIdRef = useRef(0)
+  const requestControllerRef = useRef(null)
 
   const refresh = useCallback(async () => {
+    requestControllerRef.current?.abort()
+    const controller = new AbortController()
+    requestControllerRef.current = controller
     const requestId = ++requestIdRef.current
     setLoading(true)
     setError('')
     try {
-      const [accountResult, taskResult] = await Promise.all([listAccounts(), listTasks()])
+      const [accountResult, taskResult] = await Promise.all([
+        listAccounts({ signal: controller.signal }),
+        listTasks({ signal: controller.signal }),
+      ])
       if (requestId !== requestIdRef.current) return
       setAccounts(normalizedAccounts(accountResult))
       setTasks(normalizedTasks(taskResult))
     } catch (requestError) {
       if (requestId !== requestIdRef.current) return
+      if (isAborted(requestError, controller.signal)) return
       setError(errorMessage(requestError))
     } finally {
+      if (requestControllerRef.current === controller) requestControllerRef.current = null
       if (requestId === requestIdRef.current) setLoading(false)
     }
   }, [])
@@ -199,6 +214,8 @@ function AppContent() {
     refresh()
     return () => {
       requestIdRef.current += 1
+      requestControllerRef.current?.abort()
+      requestControllerRef.current = null
     }
   }, [refresh])
 

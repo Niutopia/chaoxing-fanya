@@ -1,16 +1,56 @@
 services:
+  # Existing installations may have a data volume created by an older image
+  # that ran as root.  Migrate only that volume before the unprivileged Web
+  # service starts; the long-running service never receives these capabilities.
+  data-init:
+    image: alpine:3.22
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -eu;
+        chown -R 10001:10001 /app/data;
+        find /app/data -type d -exec chmod 0700 {} +;
+        find /app/data -type f -exec chmod 0600 {} +
+    volumes:
+      - chaoxing-data:/app/data
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   web:
     build: .
     image: chaoxing-fanya:web-local
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:5001:5000"
     volumes:
       - chaoxing-data:/app/data
+    # Keep the single-worker invariant explicit even if the image command is
+    # changed in a later release.
+    command: ["gunicorn", "--workers", "1", "--threads", "8", "--bind", "0.0.0.0:5000", "app:app"]
     environment:
       CHAOXING_DATA_DIR: /app/data
       CHAOXING_RUNNING_IN_DOCKER: "1"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=3)"]

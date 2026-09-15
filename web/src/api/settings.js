@@ -1,31 +1,36 @@
 import apiClient, { apiRequest } from './client'
 
-export function getAnswerConnection() {
-  return apiRequest(apiClient.get('/settings/answer-connection'))
+function requestConfig(options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined
+  return signal ? { signal } : {}
 }
 
-export function updateAnswerConnection(payload) {
-  return apiRequest(apiClient.put('/settings/answer-connection', payload))
+export function getAnswerConnection(options = {}) {
+  return apiRequest(apiClient.get('/settings/answer-connection', requestConfig(options)))
+}
+
+export function updateAnswerConnection(payload, options = {}) {
+  return apiRequest(apiClient.put('/settings/answer-connection', payload, requestConfig(options)))
 }
 
 export const saveAnswerConnection = updateAnswerConnection
 
-export function deleteAnswerKey() {
-  return apiRequest(apiClient.delete('/settings/answer-connection/key'))
+export function deleteAnswerKey(options = {}) {
+  return apiRequest(apiClient.delete('/settings/answer-connection/key', requestConfig(options)))
 }
 
 export const clearAnswerKey = deleteAnswerKey
 
-export function testAnswerConnection(payload = {}) {
-  return apiRequest(apiClient.post('/settings/answer-connection/test', payload))
+export function testAnswerConnection(payload = {}, options = {}) {
+  return apiRequest(apiClient.post('/settings/answer-connection/test', payload, requestConfig(options)))
 }
 
-export function getRuntimeSettings() {
-  return apiRequest(apiClient.get('/settings/runtime'))
+export function getRuntimeSettings(options = {}) {
+  return apiRequest(apiClient.get('/settings/runtime', requestConfig(options)))
 }
 
-export function updateRuntimeSettings(payload) {
-  return apiRequest(apiClient.put('/settings/runtime', payload))
+export function updateRuntimeSettings(payload, options = {}) {
+  return apiRequest(apiClient.put('/settings/runtime', payload, requestConfig(options)))
 }
 
 export const saveRuntimeSettings = updateRuntimeSettings

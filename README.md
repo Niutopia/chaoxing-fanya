@@ -73,21 +73,60 @@ docker compose up --build -d
 docker compose ps
 curl -fsS http://127.0.0.1:5001/api/health
 docker compose logs --tail=100 web
-container_id="$(docker compose ps -q web)"
+```
+
+`data-init` 是一次性权限迁移服务：每次启动前，它只对 `/app/data`
+执行所有者与权限修复，然后退出。看到它处于 `Exited (0)` 是正常现象；长期运行的
+`web` 服务仍以 UID/GID `10001`、只读根文件系统和零 Linux capabilities 运行。
+因此，从旧版 root 容器创建的数据卷升级时无需手工 `chown`。
+
+备份 SQLite 时必须先停止写入并完成 WAL checkpoint。下面的命令启用 shell
+遇错即停，任何一步失败都不会继续生成一个看似成功但不完整的备份：
+
+```bash
+set -euo pipefail
+# Stop the writer before touching SQLite.  `docker compose ps -q web` is the
+# running-container form; -aq also finds the stopped container for inspection.
+docker compose stop web
+container_id="$(docker compose ps -aq web)"
 if [ -z "$container_id" ]; then
-  echo "无法备份：Compose 服务 web 未运行，请先执行 docker compose up -d。" >&2
+  echo "无法备份：找不到 Compose 服务 web 容器，请先执行 docker compose up -d。" >&2
   exit 1
 fi
 data_volume="$(docker inspect "$container_id" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
 if [ -z "$data_volume" ]; then
-  echo "无法备份：运行中的 web 容器没有 /app/data 命名卷。" >&2
+  echo "无法备份：web 容器没有 /app/data 命名卷。" >&2
   exit 1
 fi
+# Flush SQLite WAL pages after the application has stopped writing.  The
+# temporary Compose container uses the same named volume and is removed after
+# the checkpoint.  No database file is copied while a writer is active.
+docker compose run --rm --no-deps web python -c "import sqlite3; from pathlib import Path; p=Path('/app/data/chaoxing-web.sqlite3'); c=sqlite3.connect(p) if p.exists() else None; c and c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c and c.close()"
 backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-backup.XXXXXX")"
 docker run --rm -v "${data_volume}:/source:ro" -v "$backup_dir:/backup" alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
 echo "Backup written to $backup_dir/chaoxing-data-backup.tgz"
-docker compose stop web
 ```
+
+恢复时也要先停服务，避免恢复过程中有进程继续写数据库。下面的示例把备份解压回同一个命名卷；恢复完成后再启动 Web 服务：
+
+```bash
+set -euo pipefail
+backup_file="/path/to/chaoxing-data-backup.tgz"
+[ -f "$backup_file" ] || { echo "备份文件不存在：$backup_file" >&2; exit 1; }
+docker compose stop web
+container_id="$(docker compose ps -aq web)"
+[ -n "$container_id" ] || { echo "找不到 Compose 服务 web 容器" >&2; exit 1; }
+data_volume="$(docker inspect "$container_id" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
+[ -n "$data_volume" ] || { echo "找不到 /app/data 命名卷" >&2; exit 1; }
+docker run --rm \
+  -v "${data_volume}:/target" \
+  -v "$backup_file:/backup.tgz:ro" \
+  alpine sh -c 'set -eu; find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar -xzf /backup.tgz -C /target'
+# The data-init dependency normalizes restored ownership before web starts.
+docker compose up -d web
+```
+
+备份文件应放在仓库之外，并与 `secret.key` 一起妥善保存；没有这个密钥，数据库中的加密凭据无法恢复。
 
 Enter the answer API key once in Settings using the password-style Replace API
 Key field, then save the connection through the Web UI. The key is encrypted

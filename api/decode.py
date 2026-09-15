@@ -26,6 +26,7 @@ from api.vision_ocr import (
     is_vision_ocr_enabled,
     vision_ocr,
 )
+from api.live_process import StudyCancelled
 import requests
 
 try:
@@ -209,8 +210,10 @@ def _preprocess_image_for_ocr(image_bytes: bytes, enhance_mode: int = 0) -> byte
         output = io.BytesIO()
         img.save(output, format='PNG')
         return output.getvalue()
-    except Exception as exc:
-        logger.debug(f"图片预处理失败: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("图片预处理失败")
         return image_bytes
 
 
@@ -223,15 +226,17 @@ def _call_http_ocr(ocr_endpoint: str, image_bytes: bytes, img_url: str) -> str:
             logger.debug(f"HTTP OCR 服务返回异常状态码: {ocr_resp.status_code}")
             return ""
         data = ocr_resp.json()
-    except Exception as exc:
-        logger.debug(f"调用 HTTP OCR 服务失败: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("调用 HTTP OCR 服务失败")
         return ""
 
     # 尝试从常见字段中读取 LaTeX/文本结果
     for key in ("latex", "text", "result", "data"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
-            logger.debug(f"HTTP OCR 识别成功: {value[:100]}... 来自 {img_url}")
+            logger.debug("HTTP OCR 识别成功")
             return value.strip()
 
     return ""
@@ -279,11 +284,13 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
 
         resp = session.get(img_url, headers=extra_headers or None, timeout=8)
         if resp.status_code != 200:
-            logger.debug(f"下载题目图片失败: {img_url} -> {resp.status_code}")
+            logger.debug(f"下载题目图片失败: HTTP {resp.status_code}")
             return ""
         image_bytes = resp.content
-    except Exception as exc:
-        logger.debug(f"下载题目图片异常: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("下载题目图片异常")
         return ""
 
     # 1) 若配置了外部 AI 视觉 OCR，优先使用，跳过本地 OCR
@@ -291,12 +298,14 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
         try:
             vision_result = vision_ocr(image_bytes)
             if vision_result:
-                logger.debug(f"外部 AI 视觉 OCR 识别成功: {vision_result[:100]}... 来自 {img_url}")
+                logger.debug("外部 AI 视觉 OCR 识别成功")
                 return vision_result
             else:
-                logger.debug(f"外部 AI 视觉 OCR 未识别出文本 来自 {img_url}")
-        except Exception as exc:
-            logger.debug(f"外部 AI 视觉 OCR 调用失败: {exc}")
+                logger.debug("外部 AI 视觉 OCR 未识别出文本")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.debug("外部 AI 视觉 OCR 调用失败")
         # 外部 OCR 失败时，不回退到本地，直接尝试 HTTP OCR 或返回空
         ocr_endpoint = _http_ocr_endpoint()
         if ocr_endpoint:
@@ -370,6 +379,8 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
                             ocr_result = engine.ocr(tmp_path)
                         final_texts = _parse_ocr_result(ocr_result)
                         break
+                    except StudyCancelled:
+                        raise
                     except Exception as exc:
                         global _PADDLE_OCR_DEVICE
                         if device_attempt == 0 and _PADDLE_OCR_DEVICE == "gpu":
@@ -383,14 +394,16 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
                 
                 if final_texts:
                     logger.debug(
-                        f"PaddleOCR 提取文本成功 (预处理模式{preprocess_mode}): {' '.join(final_texts)} 来自 {img_url}"
+                        "PaddleOCR 提取文本成功 (预处理模式{}, 文本行数={})",
+                        preprocess_mode,
+                        len(final_texts),
                     )
                     break
                 else:
                     logger.debug(f"PaddleOCR 预处理模式{preprocess_mode}未识别出文本，尝试下一模式")
             
             if not final_texts:
-                logger.debug(f"PaddleOCR 所有预处理模式均未识别出文本 来自 {img_url}")
+                logger.debug("PaddleOCR 所有预处理模式均未识别出文本")
             
             if final_texts:
                 # 将多行结果合并为一行，交给大模型进一步理解
@@ -655,7 +668,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
         if "otherInfo" in card:
             logger.trace("Fixing other info...")
             card["otherInfo"] = card["otherInfo"].split("&")[0]
-            logger.trace(f"New info: {card['otherInfo']}")
+            logger.trace("任务元数据已修复")
 
         # 多维度判断是否为直播任务
         card_type = card.get("type", "").lower()
@@ -694,7 +707,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
                 job_list.append(work_job)
         else:
             logger.warning(f"Unknown card type: {card_type}")
-            logger.warning(card)
+            logger.warning("未知任务卡片类型，原始卡片已省略")
 
     return job_list
 

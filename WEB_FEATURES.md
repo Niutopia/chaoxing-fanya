@@ -188,7 +188,7 @@
 - ✅ **package.json** - Node.js依赖管理
 - ✅ **vite.config.js** - Vite配置
 - ✅ **tailwind.config.js** - TailwindCSS配置
-- ✅ **requirements.txt** - Python依赖（已添加flask-cors）
+- ✅ **requirements.txt** - 固定版本的 Python 生产依赖
 
 ### 12. 文档支持 📝
 

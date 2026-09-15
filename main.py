@@ -226,15 +226,21 @@ def run_with_task_context(
 
 
 def _run_worker_with_context(
-    config: Mapping[str, Any] | None,
+    worker_context: Mapping[str, Any] | None,
     target,
     *args,
     **kwargs,
 ):
-    """Run a worker under both task logging and task-local OCR context."""
+    """Run a worker under both task logging and task-local OCR context.
 
-    task_id = config.get("task_id") if config else None
-    ocr_config = config.get("ocr_config") if config else None
+    The wrapper's first argument deliberately is not named ``config``.  Job
+    workers pass their own ``config=...`` keyword through to ``target``; using
+    the same name here makes Python reject that valid call before the target
+    can run ("multiple values for argument 'config'").
+    """
+
+    task_id = worker_context.get("task_id") if worker_context else None
+    ocr_config = worker_context.get("ocr_config") if worker_context else None
 
     def invoke():
         with vision_ocr_context(ocr_config):
@@ -408,6 +414,9 @@ def init_chaoxing(
     tiku = tiku.get_tiku_from_config()  # 载入题库
     if isinstance(tiku, AI) and answer_semaphore is not None:
         tiku.set_request_semaphore(answer_semaphore)
+    set_cancel_event = getattr(tiku, "set_cancel_event", None)
+    if callable(set_cancel_event):
+        set_cancel_event(common_config.get("cancel_event"))
     tiku.init_tiku()  # 初始化题库
     
     # 获取查询延迟设置
@@ -432,7 +441,7 @@ def init_chaoxing(
         session = build_session(initial_cookies)
     task_values = {
         key: common_config[key]
-        for key in ("task_id", "ocr_config")
+        for key in ("task_id", "ocr_config", "cancel_event")
         if key in common_config
     }
     chaoxing = Chaoxing(
@@ -469,13 +478,18 @@ def process_job(
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
         # 超星的接口没有返回当前任务是否为Audio音频任务
         video_result = chaoxing.study_video(
-            course, job, job_info, _speed=speed, _type="Video", progress_callback=progress_callback
+            course, job, job_info, _speed=speed, _type="Video",
+            progress_callback=progress_callback,
+            cancel_event=config.get("cancel_event") if config else None,
         )
         raise_if_cancelled(config)
         if video_result.is_failure():
             logger.warning("当前任务非视频任务, 正在尝试音频任务解码")
             video_result = chaoxing.study_video(
-                course, job, job_info, _speed=speed, _type="Audio", progress_callback=progress_callback)
+                course, job, job_info, _speed=speed, _type="Audio",
+                progress_callback=progress_callback,
+                cancel_event=config.get("cancel_event") if config else None,
+            )
             raise_if_cancelled(config)
         if video_result.is_failure():
             logger.warning(
