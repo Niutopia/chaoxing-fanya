@@ -23,21 +23,21 @@ echo    ✅ Node.js 已安装
 echo [2/2] 构建前端...
 cd /d "%WEB_DIR%"
 
-if not exist "node_modules" (
-    echo    正在安装依赖...
-    call npm install
-    if errorlevel 1 (
-        echo    ❌ 依赖安装失败
-        pause
-        exit /b 1
-    )
+echo    按 package-lock.json 安装依赖...
+call npm ci
+if errorlevel 1 (
+    echo    ❌ npm ci 失败，停止构建
+    exit /b 1
 )
 
 echo    正在构建...
 call npm run build
 if errorlevel 1 (
-    echo    ❌ 构建失败
-    pause
+    echo    ❌ 构建失败，停止构建
+    exit /b 1
+)
+if not exist "dist\index.html" (
+    echo    ❌ 构建未生成 dist\index.html
     exit /b 1
 )
 

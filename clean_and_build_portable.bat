@@ -10,11 +10,12 @@ echo.
 set "SCRIPT_DIR=%~dp0"
 set "BUILD_DIR=%SCRIPT_DIR%portable_build"
 set "DIST_DIR=%SCRIPT_DIR%chaoxing_portable"
-set "PYTHON_VERSION=3.11.9"
+set "PYTHON_VERSION=3.13.7"
 set "PYTHON_EMBED_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-embed-amd64.zip"
+set "PIP_BOOTSTRAP_VERSION=26.2.1"
+set "PIP_BOOTSTRAP_URL=https://bootstrap.pypa.io/pip/zipapp/pip-%PIP_BOOTSTRAP_VERSION%.pyz"
 set "PYTHON_EMBED_LOCAL=%SCRIPT_DIR%python-embed.zip"
 set "HAS_ERRORS=0"
-set "SKIP_OCR=0"
 set "FRONTEND_OK=0"
 
 REM 检查是否有预置的 Python 嵌入包
@@ -87,7 +88,6 @@ if exist "%BUILD_DIR%" rd /s /q "%BUILD_DIR%" 2>nul
 REM 清理 web 临时文件
 echo    清理前端临时文件...
 if exist "%SCRIPT_DIR%web\.vite" rd /s /q "%SCRIPT_DIR%web\.vite" 2>nul
-if exist "%SCRIPT_DIR%web\node_modules\.cache" rd /s /q "%SCRIPT_DIR%web\node_modules\.cache" 2>nul
 
 REM 清理 pip 缓存相关
 echo    清理 pip 缓存...
@@ -147,84 +147,49 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 修改 python311._pth 以启用 pip
-set "PTH_FILE=%PYTHON_DIR%\python311._pth"
-if exist "%PTH_FILE%" (
-    echo python311.zip> "%PTH_FILE%"
-    echo .>> "%PTH_FILE%"
-    echo Lib>> "%PTH_FILE%"
-    echo Lib\site-packages>> "%PTH_FILE%"
-    echo import site>> "%PTH_FILE%"
+REM 验证嵌入包确实是 Python 3.13（不能接受 3.11 包冒充）
+set "PTH_FILE=%PYTHON_DIR%\python313._pth"
+if not exist "%PTH_FILE%" (
+    echo    ❌ 嵌入包缺少 python313._pth，拒绝继续（不能使用 Python 3.11 包）
+    exit /b 1
 )
+echo python313.zip> "%PTH_FILE%"
+echo .>> "%PTH_FILE%"
+echo Lib>> "%PTH_FILE%"
+echo Lib\site-packages>> "%PTH_FILE%"
+echo import site>> "%PTH_FILE%"
 echo    ✅ Python 解压完成
 echo.
 
 echo ========================================
-echo [5/8] 安装 pip 和依赖包...
+echo [5/8] 安装项目依赖...
 echo ========================================
 set "PYTHON_EXE=%PYTHON_DIR%\python.exe"
-set "GET_PIP=%BUILD_DIR%\get-pip.py"
+set "PIP_BOOTSTRAP=%BUILD_DIR%\pip.pyz"
 
-REM 检查是否有本地 get-pip.py
-set "GET_PIP_LOCAL=%SCRIPT_DIR%get-pip.py"
-if exist "%GET_PIP_LOCAL%" (
-    echo    使用本地 get-pip.py...
-    copy "%GET_PIP_LOCAL%" "%GET_PIP%" >nul
-) else (
-    echo    下载 get-pip.py...
-    powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile '%GET_PIP%'}" 2>nul
-    if errorlevel 1 (
-        echo    ❌ 下载 get-pip.py 失败
-        echo.
-        echo    解决方案: 手动下载 https://bootstrap.pypa.io/get-pip.py
-        echo              放置在本脚本同目录下，然后重新运行
-        pause
-        exit /b 1
-    )
+REM Download a version-pinned pip zipapp; the official embeddable runtime has no pip.
+powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PIP_BOOTSTRAP_URL%' -OutFile '%PIP_BOOTSTRAP%'}" 2>nul
+if errorlevel 1 (
+    echo    ❌ 固定版本 pip bootstrap 下载失败，停止打包
+    exit /b 1
+)
+if not exist "%PIP_BOOTSTRAP%" (
+    echo    ❌ 未生成固定版本 pip bootstrap，停止打包
+    exit /b 1
 )
 
-REM 安装 pip
-echo    安装 pip...
-"%PYTHON_EXE%" "%GET_PIP%" --no-warn-script-location
+REM requirements.txt contains the exact project dependency pins.
+echo    正在安装项目依赖，这可能需要几分钟...
+"%PYTHON_EXE%" "%PIP_BOOTSTRAP%" install --disable-pip-version-check --no-warn-script-location -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
-    echo    ❌ 安装 pip 失败
+    echo    ❌ 项目依赖安装失败，停止打包
     pause
     exit /b 1
 )
 
-REM 安装项目依赖
-echo    正在安装项目依赖，这可能需要几分钟...
-echo    (如果某些依赖安装失败，程序仍会尝试继续)
-"%PYTHON_EXE%" -m pip install --no-warn-script-location -r "%SCRIPT_DIR%requirements.txt"
-if errorlevel 1 (
-    echo    ⚠️  部分核心依赖安装失败
-    set "HAS_ERRORS=1"
-)
-
-REM 安装 OCR 依赖（完整版默认安装）
-echo    安装 OCR 依赖 paddlepaddle...
-"%PYTHON_EXE%" -m pip install --no-warn-script-location paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-if errorlevel 1 (
-    echo    ⚠️  paddlepaddle 安装失败，便携版将无法使用本地 OCR
-    echo    (程序仍可运行，但验证码需要手动输入或使用在线 OCR)
-    set "SKIP_OCR=1"
-) else (
-    echo    ✅ paddlepaddle 安装成功
-    echo    安装 OCR 依赖 paddlex...
-    "%PYTHON_EXE%" -m pip install --no-warn-script-location "paddlex[ocr-core]"
-    if errorlevel 1 (
-        echo    ⚠️  paddlex 安装失败
-        set "SKIP_OCR=1"
-    ) else (
-        echo    ✅ paddlex 安装成功
-    )
-)
-
-REM 清理 pip 缓存以减小体积
-echo    清理 pip 缓存...
-"%PYTHON_EXE%" -m pip cache purge 2>nul
-
 echo    ✅ 依赖安装完成
+echo    便携版不包含本地 OCR（PaddleOCR、paddlepaddle、paddlex）
+echo    验证码请手动输入或配置在线 OCR 服务
 echo.
 
 echo ========================================
@@ -232,62 +197,39 @@ echo [6/8] 构建前端...
 echo ========================================
 set "FRONTEND_OK=0"
 
-REM 检查是否已有构建好的前端
-if exist "%SCRIPT_DIR%web\dist\index.html" (
-    echo    检测到已构建的前端，直接复制...
-    xcopy /E /I /Y "%SCRIPT_DIR%web\dist" "%DIST_DIR%\web\dist" >nul
-    set "FRONTEND_OK=1"
-    echo    ✅ 前端复制完成
-    goto :frontend_done
-)
-
-REM 检查 Node.js 是否安装
+REM Every build refreshes dependencies from package-lock.json.
 where npm >nul 2>nul
 if errorlevel 1 (
-    echo    ⚠️  未检测到 Node.js/npm
-    echo.
-    echo    ┌─────────────────────────────────────────────────────────┐
-    echo    │ 前端构建需要 Node.js，您可以:                          │
-    echo    │ 1. 安装 Node.js: https://nodejs.org/                    │
-    echo    │ 2. 或者使用命令行模式（不需要前端）                     │
-    echo    │ 3. 或者从其他地方复制已构建的 web\dist 目录             │
-    echo    └─────────────────────────────────────────────────────────┘
-    echo.
-    echo    自动继续（便携版将只有命令行模式）...
-    goto :frontend_done
+    echo    ❌ 未找到 npm，无法按 package-lock.json 构建前端
+    exit /b 1
 )
 
 cd /d "%SCRIPT_DIR%web"
-
-REM 检查 node_modules
-if not exist "node_modules" (
-    echo    未找到 node_modules，正在安装依赖...
-    call npm install
-    if errorlevel 1 (
-        echo    ⚠️  npm install 失败
-        echo    便携版将只有命令行模式
-        cd /d "%SCRIPT_DIR%"
-        goto :frontend_done
-    )
+echo    按 package-lock.json 安装前端依赖...
+call npm ci
+if errorlevel 1 (
+    echo    ❌ npm ci 失败，停止打包
+    exit /b 1
 )
-
 echo    正在构建前端...
 call npm run build
 if errorlevel 1 (
-    echo    ⚠️  前端构建失败
-    echo    便携版将只有命令行模式
-) else (
-    echo    ✅ 前端构建完成
-    xcopy /E /I /Y "dist" "%DIST_DIR%\web\dist" >nul
-    set "FRONTEND_OK=1"
+    echo    ❌ 前端构建失败，停止打包
+    exit /b 1
 )
+if not exist "dist\index.html" (
+    echo    ❌ 前端构建未生成 dist\index.html
+    exit /b 1
+)
+xcopy /E /I /Y "dist" "%DIST_DIR%\web\dist" >nul
+if errorlevel 1 (
+    echo    ❌ 前端文件复制失败，停止打包
+    exit /b 1
+)
+set "FRONTEND_OK=1"
+echo    ✅ 前端构建完成
 
 cd /d "%SCRIPT_DIR%"
-
-:frontend_done
-if "%FRONTEND_OK%"=="0" (
-    echo    提示: 便携版将只支持命令行模式
-)
 echo.
 
 echo ========================================
@@ -316,20 +258,8 @@ REM 复制配置文件模板 (不复制实际配置)
 echo    复制配置模板...
 if exist "%SCRIPT_DIR%config.ini.example" copy "%SCRIPT_DIR%config.ini.example" "%DIST_DIR%\config.ini.example" >nul
 
-REM 复制 web_config.json (清空敏感信息)
-if exist "%SCRIPT_DIR%web_config.json" (
-    echo    处理 web_config.json...
-    copy "%SCRIPT_DIR%web_config.json" "%DIST_DIR%\web_config.json" >nul
-)
-
-REM 复制 PaddleOCR (如果存在，排除缓存)
-if exist "%SCRIPT_DIR%PaddleOCR" (
-    echo    正在复制 PaddleOCR (排除缓存)...
-    xcopy /E /I /Y "%SCRIPT_DIR%PaddleOCR" "%DIST_DIR%\PaddleOCR" >nul
-    REM 清理复制后的缓存
-    for /d /r "%DIST_DIR%\PaddleOCR" %%d in (__pycache__) do rd /s /q "%%d" 2>nul
-    del /s /q "%DIST_DIR%\PaddleOCR\*.pyc" 2>nul
-)
+REM 不复制真实 web_config.json；当前仓库没有无凭据示例，Web 设置在界面中配置
+echo    不会打包 web_config.json，Web 设置请在 Web 界面中配置
 
 REM 清理 python 目录中的 __pycache__
 echo    清理便携版中的 __pycache__...
@@ -354,7 +284,7 @@ echo setlocal enabledelayedexpansion
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -388,7 +318,7 @@ echo setlocal
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -411,7 +341,7 @@ echo setlocal
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -447,8 +377,8 @@ echo - **命令行启动.bat** - 纯命令行模式>> "%README_FILE%"
 echo.>> "%README_FILE%"
 echo ## 配置说明>> "%README_FILE%"
 echo.>> "%README_FILE%"
-echo - `config.ini` - 账号密码和学习参数>> "%README_FILE%"
-echo - `web_config.json` - Web 模式的题库等设置>> "%README_FILE%"
+echo - `config.ini` - 从 config.ini.example 复制后填写账号密码和学习参数>> "%README_FILE%"
+echo - Web 模式设置请在 Web 界面中配置（不会打包 web_config.json）>> "%README_FILE%"
 echo.>> "%README_FILE%"
 echo ## 功能说明>> "%README_FILE%"
 echo.>> "%README_FILE%"
@@ -457,16 +387,12 @@ if "%FRONTEND_OK%"=="1" (
 ) else (
     echo - [X] Web 前端界面（此版本仅支持命令行模式）>> "%README_FILE%"
 )
-if "%SKIP_OCR%"=="0" (
-    echo - [√] 验证码自动识别（本地 OCR）>> "%README_FILE%"
-) else (
-    echo - [X] 验证码自动识别（需手动输入或使用在线 OCR 服务）>> "%README_FILE%"
-)
+echo - [X] 本地 OCR（便携版不包含 PaddleOCR、paddlepaddle、paddlex；需手动输入或使用在线 OCR 服务）>> "%README_FILE%"
 echo.>> "%README_FILE%"
 echo ## 常见问题>> "%README_FILE%"
 echo.>> "%README_FILE%"
 echo ### 验证码无法自动识别>> "%README_FILE%"
-echo 此便携版可能未包含 OCR 依赖，您可以：>> "%README_FILE%"
+echo 此便携版不包含本地 OCR 依赖，您可以：>> "%README_FILE%"
 echo - 手动输入验证码>> "%README_FILE%"
 echo - 配置在线 OCR 服务（如百度 OCR）>> "%README_FILE%"
 echo.>> "%README_FILE%"
@@ -484,7 +410,6 @@ echo ├── python/          # 嵌入式 Python 运行时>> "%README_FILE%"
 echo ├── api/             # 后端 API 模块>> "%README_FILE%"
 echo ├── web/dist/        # 前端静态文件（如果有）>> "%README_FILE%"
 echo ├── resource/        # 资源文件>> "%README_FILE%"
-echo ├── PaddleOCR/       # OCR 模块（如果有）>> "%README_FILE%"
 echo ├── 启动.bat         # 主启动脚本>> "%README_FILE%"
 echo ├── Web启动.bat      # Web 模式启动>> "%README_FILE%"
 echo └── 命令行启动.bat   # 命令行模式启动>> "%README_FILE%"
@@ -505,11 +430,6 @@ if "%FRONTEND_OK%"=="1" (
 echo ║  [√] Web 前端: 已包含                                        ║
 ) else (
 echo ║  [X] Web 前端: 未包含 (仅命令行模式)                         ║
-)
-if "%SKIP_OCR%"=="0" (
-echo ║  [√] OCR 识别: 已包含                                        ║
-) else (
-echo ║  [X] OCR 识别: 未包含 (需手动输入验证码)                     ║
 )
 if "%HAS_ERRORS%"=="1" (
 echo ║  [!] 警告: 部分依赖安装失败，功能可能受限                    ║

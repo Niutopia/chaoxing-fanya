@@ -59,6 +59,8 @@ logs
 **/logs
 coverage.xml
 .coverage
+.coverage.*
+**/.coverage.*
 htmlcov
 build
 build/
