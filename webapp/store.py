@@ -1385,7 +1385,7 @@ class SQLiteStore:
                 (limit,),
             ).fetchall()
             rows = [*active_rows, *terminal_rows]
-            records: list[dict[str, Any]] = []
+            records: list[tuple[tuple[float, str], dict[str, Any]]] = []
             for row in rows:
                 raw_snapshot = _json_load(row["snapshot_json"], {})
                 raw_details = _json_load(row["details_json"], {})
@@ -1418,6 +1418,17 @@ class SQLiteStore:
                     if snapshot.get(field_name) != column_timestamp:
                         snapshot_dirty = True
                     snapshot[field_name] = column_timestamp
+                # Terminal error text is historical free-form content rather
+                # than ordinary progress metadata.  Apply the historical
+                # sanitizer before returning it, and keep the read-only
+                # loader's dirty marker so TaskManager can migrate the
+                # canonical value at its own write boundary.
+                error = snapshot.get("error")
+                if error is not None:
+                    cleaned_error = sanitize_log_message(error, historical=True)
+                    if cleaned_error != error:
+                        snapshot_dirty = True
+                    snapshot["error"] = cleaned_error
                 log_rows = connection.execute(
                     """
                     SELECT sequence, level, message, timestamp
@@ -1463,10 +1474,21 @@ class SQLiteStore:
                 }
                 if logs_dirty:
                     record["_logs_dirty"] = True
+                # SQLite returns log rows in ascending sequence order after
+                # the bounded query.  This private hint lets the manager use
+                # the ordered fast path while custom adapters are always
+                # treated as unordered and scanned within their own budget.
+                record["_logs_ordered"] = True
                 if snapshot_dirty or details_dirty:
                     record["_record_dirty"] = True
-                records.append(record)
-            return records
+                order_timestamp = _finite_timestamp(snapshot.get("finished_at"))
+                if order_timestamp is None:
+                    order_timestamp = _finite_timestamp(snapshot.get("started_at"))
+                if order_timestamp is None:
+                    order_timestamp = 0.0
+                records.append(((order_timestamp, str(task_id)), record))
+            records.sort(key=lambda item: item[0], reverse=True)
+            return [record for _, record in records]
 
     def prune_web_tasks(
         self,

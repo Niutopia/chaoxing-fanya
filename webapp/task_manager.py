@@ -11,6 +11,7 @@ public snapshot, details object, or log entry.
 from __future__ import annotations
 
 import copy
+import heapq
 import math
 import threading
 import time
@@ -51,6 +52,11 @@ from .models import (
 
 DEFAULT_LOG_CAPACITY = 5_000
 DEFAULT_TERMINAL_TASK_CAPACITY = 100
+# A custom persistence adapter can provide an iterable with no reliable end.
+# Keep its restore traversal explicitly finite.  SQLiteStore supplies an
+# ordered, already-bounded hint and uses the fast path below; untrusted custom
+# values are scanned by index/iterator only within this budget.
+_MAX_CUSTOM_LOG_SCAN = 10_000
 _RESTART_INTERRUPTION_ERROR = "服务重启导致任务中断，超星进度保留，可重新开始继续"
 _UNSET = object()
 
@@ -675,7 +681,7 @@ class TaskManager:
         )
 
     def _decode_logs(
-        self, value: Any
+        self, value: Any, *, ordered: bool = False
     ) -> tuple[deque[TaskLogEntry], int, bool]:
         """Restore persisted logs and mark rows rewritten for safety.
 
@@ -686,69 +692,115 @@ class TaskManager:
         dropping unrelated safe history.
         """
 
-        if isinstance(value, (list, tuple)):
-            # Persistence adapters are untrusted.  The durable loader emits
-            # logs in ascending sequence order, so selecting the tail before
-            # iterating both retains the newest capacity and bounds work for
-            # an arbitrarily large legacy list.  Slicing also bypasses a
-            # hostile list subclass's unbounded iterator in the normal path.
-            try:
-                value = value[-self.log_capacity :]
-            except BaseException:
-                value = []
-        else:
-            # Do not consume arbitrary generators/mappings supplied by a
-            # custom adapter.  They have no reliable notion of "latest" and
-            # may be infinite or raise during iteration; treating them as an
-            # empty history is the safe bounded fallback.
-            value = []
         by_sequence: dict[int, TaskLogEntry] = {}
+        sequence_heap: list[int] = []
         dirty = False
-        try:
-            iterator = iter(value)
-            for raw_entry in iterator:
-                if not isinstance(raw_entry, Mapping):
-                    continue
-                try:
-                    sequence = int(raw_entry.get("sequence"))
-                except BaseException:
-                    continue
-                if sequence < 1:
-                    continue
-                try:
-                    timestamp = _optional_timestamp(raw_entry.get("timestamp"))
-                    if timestamp is None:
-                        timestamp = time.time()
-                    level = raw_entry.get("level", "info")
-                    message = raw_entry.get("message", "")
-                    cleaned_message = sanitize_log_message(
-                        message,
-                        historical=True,
-                    )
-                    # Compare sanitized forms rather than calling ``str`` on
-                    # a dict-like/arbitrary old value: a hostile ``__str__``
-                    # must not abort startup or enter a persistence/API
-                    # response.
-                    current_message = sanitize_log_message(message)
-                    if cleaned_message != current_message:
-                        dirty = True
-                except BaseException:
-                    continue
-                by_sequence[sequence] = TaskLogEntry(
-                    sequence=sequence,
-                    level=sanitize_log_level(level),
-                    message=cleaned_message,
-                    timestamp=timestamp,
+        next_sequence = 0
+
+        def decode_one(raw_entry: Any) -> None:
+            nonlocal dirty, next_sequence
+            if not isinstance(raw_entry, Mapping):
+                return
+            try:
+                raw_sequence = raw_entry.get("sequence")
+                if isinstance(raw_sequence, bool):
+                    return
+                sequence = int(raw_sequence)
+            except BaseException:
+                return
+            if sequence < 1:
+                return
+            # Cursor advancement follows the highest legal sequence observed,
+            # even if another field on that entry is malformed.  Otherwise a
+            # later append could reuse a sequence that was visible at restore.
+            next_sequence = max(next_sequence, sequence)
+            try:
+                timestamp = _optional_timestamp(raw_entry.get("timestamp"))
+                if timestamp is None:
+                    timestamp = time.time()
+                level = raw_entry.get("level", "info")
+                message = raw_entry.get("message", "")
+                cleaned_message = sanitize_log_message(
+                    message,
+                    historical=True,
                 )
-        except BaseException:
-            # A custom list/tuple subclass can still raise while exposing its
-            # iterator.  Keep any bounded entries already decoded and ignore
-            # the broken suffix rather than failing manager startup.
-            pass
+                # Compare sanitized forms rather than calling ``str`` on a
+                # dict-like/arbitrary old value: a hostile ``__str__`` must
+                # not abort startup or enter a persistence/API response.
+                current_message = sanitize_log_message(message)
+                if cleaned_message != current_message:
+                    dirty = True
+            except BaseException:
+                return
+            entry = TaskLogEntry(
+                sequence=sequence,
+                level=sanitize_log_level(level),
+                message=cleaned_message,
+                timestamp=timestamp,
+            )
+            if sequence in by_sequence:
+                by_sequence[sequence] = entry
+                return
+            if len(by_sequence) < self.log_capacity:
+                by_sequence[sequence] = entry
+                heapq.heappush(sequence_heap, sequence)
+                return
+            if sequence <= sequence_heap[0]:
+                return
+            evicted = heapq.heapreplace(sequence_heap, sequence)
+            by_sequence.pop(evicted, None)
+            by_sequence[sequence] = entry
+
+        if ordered:
+            # SQLiteStore's query is ORDER BY sequence DESC with LIMIT, then
+            # reverses those rows for the public ascending log history.  A
+            # tail slice is therefore safe and avoids sorting a large durable
+            # history in Python.  The loader marks only this trusted path;
+            # custom adapters below are never assumed to be ordered.
+            try:
+                selected = value[-self.log_capacity :]
+            except BaseException:
+                selected = ()
+            try:
+                selected_length = min(len(selected), self.log_capacity)
+            except BaseException:
+                selected_length = 0
+            for index in range(selected_length):
+                try:
+                    decode_one(selected[index])
+                except BaseException:
+                    break
+        elif isinstance(value, (list, tuple)):
+            # Custom lists may be finite but unsorted.  Indexing avoids a
+            # hostile subclass's unbounded __iter__, while the explicit scan
+            # budget keeps CPU/memory bounded for oversized values.
+            try:
+                selected_length = min(len(value), _MAX_CUSTOM_LOG_SCAN)
+            except BaseException:
+                selected_length = 0
+            for index in range(selected_length):
+                try:
+                    decode_one(value[index])
+                except BaseException:
+                    break
+        else:
+            # Arbitrary custom iterables have no reliable notion of "latest".
+            # Consume at most the same finite budget and retain the highest
+            # legal sequences seen, rather than trusting order or traversing
+            # an infinite/malicious iterator.
+            try:
+                iterator = iter(value)
+            except BaseException:
+                iterator = iter(())
+            for _ in range(_MAX_CUSTOM_LOG_SCAN):
+                try:
+                    raw_entry = next(iterator)
+                except StopIteration:
+                    break
+                except BaseException:
+                    break
+                decode_one(raw_entry)
         ordered = sorted(by_sequence.values(), key=lambda item: item.sequence)
-        next_sequence = max(by_sequence, default=0)
-        if len(ordered) > self.log_capacity:
-            ordered = ordered[-self.log_capacity :]
         return deque(ordered, maxlen=self.log_capacity), next_sequence, dirty
 
     def _restore_logs(self, value: Any) -> tuple[deque[TaskLogEntry], int]:
@@ -808,7 +860,10 @@ class TaskManager:
         if interrupted:
             error = _RESTART_INTERRUPTION_ERROR
         elif error is not None:
-            error = sanitize_log_message(error, historical=True)
+            cleaned_error = sanitize_log_message(error, historical=True)
+            if cleaned_error != error:
+                record_dirty = True
+            error = cleaned_error
         started_at = _optional_timestamp(raw_snapshot.get("started_at"))
         finished_at = _optional_timestamp(raw_snapshot.get("finished_at"))
         if interrupted and finished_at is None:
@@ -839,7 +894,8 @@ class TaskManager:
             # terminal monitor view.
             details = replace(details, active_jobs={})
         logs, next_sequence, logs_dirty = self._decode_logs(
-            payload.get("logs", [])
+            payload.get("logs", []),
+            ordered=payload.get("_logs_ordered") is True,
         )
         # SQLiteStore sanitizes rows while keeping its loader pure-read.  Its
         # private marker tells this manager that the in-memory canonical value
@@ -1339,6 +1395,9 @@ class TaskManager:
 
     def list_tasks(self) -> list[TaskSnapshot]:
         with self._lock:
+            for record in self._tasks.values():
+                if record.record_dirty:
+                    self._persist_record_locked(record)
             records = sorted(
                 self._tasks.values(),
                 key=lambda item: (self._list_timestamp(item), item.snapshot.id),
