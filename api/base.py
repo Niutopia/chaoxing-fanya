@@ -103,20 +103,47 @@ def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
         if len(whole_matches) == 1:
             return whole_matches[0]
 
-    # Compact multi-choice labels are accepted only when every character is a
-    # valid single-letter label.  Exact multi-letter labels such as AA were
-    # handled above by label_from_token and therefore take precedence.
-    if multiple and not is_collection and re.fullmatch(r"[A-Za-z]{2,}", raw_text):
+    # Compact multi-choice labels are accepted only when the unseparated
+    # answer has exactly one segmentation under the current option labels.
+    # Exact multi-letter labels such as AA were handled above by
+    # label_from_token and therefore take precedence.
+    if (
+        multiple
+        and not is_collection
+        and len(raw_text) >= 2
+        and all(
+            ("A" <= char <= "Z") or ("a" <= char <= "z")
+            for char in raw_text
+        )
+    ):
         compact = raw_text.upper()
-        # Once an option list contains an Excel-style label such as AA, a
-        # compact string like AAB has more than one valid decomposition
-        # (AA+B or A+A+B).  Require explicit separators in that situation;
-        # exact AA was already handled by label_from_token above.
-        if any(len(label) > 1 for label in valid_labels):
-            return ""
-        single_labels = {label for label in valid_labels if len(label) == 1}
-        if all(label in single_labels for label in compact):
-            return ordered_unique(compact)
+        compact_labels = sorted(
+            (label for label in valid_labels if label),
+            key=lambda label: (-len(label), label),
+        )
+        # Dynamic programming keeps one path per suffix and caps the count at
+        # two.  We only need to distinguish zero, one, and ambiguous; keeping
+        # all exponential paths would add risk without adding information.
+        path_counts = [0] * (len(compact) + 1)
+        unique_paths: list[tuple[str, ...] | None] = [None] * (len(compact) + 1)
+        path_counts[-1] = 1
+        unique_paths[-1] = ()
+        for index in range(len(compact) - 1, -1, -1):
+            for label in compact_labels:
+                if not compact.startswith(label, index):
+                    continue
+                suffix_index = index + len(label)
+                suffix_count = path_counts[suffix_index]
+                if not suffix_count:
+                    continue
+                if path_counts[index] == 0:
+                    unique_paths[index] = (label,) + (unique_paths[suffix_index] or ())
+                path_counts[index] = min(2, path_counts[index] + suffix_count)
+                if path_counts[index] == 2:
+                    break
+        if path_counts[0] == 1:
+            return ordered_unique(unique_paths[0] or ())
+        return ""
 
     if not nonempty_parts:
         return ""

@@ -330,6 +330,13 @@ def test_compact_labels_are_rejected_when_multi_letter_labels_make_them_ambiguou
     assert _resolve_choice_answer("AA", options, multiple=True) == "AA"
 
 
+@pytest.mark.parametrize("result", ["AC", "ac"])
+def test_compact_labels_use_unique_segmentation_with_aa_option(result):
+    options = [f"item {index}" for index in range(27)]
+
+    assert _resolve_choice_answer(result, options, multiple=True) == "AC"
+
+
 @pytest.mark.parametrize("options", ["CAT, DOG\nB. other", "CAT: DOG\nB. other"])
 def test_uppercase_words_with_ambiguous_punctuation_stay_complete_text(options):
     entries = option_entries(options)
