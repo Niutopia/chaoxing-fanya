@@ -70,6 +70,21 @@ def raise_if_cancelled(config: Mapping[str, Any] | None) -> None:
         raise StudyCancelled()
 
 
+def _request_worker_stop(config: Mapping[str, Any] | None) -> None:
+    """Close a processor-local worker gate when a nested job fails."""
+
+    if not config:
+        return
+    callback = config.get("_worker_stop_callback")
+    if callable(callback):
+        callback()
+        return
+    stop_event = config.get("_worker_stop_event")
+    setter = getattr(stop_event, "set", None)
+    if callable(setter):
+        setter()
+
+
 def _notify_callback(
     config: Mapping[str, Any] | None,
     name: str,
@@ -89,6 +104,7 @@ def _notify_callback(
         "job_list_callback",
         "job_start_callback",
         "job_done_callback",
+        "video_progress_callback",
     }:
         stop_event = config.get("_worker_stop_event")
         is_set = getattr(stop_event, "is_set", None)
@@ -624,6 +640,7 @@ class JobProcessor:
             "job_list_callback",
             "job_start_callback",
             "job_done_callback",
+            "video_progress_callback",
         }
     )
 
@@ -640,15 +657,22 @@ class JobProcessor:
         self.threads: list[threading.Thread] = []
         self.retry_thread_handle: threading.Thread | None = None
         self.worker_num = config["jobs"]
-        self.config = config
+        # ``process_course`` reuses one common configuration for every
+        # selected course.  Processor lifetime state and callback guards must
+        # therefore live in a shallow, course-local copy; mutating the caller
+        # would leave the first course's stop event/wrappers attached to the
+        # next course.
+        self.config = dict(config)
         self.worker_errors: Queue[BaseException] = Queue()
         self._worker_error_event = threading.Event()
         self._worker_stop_event = threading.Event()
+        self._lifecycle_lock = threading.RLock()
         # Expose the processor lifetime to callback boundaries.  A daemon
         # worker may outlive a bounded cancellation join; callbacks from that
         # late worker must not mutate a task that the owning runner has
         # already finalized.
-        self.config.setdefault("_worker_stop_event", self._worker_stop_event)
+        self.config["_worker_stop_event"] = self._worker_stop_event
+        self.config["_worker_stop_callback"] = self._request_stop
         for name in self._WORKER_CALLBACK_NAMES:
             callback = self.config.get(name)
             if not callable(callback):
@@ -670,7 +694,45 @@ class JobProcessor:
             return
         self.worker_errors.put(error)
         self._worker_error_event.set()
-        self._worker_stop_event.set()
+        self._request_stop()
+
+    def _request_stop(self) -> None:
+        """Close the processor lifecycle gate before workers are drained."""
+
+        with self._lifecycle_lock:
+            self._worker_stop_event.set()
+
+    def _cancel_requested(self) -> bool:
+        cancel_event = self.config.get("cancel_event")
+        is_set = getattr(cancel_event, "is_set", None)
+        return callable(is_set) and is_set()
+
+    def _enqueue_retry(self, task: ChapterTask) -> bool:
+        """Queue a failed chapter only while this processor is active.
+
+        The lifecycle lock pairs the stop transition with the queue mutation.
+        If stop wins, the caller balances the original task-queue item;
+        otherwise ``_drain_pending_tasks`` can remove the admitted retry after
+        stop and balance it deterministically.
+        """
+
+        with self._lifecycle_lock:
+            if self._worker_stop_event.is_set() or self._cancel_requested():
+                return False
+            self.retry_queue.put(task)
+            return True
+
+    def _requeue_retry(self, task: ChapterTask) -> bool:
+        """Move one retry back to work atomically with the stop transition."""
+
+        with self._lifecycle_lock:
+            if self._worker_stop_event.is_set() or self._cancel_requested():
+                return False
+            self.task_queue.put(task)
+            # The retry item held the original task_queue unfinished count;
+            # the put above temporarily added a second count for the retry.
+            self.task_queue.task_done()
+            return True
 
     def _join_workers(self, timeout: float | None = None) -> bool:
         """Join workers up to one bounded deadline.
@@ -736,7 +798,7 @@ class JobProcessor:
         # Stop and join every worker before draining queued work.  This keeps
         # Queue accounting deterministic and prevents a daemon worker from
         # dying silently while the course is reported as complete.
-        self._worker_stop_event.set()
+        self._request_stop()
         self._join_workers()
         self._drain_pending_tasks()
 
@@ -748,25 +810,26 @@ class JobProcessor:
     def _drain_pending_tasks(self) -> None:
         """Mark queued tasks complete after cooperative cancellation."""
 
-        while True:
-            try:
-                self.task_queue.get_nowait()
-            except Empty:
-                break
-            else:
-                self.task_queue.task_done()
-
-        while True:
-            try:
-                self.retry_queue.get_nowait()
-            except Empty:
-                break
-            else:
-                # A retry item still owns the original task_queue unfinished
-                # count until it is moved back by retry_thread.
-                self.retry_queue.task_done()
-                if self.task_queue.unfinished_tasks:
+        with self._lifecycle_lock:
+            while True:
+                try:
+                    self.task_queue.get_nowait()
+                except Empty:
+                    break
+                else:
                     self.task_queue.task_done()
+
+            while True:
+                try:
+                    self.retry_queue.get_nowait()
+                except Empty:
+                    break
+                else:
+                    # A retry item still owns the original task_queue
+                    # unfinished count until it is moved back by retry_thread.
+                    self.retry_queue.task_done()
+                    if self.task_queue.unfinished_tasks:
+                        self.task_queue.task_done()
 
 
     def worker_thread(self):
@@ -833,7 +896,10 @@ class JobProcessor:
                             continue
 
                         # self.wait_queue.put(task)
-                        self.retry_queue.put(task)
+                        if not self._enqueue_retry(task):
+                            self.task_queue.task_done()
+                            task_finished = True
+                            return
 
                     case ChapterResult.ERROR:
                         task.tries += 1
@@ -848,7 +914,10 @@ class JobProcessor:
                             self.task_queue.task_done()
                             task_finished = True
                             continue
-                        self.retry_queue.put(task)
+                        if not self._enqueue_retry(task):
+                            self.task_queue.task_done()
+                            task_finished = True
+                            return
 
                     case _:
                         logger.error("章节任务状态无效（任务元数据已省略）")
@@ -885,8 +954,8 @@ class JobProcessor:
                 moved = False
                 try:
                     raise_if_cancelled(self.config)
-                    self.task_queue.put(task)
-                    self.task_queue.task_done() # task_done is not called when a task failed and needs to be retried, so if is reput into the queue, the task num will increase by one and become more than the real task number
+                    if not self._requeue_retry(task):
+                        return
                     moved = True
                 finally:
                     self.retry_queue.task_done()
@@ -1003,16 +1072,24 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
                     # provider/transport is blocked.  The next bounded poll
                     # observes cancellation and unwinds the chapter.
                     continue
+                except BaseException:
+                    # Close the processor-local callback gate before sibling
+                    # executor jobs can publish progress after this failure.
+                    _request_worker_stop(config)
+                    raise
     finally:
         cancel_event = config.get("cancel_event") if config else None
         is_cancelled = getattr(cancel_event, "is_set", None)
         cancellation_requested = callable(is_cancelled) and is_cancelled()
+        stop_event = config.get("_worker_stop_event") if config else None
+        stop_is_set = getattr(stop_event, "is_set", None)
+        worker_stop_requested = callable(stop_is_set) and stop_is_set()
         # A running Python thread cannot be killed safely.  On cancellation,
         # stop waiting for executor workers and cancel only work not yet
         # started; JobProcessor's stop event gates late callbacks/retries.
         executor.shutdown(
-            wait=not cancellation_requested,
-            cancel_futures=cancellation_requested,
+            wait=not (cancellation_requested or worker_stop_requested),
+            cancel_futures=cancellation_requested or worker_stop_requested,
         )
     
     for result in job_results:
