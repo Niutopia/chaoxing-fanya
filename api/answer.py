@@ -37,12 +37,17 @@ def _strip_json_block(md_str: str) -> str:
     return match.group(1).strip() if match else md_str.strip()
 
 
-def _ensure_answer_list(value) -> list[str]:
-    """确保返回答案列表，兼容字符串、列表等多种格式"""
+def _ensure_answer_list(value, preserve_empty: bool = False) -> list[str]:
+    """Ensure a provider value is a list, optionally retaining blank slots."""
     if value is None:
         return []
     if isinstance(value, (list, tuple, set)):
+        if preserve_empty:
+            return ["" if item is None else str(item).strip() for item in value]
         return [str(item).strip() for item in value if str(item).strip()]
+    if preserve_empty and isinstance(value, str):
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        return [part.strip() for part in normalized.split("\n")]
     text = str(value).strip()
     return [text] if text else []
 
@@ -406,11 +411,12 @@ class Tiku:
         answer = cache_dao.get_cache(q_info['title'])
         if answer:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
-            return answer.strip()
+            return answer if q_info.get('type') == 'completion' else answer.strip()
         else:
             answer = self._query(q_info)
             if answer:
-                answer = answer.strip()
+                if q_info.get('type') != 'completion':
+                    answer = answer.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
 
                 # 对 AI / 硅基流动等大模型题库更宽松：只要有非空答案就直接使用并写入缓存，
@@ -772,12 +778,12 @@ class TikuLike(Tiku):
             blanks = answer.get('blanks', None)
             if blanks is not None:
                 if isinstance(blanks, list) and blanks:
-                    # 过滤掉None和空字符串
-                    valid_blanks = [blank for blank in blanks if blank is not None and str(blank).strip()]
-                    if valid_blanks:
-                        return "\n".join(str(blank) for blank in valid_blanks)
-                    else:
-                        logger.error(f'{self.name}FILL_IN_BLANK类型题目没有有效的填空内容')
+                    # Blank positions are meaningful for completion answers;
+                    # retain middle and trailing empty slots for the form
+                    # mapper.  Choice answers keep their historical filtering.
+                    values = _ensure_answer_list(blanks, preserve_empty=True)
+                    if values:
+                        return "\n".join(values)
                 else:
                     logger.error(f'{self.name}FILL_IN_BLANK类型题目没有有效的填空内容')
             else:
@@ -1049,7 +1055,9 @@ class AI(Tiku):
             {"role": "user", "content": user_content}
         ]
 
-    def _invoke_completion(self, messages: list[dict]) -> Optional[str]:
+    def _invoke_completion(
+        self, messages: list[dict], *, preserve_empty: bool = False
+    ) -> Optional[str]:
         if not self._httpx_client:
             logger.error("AI题库 HTTP 客户端未初始化")
             return None
@@ -1098,7 +1106,8 @@ class AI(Tiku):
 
                 # 去掉 <think> 和 </think> 标记本身，但保留其中的内容，以便从中提取 Answer JSON
                 text_without_tags = re.sub(r"(?is)</?think>", "", raw_content)
-                base_text = (text_without_tags or "").strip()
+                plain_text = text_without_tags or ""
+                base_text = plain_text.strip()
                 if not base_text:
                     logger.warning("AI大模型返回内容为空（仅包含 <think> 标签或空白），将视为无答案处理")
                     return None
@@ -1124,7 +1133,10 @@ class AI(Tiku):
                     # 优先按JSON解析；若失败，再尝试将单引号风格的字典转换为JSON
                     try:
                         payload = json.loads(json_candidate_stripped)
-                        answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
+                        answers = _ensure_answer_list(
+                            payload.get('Answer') or payload.get('answer'),
+                            preserve_empty=preserve_empty,
+                        )
                     except json.JSONDecodeError:
                         payload = None
                         candidate_fixed = json_candidate_stripped
@@ -1136,14 +1148,23 @@ class AI(Tiku):
                             except Exception:
                                 payload = None
                         if payload is not None:
-                            answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
+                            answers = _ensure_answer_list(
+                                payload.get('Answer') or payload.get('answer'),
+                                preserve_empty=preserve_empty,
+                            )
                         else:
                             logger.warning("AI大模型返回内容不是标准JSON，将按纯文本处理")
-                            answers = _ensure_answer_list(base_text)
+                            answers = _ensure_answer_list(
+                                plain_text if preserve_empty else base_text,
+                                preserve_empty=preserve_empty,
+                            )
                 else:
                     # 没有可用的 JSON 片段，直接按纯文本处理
                     if base_text:
-                        answers = _ensure_answer_list(base_text)
+                        answers = _ensure_answer_list(
+                            plain_text if preserve_empty else base_text,
+                            preserve_empty=preserve_empty,
+                        )
                     else:
                         logger.warning("AI大模型返回内容为空，将视为无答案处理")
                         return None
@@ -1151,7 +1172,8 @@ class AI(Tiku):
                 if not answers:
                     logger.warning("AI大模型返回空答案，将视为无答案处理")
                     return None
-                return "\n".join(answers).strip()
+                rendered = "\n".join(answers)
+                return rendered if preserve_empty else rendered.strip()
             except StudyCancelled:
                 raise
             except Exception as exc:
@@ -1178,7 +1200,9 @@ class AI(Tiku):
 
     def _query(self, q_info: dict):
         messages = self._build_messages(q_info)
-        return self._invoke_completion(messages)
+        return self._invoke_completion(
+            messages, preserve_empty=q_info.get("type") == "completion"
+        )
 
     def _init_tiku(self):
         self.endpoint = self._conf['endpoint']
@@ -1272,10 +1296,15 @@ class SiliconFlow(Tiku):
                 result = response.json()
                 content = result['choices'][0]['message']['content']
                 parsed = json.loads(_strip_json_block(content))
-                answers = _ensure_answer_list(parsed.get('Answer') or parsed.get('answer'))
+                preserve_empty = q_type == "completion"
+                answers = _ensure_answer_list(
+                    parsed.get('Answer') or parsed.get('answer'),
+                    preserve_empty=preserve_empty,
+                )
                 if not answers:
                     raise ValueError("硅基流动返回答案为空")
-                return "\n".join(answers).strip()
+                rendered = "\n".join(answers)
+                return rendered if preserve_empty else rendered.strip()
             except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
                 last_error = exc
                 logger.warning(f"硅基流动API调用失败 ({attempt}/{self.max_retries}): {exc}")

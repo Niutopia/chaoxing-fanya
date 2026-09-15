@@ -823,9 +823,34 @@ def decode_questions_info(html_content: str, *, session=None) -> Dict[str, Any]:
     
     # 处理所有问题
     questions = []
-    for div_tag in soup.find("form").find_all("div", class_="singleQuesId"):
+    form_tag = soup.find("form")
+    if not form_tag:
+        form_data["questions"] = []
+        form_data["answerwqbid"] = ""
+        return form_data
+
+    for div_tag in form_tag.find_all("div", class_="singleQuesId"):
         question = _process_question(div_tag, font_decoder, session=session)
         if question:
+            if question.get("type") == "completion":
+                question_id = str(question.get("id", ""))
+                count_name = f"tiankongsize{question_id}"
+                raw_count = form_data.get(count_name)
+                try:
+                    expected_count = int(str(raw_count).strip())
+                    if expected_count < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    expected_count = None
+
+                if expected_count is None:
+                    indexed_count = _completion_indexed_field_count(
+                        question["answerField"], question_id
+                    )
+                    if indexed_count:
+                        expected_count = indexed_count
+                if expected_count is not None:
+                    question["expectedBlankCount"] = expected_count
             questions.append(question)
     
     # 更新表单数据
@@ -844,12 +869,33 @@ def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
         return form_data
     
     # 提取所有非答案字段的input
-    for input_tag in form_tag.find_all("input"):
+    for input_tag in form_tag.find_all(["input", "textarea"]):
         if "name" not in input_tag.attrs or "answer" in input_tag.attrs["name"]:
             continue
-        form_data[input_tag.attrs["name"]] = input_tag.attrs.get("value", "")
+        if input_tag.name == "textarea":
+            value_attr = input_tag.attrs.get("value")
+            value = value_attr if value_attr not in (None, "") else input_tag.get_text()
+        else:
+            value = input_tag.attrs.get("value", "")
+        form_data[input_tag.attrs["name"]] = value
     
     return form_data
+
+
+def _completion_indexed_field_count(answer_field: Dict[str, Any], question_id: str) -> int:
+    """Count explicit completion targets without looking at provider answers."""
+
+    answer_key = f"answer{question_id}"
+    one_based = set()
+    zero_based = set()
+    for key in answer_field:
+        if not isinstance(key, str):
+            continue
+        if re.fullmatch(rf"{re.escape(answer_key)}\d+", key):
+            one_based.add(key)
+        elif re.fullmatch(rf"{re.escape(answer_key)}_\d+", key):
+            zero_based.add(key)
+    return max(len(one_based), len(zero_based))
 
 
 def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, Any]:
@@ -885,24 +931,44 @@ def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, 
         )
     q_options = '\n'.join(q_options)
     
-    # 初始化答题字段：至少包含 answer{id} 和 answertype{id}
+    # Completion pages use several mutually exclusive field layouts.  Do not
+    # manufacture an aggregate field when the DOM exposes indexed targets;
+    # the aggregate fallback is added only when no actual answer field exists.
+    answer_key = f"answer{question_id}"
     answer_field: Dict[str, Any] = {
-        f"answer{question_id}": "",
         f"answertype{question_id}": q_type_code,
     }
+    if q_type != "completion":
+        answer_field[answer_key] = ""
 
-    # 兼容填空题等可能存在的多个 answer* 字段（例如 answer{id}_0 等）：
-    # 收集当前题目 div 下所有 name 中包含 "answer" 且与本题相关的 input 字段名，
-    # 以便后续按照原始字段名回填答案。
-    for input_tag in div_tag.find_all("input"):
+    # Collect only answer fields belonging to this question.  Scanning each
+    # question div (rather than the whole form) keeps q1/q11 independent while
+    # the full-name match below rejects unrelated ``answer...`` controls.
+    for input_tag in div_tag.find_all(["input", "textarea"]):
         name = input_tag.attrs.get("name", "")
         if not name or "answer" not in name:
             continue
-        # 仅保留与当前题目 ID 相关的字段，避免污染其他题目的字段
-        if question_id and question_id not in name:
+        is_aggregate = name == answer_key
+        is_one_based = bool(
+            re.fullmatch(rf"{re.escape(answer_key)}\d+", name)
+        )
+        is_zero_based = bool(
+            re.fullmatch(rf"{re.escape(answer_key)}_\d+", name)
+        )
+        if not (is_aggregate or is_one_based or is_zero_based):
             continue
-        if name not in answer_field:
-            answer_field[name] = input_tag.attrs.get("value", "")
+        if input_tag.name == "textarea":
+            value_attr = input_tag.attrs.get("value")
+            value = value_attr if value_attr not in (None, "") else input_tag.get_text()
+        else:
+            value = input_tag.attrs.get("value", "")
+        answer_field[name] = value
+
+    if q_type == "completion" and not any(
+        key != f"answertype{question_id}"
+        for key in answer_field
+    ):
+        answer_field[answer_key] = ""
 
     return {
         "id": question_id,

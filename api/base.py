@@ -42,6 +42,43 @@ from api.vision_ocr import (
 )
 
 
+class _CompletionMappingError(ValueError):
+    """Raised when a completion answer cannot fit the actual form fields."""
+
+
+def _completion_field_modes(answer_field: Mapping, question_id: str):
+    """Return aggregate, one-based, and underscore-indexed actual fields."""
+
+    answer_key = f"answer{question_id}"
+    aggregate = [answer_key] if answer_key in answer_field else []
+    one_based = []
+    zero_based = []
+    for key in answer_field:
+        if not isinstance(key, str):
+            continue
+        match = re.fullmatch(rf"{re.escape(answer_key)}(\d+)", key)
+        if match:
+            one_based.append((int(match.group(1)), key))
+            continue
+        match = re.fullmatch(rf"{re.escape(answer_key)}_(\d+)", key)
+        if match:
+            zero_based.append((int(match.group(1)), key))
+    one_based.sort(key=lambda item: item[0])
+    zero_based.sort(key=lambda item: item[0])
+    return aggregate, [key for _, key in one_based], [key for _, key in zero_based]
+
+
+def _completion_parts(result) -> list[str]:
+    """Normalize completion results while retaining all newline slots."""
+
+    if isinstance(result, (list, tuple)):
+        return ["" if item is None else str(item).strip() for item in result]
+    if isinstance(result, str):
+        normalized = result.replace("\r\n", "\n").replace("\r", "\n")
+        return normalized.split("\n") if "\n" in normalized else [result.strip()]
+    return [str(result).strip()]
+
+
 def _resolve_choice_answer(result, options, *, multiple: bool) -> str:
     """Map strict labels or complete option text to the form's labels.
 
@@ -919,10 +956,11 @@ class Chaoxing:
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0
+        has_partial_completion = False
         cancel_event = self.kwargs.get("cancel_event")
 
         def _handle_question(q, inc_found):
-            nonlocal found_answers
+            nonlocal found_answers, has_partial_completion
             _raise_if_cancelled(cancel_event)
             logger.debug(f"当前题目信息 -> {q}")
             # 添加搜题延迟 #428 - 默认0s延迟
@@ -946,51 +984,137 @@ class Chaoxing:
                 elif q["type"] == "judgement":
                     answer = "true" if self.tiku.judgement_select(res) else "false"
                 elif q["type"] == "completion":
-                    # 填空题 / 完成题：直接使用题库返回的文本；如果是列表则拼接，避免答案被清空
-                    if isinstance(res, (list, tuple)):
-                        # 保留空字符串的位置，避免后续 indexed 字段发生错位
-                        parts = [str(part).strip() for part in res]
-                        answer = "\n".join(parts)
-                    elif isinstance(res, str):
-                        parts = res.splitlines() if any(char in res for char in "\r\n") else [res]
-                        parts = [part.strip() for part in parts]
-                        answer = "\n".join(parts).strip()
-                    else:
-                        parts = [str(res).strip()]
-                        answer = str(res).strip()
+                    # Keep blank positions: indexed Chaoxing fields are
+                    # positional, and ``splitlines`` would discard a tail
+                    # blank.  Semicolons and slashes remain ordinary text.
+                    parts = _completion_parts(res)
+                    answer = "\n".join(parts)
                 else:
                     # 其他类型直接使用答案 （目前仅知有简答题，待补充处理）
                     answer = res
 
-                has_answer = bool(answer)
-                if q["type"] == "completion":
-                    # Newline-joined empty blanks ("\n") are not a covered
-                    # answer.  Keep their positions for indexed form fields,
-                    # but use the existing random/save path.
-                    has_answer = any(str(part).strip() for part in parts)
+            if q["type"] == "completion" and parts:
+                # Validate capacity even when every returned slot is empty;
+                # an oversized provider response must never reach POST.
+                _, one_based_fields, zero_based_fields = _completion_field_modes(
+                    q["answerField"], str(q["id"])
+                )
+                try:
+                    expected_count = int(q.get("expectedBlankCount"))
+                    if expected_count < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    expected_count = None
+                indexed_count = max(
+                    len(one_based_fields), len(zero_based_fields)
+                )
+                limits = [
+                    value
+                    for value in (expected_count, indexed_count or None)
+                    if value is not None
+                ]
+                if limits and len(parts) > min(limits):
+                    raise _CompletionMappingError(
+                        "completion answer count exceeds form capacity"
+                    )
 
-                if not has_answer:  # 检查 answer 是否为空
-                    logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                    answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
-                    q[f'answerSource{q["id"]}'] = "random"
+            has_answer = bool(answer)
+            if q["type"] == "completion":
+                has_answer = any(str(part).strip() for part in parts)
+
+            if not has_answer:  # 检查 answer 是否为空
+                logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
+                answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
+                q[f'answerSource{q["id"]}'] = "random"
+                if q["type"] == "completion":
+                    # Even an all-empty completion is an incomplete answer;
+                    # save its cleared positional fields rather than submit.
+                    has_partial_completion = True
+            else:
+                if q["type"] == "completion":
+                    answer_key = f'answer{q["id"]}'
+                    field_modes = _completion_field_modes(
+                        q["answerField"], str(q["id"])
+                    )
+                    aggregate_fields, one_based_fields, zero_based_fields = field_modes
+                    if not (
+                        aggregate_fields
+                        or one_based_fields
+                        or zero_based_fields
+                    ):
+                        # Legacy fallback for hand-built/older question
+                        # objects that expose no answer control at all.
+                        q["answerField"][answer_key] = ""
+                        aggregate_fields = [answer_key]
+
+                    try:
+                        expected_count = int(q.get("expectedBlankCount"))
+                        if expected_count < 0:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        expected_count = None
+
+                    indexed_count = max(
+                        len(one_based_fields), len(zero_based_fields)
+                    )
+                    limits = [
+                        value
+                        for value in (expected_count, indexed_count or None)
+                        if value is not None
+                    ]
+                    if limits and len(parts) > min(limits):
+                        raise _CompletionMappingError(
+                            "completion answer count exceeds form capacity"
+                        )
+
+                    required_count = max(limits) if limits else None
+                    if required_count is None:
+                        source = "cover"
+                    else:
+                        source = (
+                            "cover"
+                            if len(parts) == required_count
+                            and all(
+                                str(part).strip()
+                                for part in parts[:required_count]
+                            )
+                            else "partial"
+                        )
+                    q[f'answerSource{q["id"]}'] = source
+                    if source == "cover":
+                        inc_found()
+                    else:
+                        has_partial_completion = True
                 else:
                     logger.info(f"成功获取到答案：{answer}")
                     q[f'answerSource{q["id"]}'] = "cover"
                     inc_found()
-            # 填充答案
-            answer_key = f'answer{q["id"]}'
-            q["answerField"][answer_key] = answer
+
+            # Fill only actual completion modes.  The aggregate is written
+            # only when it was present (or the legacy fallback was required).
             if q["type"] == "completion":
-                indexed_fields = []
-                for key in q["answerField"]:
-                    match = re.fullmatch(rf"{re.escape(answer_key)}_(\d+)", str(key))
-                    if match:
-                        indexed_fields.append((int(match.group(1)), key))
-                indexed_fields.sort(key=lambda item: item[0])
-                for position, (_, key) in enumerate(indexed_fields):
-                    q["answerField"][key] = (
-                        parts[position] if position < len(parts) else ""
-                    )
+                answer_key = f'answer{q["id"]}'
+                aggregate_fields, one_based_fields, zero_based_fields = (
+                    _completion_field_modes(q["answerField"], str(q["id"]))
+                )
+                if not (
+                    aggregate_fields
+                    or one_based_fields
+                    or zero_based_fields
+                ):
+                    q["answerField"][answer_key] = ""
+                    aggregate_fields = [answer_key]
+                aggregate_value = "\n".join(parts)
+                for key in aggregate_fields:
+                    q["answerField"][key] = aggregate_value
+                for fields in (one_based_fields, zero_based_fields):
+                    for position, key in enumerate(fields):
+                        q["answerField"][key] = (
+                            parts[position] if position < len(parts) else ""
+                        )
+            else:
+                answer_key = f'answer{q["id"]}'
+                q["answerField"][answer_key] = answer
             logger.info(f'{q["title"]} 填写答案为 {answer}')
 
         # 若使用 AI 题库，则在同一张卷内并发搜题，避免单题串行阻塞
@@ -1047,15 +1171,30 @@ class Chaoxing:
                 # exceptions (including cooperative cancellation) are stored
                 # in the Future and the caller proceeds to calculate coverage
                 # and submit an incomplete answer sheet.
+                mapping_error = False
                 for future in futures:
-                    future.result()
+                    try:
+                        future.result()
+                    except _CompletionMappingError:
+                        mapping_error = True
+                if mapping_error:
+                    logger.warning(
+                        "填空题答案数量超过表单字段容量，已停止提交"
+                    )
+                    return StudyResult.ERROR
         else:
             def inc_found_seq():
                 nonlocal found_answers
                 found_answers += 1
 
             for q in questions["questions"]:
-                _handle_question(q, inc_found_seq)
+                try:
+                    _handle_question(q, inc_found_seq)
+                except _CompletionMappingError:
+                    logger.warning(
+                        "填空题答案数量超过表单字段容量，已停止提交"
+                    )
+                    return StudyResult.ERROR
         # A cancellation may arrive after the last question has completed but
         # before coverage/submit bookkeeping.  Do not continue into either
         # path once the task has been asked to stop.
@@ -1064,7 +1203,12 @@ class Chaoxing:
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
 
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
-        if self.tiku.get_submit_params() == "1":
+        if has_partial_completion:
+            # A partial completion answer must be saved so known positions are
+            # not discarded, even when rollback or coverage would otherwise
+            # select direct submission.
+            questions["pyFlag"] = "1"
+        elif self.tiku.get_submit_params() == "1":
             questions["pyFlag"] = "1"
         elif cover_rate >= self.tiku.COVER_RATE * 100 or self.rollback_times >= 1:
             questions["pyFlag"] = ""
@@ -1085,7 +1229,16 @@ class Chaoxing:
                     if not isinstance(key, str) or not key.startswith("answer"):
                         continue
                     if is_save:
-                        questions[key] = val if src == "cover" else ""
+                        # Save both covered and partial completion answers so
+                        # known positions survive a save; random answers stay
+                        # cleared as before.
+                        keep_completion = (
+                            q.get("type") == "completion"
+                            and src in {"cover", "partial"}
+                        )
+                        questions[key] = (
+                            val if src == "cover" or keep_completion else ""
+                        )
                     else:
                         questions[key] = val
 
