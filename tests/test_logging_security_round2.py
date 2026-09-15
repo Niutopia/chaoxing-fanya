@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import signal
 import time
 from types import SimpleNamespace
 
@@ -11,8 +12,10 @@ import pytest
 import main
 from api.logger import (
     HISTORICAL_SENSITIVE_LOG,
+    MAX_LOG_MESSAGE_LENGTH,
     _sanitize_record,
     logger,
+    sanitize_log_extra,
     sanitize_log_message,
 )
 from webapp.crypto import SecretBox
@@ -76,6 +79,75 @@ def test_sanitizer_long_punctuation_input_is_bounded():
 
     assert len(cleaned) <= 20_000
     assert elapsed < 1.0
+
+
+def test_secret_word_scan_does_not_backtrack_on_separator_runs():
+    value = "a_" * 24
+    timed_out = False
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def fail_fast(_signum, _frame):
+        raise TimeoutError("secret-word scan exceeded the bounded budget")
+
+    signal.signal(signal.SIGALRM, fail_fast)
+    signal.setitimer(signal.ITIMER_REAL, 0.75)
+    try:
+        cleaned = sanitize_log_message(value)
+    except TimeoutError:
+        timed_out = True
+        cleaned = None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    assert not timed_out
+    assert cleaned == value
+
+
+def test_sanitizer_is_idempotent_when_secret_matches_redaction_marker_text():
+    first = sanitize_log_message("a", secrets=("a",))
+
+    assert first == "[redacted]"
+    assert sanitize_log_message(first, secrets=("a",)) == first
+
+
+def test_sanitizer_collapses_repeated_secret_replacements_within_bound():
+    value = "a" * MAX_LOG_MESSAGE_LENGTH
+
+    cleaned = sanitize_log_message(value, secrets=("a",))
+
+    assert cleaned == "[redacted]"
+    assert len(cleaned) <= MAX_LOG_MESSAGE_LENGTH
+    assert sanitize_log_message(cleaned, secrets=("a",)) == cleaned
+
+
+def test_historical_unknown_progress_text_is_reduced_to_safe_marker():
+    assert (
+        sanitize_log_message("progress LIVESECRET", historical=True)
+        == HISTORICAL_SENSITIVE_LOG
+    )
+
+
+def test_historical_structured_progress_remains_readable():
+    assert sanitize_log_message("progress 42/100", historical=True) == "progress 42/100"
+
+
+def test_oversized_secret_is_not_dropped_from_message_or_extra():
+    secret = "push-key-prefix-" + ("x" * 5_010)
+    message = sanitize_log_message(
+        f"push_key: {secret}",
+        secrets=(secret,),
+    )
+    extra = sanitize_log_extra(
+        {"push_key": secret, "app_key": secret},
+        secrets=(secret,),
+    )
+
+    assert len(message) <= MAX_LOG_MESSAGE_LENGTH
+    assert secret not in message
+    assert secret[:32] not in message
+    assert extra == {"push_key": "[redacted]", "app_key": "[redacted]"}
+    assert sanitize_log_message(message, secrets=(secret,)) == message
 
 
 def test_record_extra_is_bounded_and_task_id_is_preserved():

@@ -42,6 +42,10 @@ _SENSITIVE_KEY_MARKERS = (
     "apikey",
     "authorization",
     "credential",
+    "push_key",
+    "pushkey",
+    "app_key",
+    "appkey",
 )
 
 _URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?)://[^\s<>\[\]{}\"']+")
@@ -93,10 +97,10 @@ _BEARER_PATTERN = re.compile(
 # matching unrelated progress prose.
 _SECRET_WORD_PATTERN = re.compile(
     r"(?i)(?<![\w])(?!(?:set[-_. ]?cookie)\b)(?:"
-    r"(?:[\w]+[-_.])+(?:secret|dtoken|jtoken|ktoken|token|cookie|bearer)"
-    r"[\w.-]*|"
-    r"(?:secret|dtoken|jtoken|ktoken|token|cookie|bearer)[-_.][\w.-]+|"
-    r"(?:api[_-]?key|access[-_]?token)[-_.][\w.-]+"
+    r"(?:[^\W_.-]+[-_.]){1,64}(?:secret|dtoken|jtoken|ktoken|token|cookie|bearer)"
+    r"[\w.-]*+|"
+    r"(?:secret|dtoken|jtoken|ktoken|token|cookie|bearer)[-_.][\w.-]*+|"
+    r"(?:api[_-]?key|access[-_]?token)[-_.][\w.-]*+"
     r")(?![\w])"
 )
 
@@ -120,18 +124,24 @@ _HISTORICAL_HEADER_PATTERN = re.compile(
 )
 _HISTORICAL_JSON_PATTERN = re.compile(r"(?s)^\s*[\[{].{0,16384}[\]}]\s*$")
 
-# Explicit allowlist for harmless legacy runtime labels.  Any old free-form
-# text outside this set is replaced as a whole by HISTORICAL_SENSITIVE_LOG.
+# Explicit allowlist for harmless legacy runtime labels.  Dynamic values must
+# be structured (and contain a digit); arbitrary prose after ``progress`` or
+# another operational prefix is replaced as a whole by the marker below.
 _HISTORICAL_SAFE_PATTERN = re.compile(
-    r"(?ix)^(?:"
+    r"(?x)^(?:"
     r"服务重启导致任务中断，超星进度保留，可重新开始继续|"
     r"(?:completed\s+)?checkpoint(?:[\s_-]+[a-z0-9_.:/-]+)*|"
     r"(?:first|second)-only|entry-[0-9]+|kept|ignored|"
     r"(?:progress|retry|attempt|queued|running|stopping|worker|task|job|"
-    r"chapter|course)(?:[\s_:#/().+%=-]+[a-z0-9_.:/-]+)*|"
+    r"chapter|course)(?:[\s_:#/().+%=-]+(?=[a-z0-9_.:/%+-]*\d)[a-z0-9_.:/%+-]+)*|"
     r"(?:任务进度|任务开始|任务完成|任务停止|任务失败|队列状态|工作线程状态)"
-    r"(?:[：: /_-]+[0-9a-z_.:/-]+)*"
+    r"(?:[：: /_-]+(?=[0-9a-z_.:/%+-]*\d)[0-9a-z_.:/%+-]+)*"
     r")$"
+)
+
+_TRUNCATION_MARKER = "[truncated]"
+_PROTECTED_MARKER_PATTERN = re.compile(
+    r"\[(?:redacted(?:-[a-z]+)*|truncated|unavailable(?:-[a-z]+)?)\]"
 )
 
 
@@ -146,7 +156,15 @@ def validate_task_id(value: Any) -> str:
 
 
 def _normalise_secrets(secrets: Iterable[Any] | None) -> tuple[str, ...]:
-    """Return non-empty, deterministic literal secrets within fixed bounds."""
+    """Return deterministic literal secrets within the message-size bound.
+
+    ``MAX_SECRET_LENGTH`` is the normal collector budget, but dropping a
+    caller-supplied value just because it is a little larger is unsafe: the
+    beginning of that value can then survive message truncation.  Keep a
+    bounded prefix for larger values (the whole value for any message-sized
+    secret) so matching remains resource bounded without silently disabling
+    redaction.
+    """
 
     if secrets is None:
         return ()
@@ -169,8 +187,11 @@ def _normalise_secrets(secrets: Iterable[Any] | None) -> tuple[str, ...]:
                 text = str(value)
             except BaseException:
                 continue
-            if text and len(text) <= MAX_SECRET_LENGTH:
-                values.append(text)
+            if not text:
+                continue
+            if len(text) > MAX_LOG_MESSAGE_LENGTH:
+                text = text[:MAX_LOG_MESSAGE_LENGTH]
+            values.append(text)
     except BaseException:
         # A caller-owned iterator is outside the logging trust boundary.  A
         # broken ``__next__`` must not turn a best-effort sanitizer into the
@@ -198,7 +219,8 @@ def _coerce_message(value: Any) -> str:
     else:
         return "[redacted-object]"
     if len(text) > MAX_LOG_MESSAGE_LENGTH:
-        return text[:MAX_LOG_MESSAGE_LENGTH] + "[truncated]"
+        limit = MAX_LOG_MESSAGE_LENGTH - len(_TRUNCATION_MARKER)
+        return text[:limit] + _TRUNCATION_MARKER
     return text
 
 
@@ -248,16 +270,35 @@ def _replace_known_secrets(text: str, secrets: tuple[str, ...]) -> str:
     if not matches:
         return text
 
-    output: list[str] = []
-    index = 0
-    while index < len(text):
-        length = matches.get(index)
-        if length:
-            output.append("[redacted]")
-            index += length
+    # Generated markers are already safe.  Keeping their spans immutable is
+    # what makes a second sanitizer pass stable even when a secret is a
+    # character contained in ``[redacted]`` (for example ``"a"``).
+    protected = [(match.start(), match.end()) for match in _PROTECTED_MARKER_PATTERN.finditer(text)]
+
+    redactions: list[tuple[int, int]] = []
+    protected_index = 0
+    for start, length in sorted(matches.items()):
+        end = start + length
+        while protected_index < len(protected) and protected[protected_index][1] <= start:
+            protected_index += 1
+        if protected_index < len(protected):
+            protected_start, protected_end = protected[protected_index]
+            if start < protected_end and end > protected_start:
+                continue
+        if redactions and start <= redactions[-1][1]:
+            redactions[-1] = (redactions[-1][0], max(redactions[-1][1], end))
         else:
-            output.append(text[index])
-            index += 1
+            redactions.append((start, end))
+
+    if not redactions:
+        return text
+    output: list[str] = []
+    cursor = 0
+    for start, end in redactions:
+        output.append(text[cursor:start])
+        output.append("[redacted]")
+        cursor = end
+    output.append(text[cursor:])
     return "".join(output)
 
 
@@ -289,6 +330,21 @@ def _replace_secret_assignments(text: str) -> str:
     ):
         text = pattern.sub(replace, text)
     return text
+
+
+def _bound_log_message(text: str) -> str:
+    """Keep sanitizer output bounded without cutting a generated marker."""
+
+    if len(text) <= MAX_LOG_MESSAGE_LENGTH:
+        return text
+    limit = MAX_LOG_MESSAGE_LENGTH - len(_TRUNCATION_MARKER)
+    prefix = text[:limit]
+    # A partial marker would be eligible for replacement on a later pass and
+    # would violate idempotence.  Discard that incomplete tail before adding
+    # the complete truncation marker.
+    if prefix.rfind("[") > prefix.rfind("]"):
+        prefix = prefix[: prefix.rfind("[")]
+    return prefix + _TRUNCATION_MARKER
 
 
 def _historical_has_sensitive_shape(text: str) -> bool:
@@ -341,7 +397,7 @@ def sanitize_log_message(
     text = _SECRET_WORD_PATTERN.sub("[redacted]", text)
     if historical and not _HISTORICAL_SAFE_PATTERN.fullmatch(text):
         return HISTORICAL_SENSITIVE_LOG
-    return text
+    return _bound_log_message(text)
 
 
 def sanitize_log_level(value: Any) -> str:
