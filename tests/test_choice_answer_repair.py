@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 import api.base as base
-from api.answer import AI, CacheDAO, SiliconFlow
+from api.answer import AI, CacheDAO, SiliconFlow, Tiku
 from api.base import Account, Chaoxing, StudyResult, _resolve_choice_answer
 from api.live_process import StudyCancelled
 
@@ -34,6 +36,21 @@ class _MemoryCache:
             self.values.pop(question, None)
         else:
             self.values[question] = answer
+
+
+class _StrictJudgementTiku(Tiku):
+    """A non-AI provider whose judgement vocabulary is intentionally narrow."""
+
+    def __init__(self, result):
+        super().__init__()
+        self.name = "strict synthetic provider"
+        self.true_list = ["正确"]
+        self.false_list = ["错误"]
+        self.result = result
+        self._cache = _MemoryCache()
+
+    def _query(self, _question):
+        return self.result
 
 
 class _ChoiceClient:
@@ -83,6 +100,35 @@ class _SiliconChoiceSession:
                 "choices": [{"message": {"content": content}}]
             },
         )
+
+
+class _SiliconPlainResponse:
+    """HTTP 200 response whose body is not JSON, as requests can return."""
+
+    status_code = 200
+
+    def __init__(self, text):
+        self.text = text
+
+    def json(self):
+        raise ValueError("synthetic invalid JSON")
+
+
+class _SiliconMixedResponseSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, endpoint, *, headers, json, timeout):
+        self.calls.append(
+            {
+                "endpoint": endpoint,
+                "headers": dict(headers),
+                "json": json,
+                "timeout": timeout,
+            }
+        )
+        return self.responses.pop(0)
 
 
 class _WorkSession:
@@ -439,6 +485,165 @@ def test_siliconflow_natural_language_label_is_mapped_without_format_retry(
     assert len(client.calls) == 1
     assert question["answerSourceq1"] == "cover"
     assert session.posts[0]["answerq1"] == "B"
+
+
+def test_siliconflow_http_200_plain_text_body_maps_without_transport_retry(
+    monkeypatch,
+):
+    client = _SiliconMixedResponseSession([_SiliconPlainResponse("答案是 B。")])
+    provider = _silicon_provider(client, max_retries=5)
+    question = _choice_question()
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 1
+    assert question["answerSourceq1"] == "cover"
+    assert session.posts[0]["answerq1"] == "B"
+
+
+def test_siliconflow_http_200_malformed_text_gets_at_most_one_repair(
+    monkeypatch,
+):
+    repaired = SimpleNamespace(
+        status_code=200,
+        json=lambda: {"choices": [{"message": {"content": '{"Answer": ["B"]}'}}]},
+    )
+    client = _SiliconMixedResponseSession(
+        [_SiliconPlainResponse("not one of the options"), repaired]
+    )
+    provider = _silicon_provider(client, max_retries=5)
+    question = _choice_question()
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert len(client.calls) == 2
+    assert question["answerSourceq1"] == "cover"
+    assert session.posts[0]["answerq1"] == "B"
+    assert "选择题答案格式修复" in client.calls[1]["json"]["messages"][0]["content"]
+
+
+def test_non_ai_true_response_stays_unknown_and_save_only(monkeypatch):
+    question = _choice_question()
+    question.update(
+        {
+            "title": "synthetic strict judgement response",
+            "options": "",
+            "type": "judgement",
+        }
+    )
+    question["answerField"]["answertypeq1"] = "1"
+    provider = _StrictJudgementTiku("true")
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert question["answerSourceq1"] == "uncovered"
+    assert session.posts[0]["pyFlag"] == "1"
+    assert session.posts[0]["answerq1"] == ""
+    assert question["title"] not in provider._cache.values
+
+
+def test_non_ai_true_cache_hit_stays_unknown_and_save_only(monkeypatch):
+    question = _choice_question()
+    question.update(
+        {
+            "title": "synthetic strict judgement cache",
+            "options": "",
+            "type": "judgement",
+        }
+    )
+    question["answerField"]["answertypeq1"] = "1"
+    provider = _StrictJudgementTiku("正确")
+    provider._cache.values[question["title"]] = "true"
+
+    outcome, session = _run_ai_work(monkeypatch, provider, question)
+
+    assert outcome is StudyResult.SUCCESS
+    assert question["answerSourceq1"] == "uncovered"
+    assert session.posts[0]["pyFlag"] == "1"
+    assert session.posts[0]["answerq1"] == ""
+    assert provider._cache.values[question["title"]] == "true"
+
+
+def test_siliconflow_timeout_retries_and_releases_request_slot():
+    class _TimeoutSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            raise requests.Timeout("synthetic timeout")
+
+    client = _TimeoutSession()
+    provider = _silicon_provider(client, max_retries=2)
+    provider.retry_delay = 0
+
+    assert provider._query(_choice_question()) is None
+    assert client.calls == 2
+    assert provider._request_semaphore.acquire(timeout=0.1)
+    provider._request_semaphore.release()
+
+
+def test_siliconflow_request_interval_waits_before_next_request(monkeypatch):
+    client = _SiliconChoiceSession(['{"Answer": ["B"]}'])
+    provider = _silicon_provider(client, max_retries=1)
+    provider.min_interval = 10
+    provider.last_request_time = time.time()
+    waited = []
+    monkeypatch.setattr(provider, "_wait_or_cancel", lambda seconds: waited.append(seconds))
+
+    assert provider._query(_choice_question()) == "B"
+    assert len(waited) == 1
+    assert 0 < waited[0] <= 10
+
+
+def test_siliconflow_cancellation_after_response_releases_request_slot():
+    cancel_event = threading.Event()
+
+    class _CancelAfterResponseSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            cancel_event.set()
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"choices": [{"message": {"content": '{"Answer": ["B"]}'}}]},
+            )
+
+    client = _CancelAfterResponseSession()
+    provider = _silicon_provider(client, cancel_event=cancel_event, max_retries=1)
+
+    with pytest.raises(StudyCancelled):
+        provider._query(_choice_question())
+
+    assert client.calls == 1
+    assert provider._request_semaphore.acquire(timeout=0.1)
+    provider._request_semaphore.release()
+
+
+def test_siliconflow_cancellation_while_waiting_for_request_slot_skips_post():
+    cancel_event = threading.Event()
+
+    class _CancellingSemaphore:
+        def acquire(self, *, timeout):
+            cancel_event.set()
+            return False
+
+    class _UnexpectedSession:
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("cancelled request must not reach transport")
+
+    provider = _silicon_provider(
+        _UnexpectedSession(), cancel_event=cancel_event, max_retries=1
+    )
+    provider._request_semaphore = _CancellingSemaphore()
+
+    with pytest.raises(StudyCancelled):
+        provider._query(_choice_question())
 
 
 def test_ai_repair_makes_one_request_even_when_max_retries_is_zero(monkeypatch):

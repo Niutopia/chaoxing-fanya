@@ -555,11 +555,15 @@ class Tiku:
             return None
         # AI/SiliconFlow canonical cache entries are always lower-case
         # ``true``/``false`` and must remain usable even when a caller's
-        # configured synonym lists omit those internal labels.
-        if answer.casefold() == "true":
-            return True
-        if answer.casefold() == "false":
-            return False
+        # configured synonym lists omit those internal labels.  Other Tiku
+        # implementations must continue to honor only their configured
+        # vocabularies; an old ``true``/``false`` cache entry is not evidence
+        # that their answer can be submitted.
+        if isinstance(self, (AI, SiliconFlow)):
+            if answer.casefold() == "true":
+                return True
+            if answer.casefold() == "false":
+                return False
         if answer in self.true_list:
             return True
         elif answer in self.false_list:
