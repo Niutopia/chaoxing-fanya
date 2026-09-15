@@ -75,6 +75,12 @@ function requestMessage(error, fallback) {
   return typeof message === 'string' && message.trim() ? message : fallback
 }
 
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
+}
+
 function accountField(account, snakeCase, camelCase = snakeCase) {
   return account?.[snakeCase] ?? account?.[camelCase]
 }
@@ -114,7 +120,7 @@ function mergedAccount(previous, next) {
   return { ...previous, ...safeNext }
 }
 
-function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
+function AccountActionsMenu({ account, open, pending = false, onToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
   const triggerRef = useRef(null)
   const itemRefs = useRef([])
@@ -203,6 +209,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   }
 
   const runAction = (action, { restoreFocus = false } = {}) => {
+    if (pending) return
     closeMenu(restoreFocus)
     action()
   }
@@ -223,6 +230,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
         aria-label={`${account.name}的更多操作`}
         aria-haspopup="menu"
         aria-expanded={open}
+        disabled={pending}
         onClick={onToggle}
       >
         <MoreHorizontal aria-hidden="true" size={17} strokeWidth={1.8} />
@@ -242,6 +250,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
               type="button"
               role="menuitem"
               tabIndex={-1}
+              disabled={pending}
               className={cn(
                 'touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
                 item.danger ? 'text-danger hover:bg-danger/[0.06] focus-visible:ring-danger' : 'text-label-primary',
@@ -258,7 +267,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   )
 }
 
-function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
+function AccountRow({ account, task, actionError, menuOpen, pending, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
   const state = enabled ? task?.state ?? 'idle' : 'disabled'
   const label = enabled ? taskStateLabel(state) : '已停用'
@@ -353,6 +362,7 @@ function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit
           <AccountActionsMenu
             account={account}
             open={menuOpen}
+            pending={pending}
             onToggle={onMenuToggle}
             onEdit={onEdit}
             onVerify={onVerify}
@@ -378,6 +388,12 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
         <Dialog.Content
           className="fixed left-1/2 top-1/2 z-50 w-[min(420px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-separator bg-surface p-5 text-label-primary outline-none"
           aria-describedby="delete-account-description"
+          onEscapeKeyDown={(event) => {
+            if (pending) event.preventDefault()
+          }}
+          onPointerDownOutside={(event) => {
+            if (pending) event.preventDefault()
+          }}
         >
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
@@ -394,6 +410,7 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
                 type="button"
                 className="touch-target touch-target-compact inline-flex size-8 shrink-0 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                 aria-label="关闭删除确认对话框"
+                disabled={pending}
               >
                 <X aria-hidden="true" size={17} strokeWidth={1.8} />
               </button>
@@ -408,11 +425,11 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
 
           <div className="mt-5 flex justify-end gap-2 border-t border-separator pt-4">
             <Dialog.Close asChild>
-              <Button type="button" variant="ghost">
+              <Button type="button" variant="ghost" disabled={pending}>
                 取消
               </Button>
             </Dialog.Close>
-            <Button type="button" variant="destructive" loading={pending} onClick={onConfirm}>
+            <Button type="button" variant="destructive" disabled={pending} loading={pending} onClick={onConfirm}>
               确认删除
             </Button>
           </div>
@@ -442,10 +459,18 @@ function OverviewPage({
   const [confirmAccount, setConfirmAccount] = useState(null)
   const [confirmPending, setConfirmPending] = useState(false)
   const [confirmError, setConfirmError] = useState('')
-  const [pendingAccountId, setPendingAccountId] = useState(null)
+  const [pendingAccountIds, setPendingAccountIds] = useState({})
+  const [pendingAccountActions, setPendingAccountActions] = useState({})
   const [actionMessage, setActionMessage] = useState('')
   const [actionErrors, setActionErrors] = useState({})
   const requestIdRef = useRef(0)
+  const loadControllerRef = useRef(null)
+  const pendingAccountIdsRef = useRef(new Set())
+  const mountedRef = useRef(false)
+  const accountOperationRef = useRef(new Map())
+  const accountGenerationRef = useRef(new Map())
+  const deleteOperationRef = useRef(null)
+  const deleteGenerationRef = useRef(0)
   const controlledData = suppliedAccounts !== undefined
     || suppliedTasks !== undefined
     || suppliedLoading !== undefined
@@ -461,28 +486,51 @@ function OverviewPage({
   const visibleError = suppliedError !== undefined ? String(suppliedError || '') : error
 
   const loadData = useCallback(async () => {
+    loadControllerRef.current?.abort()
+    const controller = new AbortController()
+    loadControllerRef.current = controller
     const requestId = ++requestIdRef.current
     setLoading(true)
     setError('')
     try {
-      const [accountResult, taskResult] = await Promise.all([listAccounts(), listTasks()])
-      if (requestId !== requestIdRef.current) return
+      const [accountResult, taskResult] = await Promise.all([
+        listAccounts({ signal: controller.signal }),
+        listTasks({ signal: controller.signal }),
+      ])
+      if (!mountedRef.current || controller.signal.aborted || requestId !== requestIdRef.current) return
       setAccounts(asArray(accountResult, 'accounts').map(publicAccount).filter((account) => account?.id))
       setTasks(asArray(taskResult, 'tasks'))
     } catch (requestError) {
-      if (requestId !== requestIdRef.current) return
+      if (!mountedRef.current || requestId !== requestIdRef.current || isAborted(requestError, controller.signal)) return
       setError(requestMessage(requestError, '账户概览加载失败，请重试'))
     } finally {
-      if (requestId === requestIdRef.current) setLoading(false)
+      if (loadControllerRef.current === controller) loadControllerRef.current = null
+      if (mountedRef.current && !controller.signal.aborted && requestId === requestIdRef.current) setLoading(false)
     }
   }, [])
 
   const refreshData = typeof onRefresh === 'function' ? onRefresh : loadData
 
   useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      requestIdRef.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
+      accountOperationRef.current.forEach((operation) => operation.controller.abort())
+      accountOperationRef.current.clear()
+      deleteOperationRef.current?.controller.abort()
+      deleteOperationRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
     if (!controlledData) loadData()
     return () => {
       requestIdRef.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
     }
   }, [controlledData, loadData])
 
@@ -526,18 +574,73 @@ function OverviewPage({
     })
   }
 
+  const beginAccountAction = (accountId, accountName, action) => {
+    const key = String(accountId)
+    if (!mountedRef.current || pendingAccountIdsRef.current.has(key)) return null
+    const generation = (accountGenerationRef.current.get(key) ?? 0) + 1
+    const operation = {
+      accountId,
+      controller: new AbortController(),
+      generation,
+      key,
+    }
+    accountGenerationRef.current.set(key, generation)
+    accountOperationRef.current.set(key, operation)
+    pendingAccountIdsRef.current.add(key)
+    setPendingAccountIds((current) => ({ ...current, [key]: true }))
+    setPendingAccountActions((current) => ({
+      ...current,
+      [key]: { accountName: String(accountName ?? '未命名账户'), action },
+    }))
+    return operation
+  }
+
+  const isMountedCurrentAccountAction = (operation) => (
+    Boolean(operation)
+    && mountedRef.current
+    && accountOperationRef.current.get(operation.key) === operation
+    && accountGenerationRef.current.get(operation.key) === operation.generation
+  )
+
+  const isCurrentAccountAction = (operation) => (
+    isMountedCurrentAccountAction(operation)
+    && !operation.controller.signal.aborted
+  )
+
+  const endAccountAction = (operation) => {
+    if (!isMountedCurrentAccountAction(operation)) return
+    const { key } = operation
+    accountOperationRef.current.delete(key)
+    pendingAccountIdsRef.current.delete(key)
+    setPendingAccountIds((current) => {
+      if (!current[key]) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+    setPendingAccountActions((current) => {
+      if (!current[key]) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+  }
+
   const handleVerify = async (account) => {
+    const operation = beginAccountAction(account.id, account.name, '验证')
+    if (!operation) return
     setMenuAccountId(null)
-    setPendingAccountId(account.id)
     setActionMessage('')
     setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     try {
-      const verified = await verifyAccount(account.id)
+      const verified = await verifyAccount(account.id, { signal: operation.controller.signal })
+      if (!isCurrentAccountAction(operation)) return
       const safeVerified = publicAccount(verified)
       if (safeVerified?.verification_status !== 'valid') {
         throw new Error('账户验证失败，请重试')
       }
       setAccounts((current) => {
+        if (!isCurrentAccountAction(operation)) return current
         const targetId = safeVerified.id ?? account.id
         const next = current.map((item) => (
           String(item.id) === String(targetId) ? mergedAccount(item, safeVerified) : item
@@ -545,27 +648,32 @@ function OverviewPage({
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentAccountAction(operation)) return
       setActionMessage('账户验证成功')
       setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
+      if (!isCurrentAccountAction(operation) || isAborted(requestError, operation.controller.signal)) return
       setActionErrors((current) => ({
         ...current,
         [String(account.id)]: requestMessage(requestError, '账户验证失败，请重试'),
       }))
     } finally {
-      setPendingAccountId(null)
+      endAccountAction(operation)
     }
   }
 
   const handleToggleEnabled = async (account) => {
+    const nextEnabled = accountField(account, 'enabled') === false
+    const operation = beginAccountAction(account.id, account.name, nextEnabled ? '启用' : '停用')
+    if (!operation) return
     setMenuAccountId(null)
-    setPendingAccountId(account.id)
     setActionMessage('')
     setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
-    const nextEnabled = accountField(account, 'enabled') === false
     try {
-      const updated = await setAccountEnabled(account.id, nextEnabled)
+      const updated = await setAccountEnabled(account.id, nextEnabled, { signal: operation.controller.signal })
+      if (!isCurrentAccountAction(operation)) return
       setAccounts((current) => {
+        if (!isCurrentAccountAction(operation)) return current
         const next = current.map((item) => (
           String(item.id) === String(account.id)
             ? mergedAccount(item, updated || { enabled: nextEnabled })
@@ -574,15 +682,17 @@ function OverviewPage({
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentAccountAction(operation)) return
       setActionMessage(nextEnabled ? '账户已启用' : '账户已停用')
       setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
+      if (!isCurrentAccountAction(operation) || isAborted(requestError, operation.controller.signal)) return
       setActionErrors((current) => ({
         ...current,
         [String(account.id)]: requestMessage(requestError, '账户状态更新失败，请重试'),
       }))
     } finally {
-      setPendingAccountId(null)
+      endAccountAction(operation)
     }
   }
 
@@ -600,24 +710,38 @@ function OverviewPage({
   }
 
   const handleDelete = async () => {
-    if (!confirmAccount || confirmPending) return
+    const account = confirmAccount
+    if (!account || deleteOperationRef.current || !mountedRef.current) return
+    const operation = {
+      accountId: account.id,
+      controller: new AbortController(),
+      generation: deleteGenerationRef.current + 1,
+    }
+    deleteGenerationRef.current = operation.generation
+    deleteOperationRef.current = operation
     setConfirmPending(true)
     setConfirmError('')
     try {
-      await deleteAccount(confirmAccount.id)
+      await deleteAccount(account.id, { signal: operation.controller.signal })
+      if (!isCurrentDeleteOperation(operation)) return
       setAccounts((current) => {
-        const next = current.filter((item) => String(item.id) !== String(confirmAccount.id))
+        if (!isCurrentDeleteOperation(operation)) return current
+        const next = current.filter((item) => String(item.id) !== String(account.id))
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentDeleteOperation(operation)) return
       setTasks((current) => {
-        const next = current.filter((item) => String(accountIdOf(item)) !== String(confirmAccount.id))
+        if (!isCurrentDeleteOperation(operation)) return current
+        const next = current.filter((item) => String(accountIdOf(item)) !== String(account.id))
         onTasksChange?.(next)
         return next
       })
+      if (!isCurrentDeleteOperation(operation)) return
       setConfirmAccount(null)
       setActionMessage('账户已删除')
     } catch (requestError) {
+      if (!isCurrentDeleteOperation(operation) || isAborted(requestError, operation.controller.signal)) return
       const code = requestError?.code
       if (code === 'account_active') {
         setConfirmError('请先停止该账户的任务')
@@ -625,8 +749,26 @@ function OverviewPage({
         setConfirmError(requestMessage(requestError, '删除账户失败，请重试'))
       }
     } finally {
-      setConfirmPending(false)
+      endDeleteOperation(operation)
     }
+  }
+
+  const isMountedCurrentDeleteOperation = (operation) => (
+    Boolean(operation)
+    && mountedRef.current
+    && deleteOperationRef.current === operation
+    && deleteGenerationRef.current === operation.generation
+  )
+
+  const isCurrentDeleteOperation = (operation) => (
+    isMountedCurrentDeleteOperation(operation)
+    && !operation.controller.signal.aborted
+  )
+
+  const endDeleteOperation = (operation) => {
+    if (!isMountedCurrentDeleteOperation(operation)) return
+    deleteOperationRef.current = null
+    setConfirmPending(false)
   }
 
   if (visibleLoading) {
@@ -695,6 +837,7 @@ function OverviewPage({
                 task={taskForAccount(visibleTasks, account.id)}
                 actionError={actionErrors[String(account.id)]}
                 menuOpen={String(menuAccountId) === String(account.id)}
+                pending={Boolean(pendingAccountIds[String(account.id)])}
                 onMenuToggle={() => setMenuAccountId((current) => (
                   String(current) === String(account.id) ? null : account.id
                 ))}
@@ -723,9 +866,12 @@ function OverviewPage({
         onConfirm={handleDelete}
       />
 
-      {pendingAccountId ? (
-        <span className="sr-only" role="status" aria-live="polite">
-          正在更新账户
+      {Object.keys(pendingAccountActions).length > 0 || confirmPending ? (
+        <span className="sr-only" role="status" aria-live="polite" data-testid="overview-pending-status">
+          {[
+            ...Object.values(pendingAccountActions).map(({ accountName, action }) => `正在${action}账户“${accountName}”…`),
+            ...(confirmPending && confirmAccount ? [`正在删除账户“${confirmAccount.name}”…`] : []),
+          ].join('；')}
         </span>
       ) : null}
     </>

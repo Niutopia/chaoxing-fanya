@@ -68,6 +68,29 @@ test('shows a mask and never renders the saved api key', async () => {
   expect(screen.queryByDisplayValue('saved-secret')).not.toBeInTheDocument()
 })
 
+test('does not show a load error when the connection request rejects with AbortError', async () => {
+  const aborted = new Error('connection request cancelled')
+  aborted.name = 'AbortError'
+  getAnswerConnection.mockRejectedValue(aborted)
+
+  renderPage()
+
+  expect(await screen.findByText('所有账户共享这一答题服务。')).toBeInTheDocument()
+  expect(screen.queryByText('connection request cancelled')).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '重新加载' })).not.toBeInTheDocument()
+})
+
+test('does not show a load error when the runtime request rejects with ERR_CANCELED', async () => {
+  const cancelled = Object.assign(new Error('runtime request cancelled'), { code: 'ERR_CANCELED' })
+  getRuntimeSettings.mockRejectedValue(cancelled)
+
+  renderPage()
+
+  expect(await screen.findByText('所有账户共享这一答题服务。')).toBeInTheDocument()
+  expect(screen.queryByText('runtime request cancelled')).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: '重新加载' })).not.toBeInTheDocument()
+})
+
 test('tests the edited connection and preserves a saved key when replacement is blank', async () => {
   const user = userEvent.setup()
   renderPage()
@@ -230,20 +253,42 @@ test('does not let an in-flight test restore success after the draft changes', a
   await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
 })
 
-test('preserves edits made while a connection save is pending', async () => {
+test('locks connection controls while a save is pending and applies the submitted response', async () => {
   const user = userEvent.setup()
   let resolveSave
   saveAnswerConnection.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve }))
   renderPage()
 
   const model = await screen.findByLabelText('模型')
-  await user.click(screen.getByRole('button', { name: '保存连接' }))
   await user.clear(model)
+  await user.type(model, 'submitted-model')
+  const key = screen.getByLabelText('替换 API Key')
+  await user.type(key, 'submitted-secret')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+
+  expect(saveAnswerConnection).toHaveBeenCalledWith(
+    expect.objectContaining({ model: 'submitted-model', api_key: 'submitted-secret' }),
+    { signal: expect.any(AbortSignal) },
+  )
+  expect(model).toBeDisabled()
+  expect(screen.getByLabelText('基础地址')).toBeDisabled()
+  expect(screen.getByLabelText('替换 API Key')).toBeDisabled()
+  expect(screen.getByLabelText('请求超时')).toBeDisabled()
+  expect(screen.getByLabelText('重试次数')).toBeDisabled()
+  expect(screen.getByLabelText('全局答题并发数')).toBeDisabled()
+  expect(screen.getByRole('button', { name: '清除 API Key' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '保存连接' })).toBeDisabled()
+  expect(screen.getByLabelText('最大同时运行账户数')).not.toBeDisabled()
+
   await user.type(model, 'edited-during-save')
-  await act(async () => { resolveSave({ model: 'stale-response-model' }) })
+  expect(model).toHaveValue('submitted-model')
+  await act(async () => { resolveSave({ model: 'submitted-model' }) })
 
   expect(await screen.findByText('连接设置已保存')).toBeInTheDocument()
-  expect(model).toHaveValue('edited-during-save')
+  expect(model).toHaveValue('submitted-model')
+  expect(key).toHaveValue('')
+  expect(model).not.toBeDisabled()
 })
 
 test('disables connection testing throughout a connection mutation', async () => {
@@ -274,7 +319,7 @@ test('merges saved metadata without rendering a plaintext key from the response'
   expect(document.body.textContent).not.toContain('response-plaintext-must-not-leak')
 })
 
-test('keeps a newer runtime edit when an older save completes', async () => {
+test('locks runtime controls while a save is pending and applies the submitted response', async () => {
   const user = userEvent.setup()
   let resolveSave
   saveRuntimeSettings.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve }))
@@ -284,10 +329,166 @@ test('keeps a newer runtime edit when an older save completes', async () => {
   await user.clear(input)
   await user.type(input, '4')
   await user.click(screen.getByRole('button', { name: '保存运行限制' }))
-  await user.clear(input)
+
+  expect(input).toBeDisabled()
+  expect(screen.getByRole('button', { name: '保存运行限制' })).toBeDisabled()
+  expect(screen.getByLabelText('模型')).not.toBeDisabled()
   await user.type(input, '6')
+  expect(input).toHaveValue(4)
   await act(async () => { resolveSave({ max_active_accounts: 4 }) })
 
   expect(await screen.findByText('运行限制已保存')).toBeInTheDocument()
-  expect(input).toHaveValue(6)
+  expect(input).toHaveValue(4)
+  expect(input).not.toBeDisabled()
+})
+
+test('keeps the runtime section usable while the connection save is pending', async () => {
+  const user = userEvent.setup()
+  let resolveConnection
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => { resolveConnection = resolve }))
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存连接' }))
+  expect(screen.getByLabelText('最大同时运行账户数')).not.toBeDisabled()
+  expect(screen.getByRole('button', { name: '保存运行限制' })).not.toBeDisabled()
+
+  await act(async () => { resolveConnection({}) })
+})
+
+test('keeps the connection section usable while the runtime save is pending', async () => {
+  const user = userEvent.setup()
+  let resolveRuntime
+  saveRuntimeSettings.mockImplementation(() => new Promise((resolve) => { resolveRuntime = resolve }))
+  renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存运行限制' }))
+  expect(screen.getByLabelText('模型')).not.toBeDisabled()
+  expect(screen.getByRole('button', { name: '保存连接' })).not.toBeDisabled()
+
+  await act(async () => { resolveRuntime({}) })
+})
+
+test('ignores a connection save that resolves after unmount without reporting an error', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  saveAnswerConnection.mockImplementation((_payload, options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveSave = resolve })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存连接' }))
+  unmount()
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveSave({ model: 'late-model' }) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
+})
+
+test('handles a rejected connection save after unmount without an unhandled error', async () => {
+  const user = userEvent.setup()
+  let rejectSave
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  saveAnswerConnection.mockImplementation((_payload, options) => {
+    signal = options?.signal
+    return new Promise((_resolve, reject) => { rejectSave = reject })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存连接' }))
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { rejectSave(new Error('late connection failure')) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
+})
+
+test('ignores a key clear that resolves after unmount without reporting an error', async () => {
+  const user = userEvent.setup()
+  let resolveClear
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  clearAnswerKey.mockImplementation((options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveClear = resolve })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+  unmount()
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveClear({ has_api_key: false }) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
+})
+
+test('handles a rejected key clear after unmount without an unhandled error', async () => {
+  const user = userEvent.setup()
+  let rejectClear
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  clearAnswerKey.mockImplementation((options) => {
+    signal = options?.signal
+    return new Promise((_resolve, reject) => { rejectClear = reject })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '清除 API Key' }))
+  await user.click(screen.getByRole('button', { name: '确认清除' }))
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { rejectClear(new Error('late clear failure')) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
+})
+
+test('ignores a runtime save that resolves after unmount without reporting an error', async () => {
+  const user = userEvent.setup()
+  let resolveSave
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  saveRuntimeSettings.mockImplementation((_payload, options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveSave = resolve })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存运行限制' }))
+  unmount()
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveSave({ max_active_accounts: 5 }) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
+})
+
+test('handles a rejected runtime save after unmount without an unhandled error', async () => {
+  const user = userEvent.setup()
+  let rejectSave
+  let signal
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+  saveRuntimeSettings.mockImplementation((_payload, options) => {
+    signal = options?.signal
+    return new Promise((_resolve, reject) => { rejectSave = reject })
+  })
+  const { unmount } = renderPage()
+
+  await user.click(await screen.findByRole('button', { name: '保存运行限制' }))
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { rejectSave(new Error('late runtime failure')) })
+
+  expect(consoleError).not.toHaveBeenCalled()
+  consoleError.mockRestore()
 })

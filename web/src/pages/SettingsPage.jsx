@@ -266,9 +266,13 @@ function SettingsPage({ className }) {
       const nextConnection = normalizeConnection(connectionResult.value)
       connectionRef.current = nextConnection
       setConnection(nextConnection)
-    } else failures.push(errorMessage(connectionResult.reason, '答题连接设置加载失败'))
+    } else if (!isAborted(connectionResult.reason, controller.signal)) {
+      failures.push(errorMessage(connectionResult.reason, '答题连接设置加载失败'))
+    }
     if (runtimeResult.status === 'fulfilled') setRuntime(normalizeRuntime(runtimeResult.value))
-    else failures.push(errorMessage(runtimeResult.reason, '运行设置加载失败'))
+    else if (!isAborted(runtimeResult.reason, controller.signal)) {
+      failures.push(errorMessage(runtimeResult.reason, '运行设置加载失败'))
+    }
     setLoadError(failures.join('；'))
     setLoading(false)
     if (loadControllerRef.current === controller) loadControllerRef.current = null
@@ -460,6 +464,7 @@ function SettingsPage({ className }) {
   }
 
   const handleSaveRuntime = async () => {
+    if (runtimeSaveControllerRef.current) return
     const validationError = validateRuntime(runtime)
     if (validationError) {
       setRuntimeError(validationError)
@@ -507,6 +512,7 @@ function SettingsPage({ className }) {
   }
 
   const connectionMask = connection.has_api_key ? connection.api_key_mask || CONFIG_MASK : '未配置'
+  const connectionPending = savingConnection || clearingKey
 
   return (
     <section className={cn('mx-auto w-full max-w-5xl px-4 py-7 md:px-8 md:py-8', className)} aria-labelledby="settings-title">
@@ -548,6 +554,7 @@ function SettingsPage({ className }) {
                 type="checkbox"
                 className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                 checked={Boolean(connection.enabled)}
+                disabled={connectionPending}
                 onChange={updateConnection('enabled')}
               />
               <span>
@@ -557,10 +564,10 @@ function SettingsPage({ className }) {
             </label>
 
             <Field label="基础地址" htmlFor="answer-base-url" description="例如 http://localhost:8849/v1。">
-              <Input id="answer-base-url" value={connection.base_url} onChange={updateConnection('base_url')} autoComplete="url" />
+              <Input id="answer-base-url" value={connection.base_url} onChange={updateConnection('base_url')} autoComplete="url" disabled={connectionPending} />
             </Field>
             <Field label="模型" htmlFor="answer-model">
-              <Input id="answer-model" value={connection.model} onChange={updateConnection('model')} autoComplete="off" />
+              <Input id="answer-model" value={connection.model} onChange={updateConnection('model')} autoComplete="off" disabled={connectionPending} />
             </Field>
             <Field label="替换 API Key" htmlFor="replace-api-key" description="留空表示保留已保存的 Key；输入内容不会显示在页面状态中。">
               <Input
@@ -577,6 +584,7 @@ function SettingsPage({ className }) {
                 }}
                 autoComplete="new-password"
                 spellCheck="false"
+                disabled={connectionPending}
               />
             </Field>
             <p className="text-xs text-label-secondary" role="status" aria-live="polite">
@@ -585,13 +593,13 @@ function SettingsPage({ className }) {
 
             <div className="grid gap-5 md:grid-cols-3">
               <Field label="请求超时" htmlFor="answer-timeout" description="秒">
-                <Input id="answer-timeout" type="number" min="1" step="1" value={connection.timeout_seconds} onChange={updateConnection('timeout_seconds')} />
+                <Input id="answer-timeout" type="number" min="1" step="1" value={connection.timeout_seconds} onChange={updateConnection('timeout_seconds')} disabled={connectionPending} />
               </Field>
               <Field label="重试次数" htmlFor="answer-retries" description="可为 0">
-                <Input id="answer-retries" type="number" min="0" step="1" value={connection.max_retries} onChange={updateConnection('max_retries')} />
+                <Input id="answer-retries" type="number" min="0" step="1" value={connection.max_retries} onChange={updateConnection('max_retries')} disabled={connectionPending} />
               </Field>
               <Field label="全局答题并发数" htmlFor="answer-concurrency" description="大于 0 的整数">
-                <Input id="answer-concurrency" type="number" min="1" step="1" value={connection.max_concurrency} onChange={updateConnection('max_concurrency')} />
+                <Input id="answer-concurrency" type="number" min="1" step="1" value={connection.max_concurrency} onChange={updateConnection('max_concurrency')} disabled={connectionPending} />
               </Field>
             </div>
 
@@ -600,15 +608,15 @@ function SettingsPage({ className }) {
                 confirmingClear ? (
                   <div className="flex flex-wrap items-center gap-2 text-sm text-label-secondary">
                     <span>确认清除已保存的 Key？</span>
-                    <Button type="button" variant="outline" onClick={() => setConfirmingClear(false)}>取消</Button>
-                    <Button type="button" variant="destructive" loading={clearingKey} onClick={handleClearKey}>确认清除</Button>
+                    <Button type="button" variant="outline" disabled={connectionPending} onClick={() => setConfirmingClear(false)}>取消</Button>
+                    <Button type="button" variant="destructive" disabled={connectionPending} loading={clearingKey} onClick={handleClearKey}>确认清除</Button>
                   </div>
                 ) : (
-                  <Button type="button" variant="outline" disabled={savingConnection || clearingKey} onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
+                  <Button type="button" variant="outline" disabled={connectionPending} onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
                 )
               ) : null}
-              <Button type="button" variant="outline" disabled={savingConnection || clearingKey} loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
-              <Button type="button" disabled={clearingKey} onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
+              <Button type="button" variant="outline" disabled={connectionPending} loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
+              <Button type="button" disabled={connectionPending} onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
             </div>
           </div>
         </details>
@@ -622,11 +630,11 @@ function SettingsPage({ className }) {
             <p className="text-pretty text-sm leading-5 text-label-secondary">限制整套应用同时运行的账户数量。</p>
             {runtimeError ? <Alert variant="danger" aria-live="polite">{runtimeError}</Alert> : null}
             <Field label="最大同时运行账户数" htmlFor="max-active-accounts" description="范围 1 到 10。">
-              <Input id="max-active-accounts" type="number" min="1" max="10" step="1" value={runtime.max_active_accounts} onChange={updateRuntime('max_active_accounts')} />
+              <Input id="max-active-accounts" type="number" min="1" max="10" step="1" value={runtime.max_active_accounts} onChange={updateRuntime('max_active_accounts')} disabled={savingRuntime} />
             </Field>
             <p className="text-pretty text-sm leading-5 text-label-secondary">答题并发数和请求超时在上方的答题连接中统一配置。</p>
             <div className="flex justify-end border-t border-separator pt-4">
-              <Button type="button" loading={savingRuntime} onClick={handleSaveRuntime}>保存运行限制</Button>
+              <Button type="button" disabled={savingRuntime} loading={savingRuntime} onClick={handleSaveRuntime}>保存运行限制</Button>
             </div>
           </div>
         </details>
