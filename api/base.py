@@ -941,6 +941,19 @@ class Chaoxing:
 
         _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
 
+        missing_choice_options = sum(
+            1
+            for question in questions.get("questions", [])
+            if question.get("type") in {"single", "multiple"}
+            and not _option_lines(question.get("options"))
+        )
+        if missing_choice_options:
+            logger.warning(
+                "检测到单选/多选题没有有效选项，已停止答题并跳过提交 "
+                f"(count={missing_choice_options})"
+            )
+            return StudyResult.ERROR
+
         # 搜题
         total_questions = len(questions["questions"])
         found_answers = 0

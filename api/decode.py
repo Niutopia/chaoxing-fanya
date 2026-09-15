@@ -861,13 +861,25 @@ def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, 
     
     # 提取题目内容和选项
     title_div = div_tag.find("div", class_="Zy_TItle")
-    options_list = div_tag.find("ul").find_all("li") if div_tag.find("ul") else []
-    
+    options_container = div_tag.find("ul", class_="Zy_ulTk") or div_tag.find("ul")
+    options_list = options_container.find_all("li") if options_container else []
+
     # 解析题目和选项
     q_title = _extract_title(title_div, font_decoder, session=session)
     q_options = []
-    for li in options_list:
-        q_options.append(_extract_choices(li, font_decoder))
+    if options_list:
+        # Keep the legacy ``ul > li`` path unchanged when any li exists.
+        for li in options_list:
+            q_options.append(_extract_choices(li, font_decoder))
+    elif options_container:
+        # Newer pages place each choice in a ``div.clearfix`` pair instead
+        # of an li.  Only complete label/text pairs are choices.
+        for choice_block in options_container.find_all(
+            "div", class_="clearfix", recursive=False
+        ):
+            choice = _extract_choice_block(choice_block, font_decoder)
+            if choice:
+                q_options.append(choice)
     # 排序选项
     q_options.sort()
     q_options = '\n'.join(q_options)
@@ -965,3 +977,32 @@ def _extract_choices(element, font_decoder=None) -> str:
         cleaned_content = cleaned_content[:-2].rstrip()
 
     return cleaned_content
+
+
+def _extract_choice_block(element, font_decoder=None) -> str:
+    """Extract one option from a ``clearfix`` label/text pair."""
+
+    label_element = element.find("span", class_="num_option")
+    answer_element = element.find("div", class_="answer_p")
+    if not label_element or not answer_element:
+        return ""
+
+    label_candidates = [label_element.get_text(" ", strip=True)]
+    for attr in ("aria-label", "data", "value"):
+        value = label_element.get(attr)
+        if value:
+            label_candidates.append(str(value))
+
+    label = ""
+    for candidate in label_candidates:
+        match = re.fullmatch(r"\s*([A-Za-z])\s*(?:[.．,，、:：)）])?\s*", candidate)
+        if match:
+            label = match.group(1).upper()
+            break
+    if not label:
+        return ""
+
+    answer = _extract_choices(answer_element, font_decoder)
+    if not answer:
+        return ""
+    return f"{label}. {answer}"
