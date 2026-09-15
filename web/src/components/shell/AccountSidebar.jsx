@@ -42,7 +42,7 @@ const AccountSidebar = React.forwardRef(function AccountSidebar(
         </NavLink>
         <NavLink to="/settings" className={navLinkClass} onClick={onNavigate}>
           <Settings aria-hidden="true" size={16} strokeWidth={1.8} />
-          <span>设置</span>
+          <span>全局设置</span>
         </NavLink>
       </nav>
 

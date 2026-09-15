@@ -1,6 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
-import { getPreferences, savePreferences } from '../api/accounts'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   clearAnswerKey,
   getAnswerConnection,
@@ -26,9 +24,8 @@ const DEFAULT_CONNECTION = {
   max_concurrency: 4,
 }
 
-const DEFAULT_RUNTIME = {
-  max_active_accounts: 3,
-}
+const DEFAULT_RUNTIME = { max_active_accounts: 3 }
+const CONFIG_MASK = 'Configured (••••)'
 
 function unwrap(value, keys = []) {
   if (value && typeof value === 'object') {
@@ -46,9 +43,7 @@ function errorMessage(error, fallback) {
 }
 
 function isAborted(error, signal) {
-  return Boolean(signal?.aborted)
-    || error?.name === 'AbortError'
-    || error?.code === 'ERR_CANCELED'
+  return Boolean(signal?.aborted) || error?.name === 'AbortError' || error?.code === 'ERR_CANCELED'
 }
 
 function numberValue(value, fallback) {
@@ -63,26 +58,19 @@ function stringValue(value, fallback = '') {
 function safeMask(value, configured) {
   if (!configured) return null
   if (typeof value === 'string' && /(?:•|\*{2,})/.test(value)) return value
-  return 'Configured (••••)'
+  return CONFIG_MASK
 }
 
 function normalizeConnection(value) {
   const source = unwrap(value, ['connection', 'answer_connection'])
-  if (!source || typeof source !== 'object' || Array.isArray(source)) {
-    return { ...DEFAULT_CONNECTION }
-  }
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return { ...DEFAULT_CONNECTION }
   return {
-    // Keep the public connection shape explicit.  In particular, never
-    // spread an API response into React state where an accidental api_key
-    // field could survive a render or be copied into a later payload.
     enabled: source.enabled === true,
     base_url: stringValue(source.base_url, DEFAULT_CONNECTION.base_url),
     model: stringValue(source.model, DEFAULT_CONNECTION.model),
     has_api_key: source.has_api_key === true,
     api_key_mask: safeMask(source.api_key_mask, source.has_api_key === true),
-    last_test_status: typeof source.last_test_status === 'string'
-      ? source.last_test_status
-      : 'untested',
+    last_test_status: typeof source.last_test_status === 'string' ? source.last_test_status : 'untested',
     timeout_seconds: numberValue(source.timeout_seconds, DEFAULT_CONNECTION.timeout_seconds),
     max_retries: numberValue(source.max_retries, DEFAULT_CONNECTION.max_retries),
     max_concurrency: numberValue(source.max_concurrency, DEFAULT_CONNECTION.max_concurrency),
@@ -91,9 +79,7 @@ function normalizeConnection(value) {
 
 function normalizeRuntime(value) {
   const source = unwrap(value, ['runtime', 'settings'])
-  if (!source || typeof source !== 'object' || Array.isArray(source)) {
-    return { ...DEFAULT_RUNTIME }
-  }
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return { ...DEFAULT_RUNTIME }
   return {
     max_active_accounts: numberValue(
       source.max_active_accounts ?? source.max_concurrent_accounts,
@@ -101,8 +87,6 @@ function normalizeRuntime(value) {
     ),
   }
 }
-
-const CONFIG_MASK = 'Configured (••••)'
 
 function connectionSource(value) {
   const source = unwrap(value, ['connection', 'answer_connection'])
@@ -113,7 +97,6 @@ function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key)
 }
 
-/** Pick only non-secret connection fields returned by a save response. */
 function connectionResponseFields(value) {
   const source = connectionSource(value)
   if (!source) return {}
@@ -127,7 +110,6 @@ function connectionResponseFields(value) {
   return fields
 }
 
-/** Keep only safe server metadata; never copy a response's plaintext key. */
 function safeConnectionMetadata(value, replacementApiKey = '') {
   const source = connectionSource(value)
   const metadata = {}
@@ -141,10 +123,6 @@ function safeConnectionMetadata(value, replacementApiKey = '') {
     if (metadata.has_api_key === false && !hasOwn(metadata, 'api_key_mask')) metadata.api_key_mask = null
     if (typeof source.last_test_status === 'string') metadata.last_test_status = source.last_test_status
   }
-
-  // A successful save response from an older server may omit metadata.  The
-  // non-empty replacement itself is enough to show safe configured state;
-  // the plaintext is never copied into the connection model.
   if (typeof replacementApiKey === 'string' && replacementApiKey.trim() && !hasOwn(metadata, 'has_api_key')) {
     metadata.has_api_key = true
     if (!hasOwn(metadata, 'api_key_mask')) metadata.api_key_mask = CONFIG_MASK
@@ -158,100 +136,8 @@ function mergeSavedConnection(current, saved, replacementApiKey, draftChanged) {
     ...(draftChanged ? {} : connectionResponseFields(saved)),
     ...safeConnectionMetadata(saved, replacementApiKey),
   }
-  // A test result belongs to the payload that was saved.  Once a user edits
-  // that payload while the request is pending, the current draft is untested.
   if (draftChanged) next.last_test_status = 'untested'
   return next
-}
-
-function configKey(key) {
-  return String(key).trim().replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
-}
-
-function compactConfigKey(key) {
-  return configKey(key).replace(/_/g, '')
-}
-
-function isConfigMetadataKey(key) {
-  const normalized = configKey(key)
-  return normalized.startsWith('has_')
-    || normalized.endsWith('_mask')
-    || normalized.endsWith('_configured')
-}
-
-function isSensitiveConfigKey(key, { notification = false } = {}) {
-  const compact = compactConfigKey(key)
-  if (!compact) return false
-  if (
-    compact === 'key'
-    || ['apikey', 'accesstoken', 'accesskey', 'token', 'secret', 'authorization', 'password', 'credential', 'cookie', 'privatekey']
-      .some((marker) => compact.includes(marker))
-  ) return true
-  return notification && ['url', 'uri', 'endpoint', 'webhook', 'chatid', 'chat'].some((marker) => compact.includes(marker))
-}
-
-function configValuePresent(value) {
-  if (value == null) return false
-  if (typeof value === 'string') return value.trim().length > 0
-  if (Array.isArray(value)) return value.length > 0
-  if (typeof value === 'object') return Object.keys(value).length > 0
-  return Boolean(value)
-}
-
-/** Keep editable account configuration free of values that may be secrets. */
-function safeConfig(value, options = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  return Object.entries(value).reduce((result, [key, item]) => {
-    if (isConfigMetadataKey(key)) {
-      // Metadata is already safe and is useful for showing “configured” copy.
-      const normalized = configKey(key)
-      if (normalized.startsWith('has_')) {
-        result[key] = item === true
-      } else if (normalized.endsWith('_mask') || normalized.endsWith('_configured')) {
-        result[key] = item ? CONFIG_MASK : null
-      }
-      return result
-    }
-    if (isSensitiveConfigKey(key, options)) {
-      const normalized = configKey(key)
-      const present = configValuePresent(item)
-      result[`has_${normalized}`] = present
-      result[`${normalized}_mask`] = present ? CONFIG_MASK : null
-      return result
-    }
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      result[key] = safeConfig(item, options)
-    } else if (Array.isArray(item)) {
-      result[key] = item.map((entry) => (
-        entry && typeof entry === 'object' && !Array.isArray(entry)
-          ? safeConfig(entry, options)
-          : entry
-      ))
-    } else if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') {
-      result[key] = item
-    }
-    return result
-  }, {})
-}
-
-function configuredSecret(value, names = []) {
-  if (!value || typeof value !== 'object') return false
-  const wanted = names.map((name) => compactConfigKey(name))
-  return Object.entries(value).some(([key, item]) => {
-    const normalized = compactConfigKey(key)
-    if (normalized.startsWith('has') && item === true) {
-      const candidate = normalized.slice(3)
-      return !wanted.length || wanted.some((name) => candidate.includes(name))
-    }
-    if (normalized.endsWith('configured') && item === true) {
-      const candidate = normalized.slice(0, -10)
-      return !wanted.length || wanted.some((name) => candidate.includes(name))
-    }
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      return configuredSecret(item, names)
-    }
-    return false
-  })
 }
 
 function answerPayload(connection, apiKey) {
@@ -280,316 +166,125 @@ function connectionDraftFingerprint(connection, apiKey) {
   })
 }
 
-// Account-level replacement inputs are intentionally kept in memory only.
-// Keep a small, explicit fingerprint so a response from a save started with
-// one draft cannot clear a newer secret typed while that request was pending.
-function accountDraftFingerprint(notification, ocr) {
-  return JSON.stringify({
-    notification: {
-      enabled: notification?.enabled === true,
-      provider: notification?.provider == null ? '' : String(notification.provider),
-      url: notification?.url == null ? '' : String(notification.url),
-      token: notification?.token == null ? '' : String(notification.token),
-      tg_chat_id: notification?.tg_chat_id == null ? '' : String(notification.tg_chat_id),
-    },
-    ocr: {
-      enabled: ocr?.enabled === true,
-      provider: ocr?.provider == null ? '' : String(ocr.provider),
-      endpoint: ocr?.endpoint == null ? '' : String(ocr.endpoint),
-      model: ocr?.model == null ? '' : String(ocr.model),
-      api_key: ocr?.api_key == null ? '' : String(ocr.api_key),
-    },
-  })
-}
-
 function validateConnection(connection) {
   if (!stringValue(connection.base_url).trim()) return '请输入基础地址'
   if (!stringValue(connection.model).trim()) return '请输入模型名称'
-  if (!Number.isFinite(Number(connection.max_concurrency)) || Number(connection.max_concurrency) <= 0 || !Number.isInteger(Number(connection.max_concurrency))) {
-    return '请输入大于 0 的整数'
-  }
-  if (!Number.isFinite(Number(connection.timeout_seconds)) || Number(connection.timeout_seconds) <= 0) {
-    return '请输入大于 0 的秒数'
-  }
-  if (!Number.isFinite(Number(connection.max_retries)) || Number(connection.max_retries) < 0 || !Number.isInteger(Number(connection.max_retries))) {
-    return '请输入 0 或更大的整数'
-  }
-  return ''
-}
-
-function validateRuntime(runtime, connection) {
-  const maxAccounts = Number(runtime.max_active_accounts)
-  if (!Number.isInteger(maxAccounts) || maxAccounts < 1 || maxAccounts > 10) return '请输入 1 到 10'
-  const concurrency = Number(connection.max_concurrency)
-  if (!Number.isInteger(concurrency) || concurrency <= 0) return '请输入大于 0 的整数'
-  const timeout = Number(connection.timeout_seconds)
-  if (!Number.isFinite(timeout) || timeout <= 0) return '请输入大于 0 的秒数'
+  if (!Number.isInteger(Number(connection.max_concurrency)) || Number(connection.max_concurrency) <= 0) return '请输入大于 0 的整数'
+  if (!Number.isFinite(Number(connection.timeout_seconds)) || Number(connection.timeout_seconds) <= 0) return '请输入大于 0 的秒数'
   if (!Number.isInteger(Number(connection.max_retries)) || Number(connection.max_retries) < 0) return '请输入 0 或更大的整数'
   return ''
 }
 
-function editableConfig(value, options = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  return Object.entries(value).reduce((result, [key, item]) => {
-    if (isConfigMetadataKey(key)) return result
-    if (item && typeof item === 'object' && !Array.isArray(item)) {
-      result[key] = editableConfig(item, options)
-    } else if (Array.isArray(item)) {
-      result[key] = item.map((entry) => (
-        entry && typeof entry === 'object' && !Array.isArray(entry)
-          ? editableConfig(entry, options)
-          : entry
-      ))
-    } else if (!isSensitiveConfigKey(key, options) && (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean')) {
-      result[key] = item
-    }
-    return result
-  }, {})
+function validateRuntime(runtime) {
+  const maxAccounts = Number(runtime.max_active_accounts)
+  if (!Number.isInteger(maxAccounts) || maxAccounts < 1 || maxAccounts > 10) return '请输入 1 到 10'
+  return ''
 }
 
-function preferenceConfigPayload(notification, ocr, originalNotification, originalOcr) {
-  const notificationPayload = {
-    ...editableConfig(originalNotification, { notification: true }),
-    enabled: Boolean(notification.enabled),
-    provider: stringValue(notification.provider).trim(),
-  }
-  const notificationUrl = stringValue(notification.url).trim()
-  const notificationToken = stringValue(notification.token).trim()
-  const notificationChatId = stringValue(notification.tg_chat_id).trim()
-  if (notificationUrl) notificationPayload.url = notificationUrl
-  if (notificationToken) notificationPayload.token = notificationToken
-  if (notificationChatId) notificationPayload.tg_chat_id = notificationChatId
-
-  const ocrPayload = {
-    ...editableConfig(originalOcr),
-    enabled: Boolean(ocr.enabled),
-    provider: stringValue(ocr.provider).trim(),
-    endpoint: stringValue(ocr.endpoint).trim(),
-    model: stringValue(ocr.model).trim(),
-  }
-  const ocrKey = stringValue(ocr.api_key).trim()
-  if (ocrKey) ocrPayload.api_key = ocrKey
-
-  return {
-    notification_config: notificationPayload,
-    ocr_config: ocrPayload,
-  }
-}
-
-function SettingsPage({ accounts = [], accountId: explicitAccountId, className }) {
-  const params = useParams()
-  const [searchParams] = useSearchParams()
-  const accountFromQuery = searchParams.get('account')
-  const initialAccountId = explicitAccountId ?? params.accountId ?? accountFromQuery ?? accounts[0]?.id ?? ''
-  const [selectedAccountId, setSelectedAccountId] = useState(initialAccountId)
+function SettingsPage({ className }) {
   const [connection, setConnection] = useState({ ...DEFAULT_CONNECTION })
   const [apiKey, setApiKey] = useState('')
   const [runtime, setRuntime] = useState({ ...DEFAULT_RUNTIME })
-  const [notification, setNotification] = useState({ enabled: false, provider: '', url: '', token: '', tg_chat_id: '' })
-  const [ocr, setOcr] = useState({ enabled: false, provider: '', endpoint: '', model: '', api_key: '' })
-  const originalNotificationRef = useRef({})
-  const originalOcrRef = useRef({})
-  const selectedAccountIdRef = useRef(selectedAccountId)
-  const loadGenerationRef = useRef(0)
-  const requestId = useRef(0)
-  const testGeneration = useRef(0)
-  const connectionRef = useRef(connection)
-  const apiKeyRef = useRef(apiKey)
-  const connectionMutationRef = useRef(0)
-  const connectionMutationEpochRef = useRef(0)
-  const connectionMutationOperationRef = useRef(0)
-  const settingsSaveOperationRef = useRef(0)
-  const mountedRef = useRef(false)
-  const loadControllerRef = useRef(null)
-  const testControllerRef = useRef(null)
-  const connectionMutationControllerRef = useRef(null)
-  const settingsSaveControllerRef = useRef(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [connectionError, setConnectionError] = useState('')
   const [runtimeError, setRuntimeError] = useState('')
-  const [accountError, setAccountError] = useState('')
   const [success, setSuccess] = useState('')
+  const [connectionSuccess, setConnectionSuccess] = useState('')
   const [testState, setTestState] = useState('idle')
   const [testMessage, setTestMessage] = useState('')
-  const [connectionSuccess, setConnectionSuccess] = useState('')
   const [savingConnection, setSavingConnection] = useState(false)
-  const [savingSettings, setSavingSettings] = useState(false)
+  const [savingRuntime, setSavingRuntime] = useState(false)
   const [confirmingClear, setConfirmingClear] = useState(false)
   const [clearingKey, setClearingKey] = useState(false)
-  const [accountPrefsReady, setAccountPrefsReady] = useState(!initialAccountId)
 
-  selectedAccountIdRef.current = selectedAccountId
+  const mountedRef = useRef(false)
+  const requestIdRef = useRef(0)
+  const testGenerationRef = useRef(0)
+  const connectionRef = useRef(connection)
+  const apiKeyRef = useRef(apiKey)
+  const connectionMutationPendingRef = useRef(false)
+  const connectionMutationOperationRef = useRef(0)
+  const runtimeSaveOperationRef = useRef(0)
+  const loadControllerRef = useRef(null)
+  const testControllerRef = useRef(null)
+  const connectionMutationControllerRef = useRef(null)
+  const runtimeSaveControllerRef = useRef(null)
 
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
-      requestId.current += 1
-      loadGenerationRef.current += 1
-      testGeneration.current += 1
-      settingsSaveOperationRef.current += 1
+      requestIdRef.current += 1
+      testGenerationRef.current += 1
       connectionMutationOperationRef.current += 1
-      connectionMutationEpochRef.current += 1
-      connectionMutationRef.current = 0
+      runtimeSaveOperationRef.current += 1
+      connectionMutationPendingRef.current = false
       loadControllerRef.current?.abort()
       testControllerRef.current?.abort()
       connectionMutationControllerRef.current?.abort()
-      settingsSaveControllerRef.current?.abort()
-      loadControllerRef.current = null
-      testControllerRef.current = null
-      connectionMutationControllerRef.current = null
-      settingsSaveControllerRef.current = null
+      runtimeSaveControllerRef.current?.abort()
     }
   }, [])
 
-  useEffect(() => {
-    connectionRef.current = connection
-  }, [connection])
-
-  useEffect(() => {
-    apiKeyRef.current = apiKey
-  }, [apiKey])
-
-  useEffect(() => {
-    setSelectedAccountId((current) => {
-      if (current && (current === explicitAccountId || accounts.some((account) => String(account.id) === String(current)))) return current
-      return explicitAccountId ?? accountFromQuery ?? accounts[0]?.id ?? ''
-    })
-  }, [accountFromQuery, accounts, explicitAccountId])
+  useEffect(() => { connectionRef.current = connection }, [connection])
+  useEffect(() => { apiKeyRef.current = apiKey }, [apiKey])
 
   const loadSettings = useCallback(async () => {
-    // A reload (including an account switch) starts a new settings session.
-    // Abort transports where possible and advance every mutation token so a
-    // response from the previous session cannot write into this one. Aborting
-    // a POST only affects this UI; it cannot roll back a server-side write.
     loadControllerRef.current?.abort()
     testControllerRef.current?.abort()
     connectionMutationControllerRef.current?.abort()
-    settingsSaveControllerRef.current?.abort()
+    runtimeSaveControllerRef.current?.abort()
     const controller = new AbortController()
+    const requestId = ++requestIdRef.current
     loadControllerRef.current = controller
-    const currentRequest = ++requestId.current
-    const currentLoadGeneration = ++loadGenerationRef.current
-    testGeneration.current += 1
-    settingsSaveOperationRef.current += 1
+    testGenerationRef.current += 1
     connectionMutationOperationRef.current += 1
-    connectionMutationEpochRef.current += 1
-    connectionMutationRef.current = 0
+    runtimeSaveOperationRef.current += 1
+    connectionMutationPendingRef.current = false
     connectionMutationControllerRef.current = null
-    settingsSaveControllerRef.current = null
-    setSavingConnection(false)
-    setSavingSettings(false)
-    setClearingKey(false)
+    runtimeSaveControllerRef.current = null
     setLoading(true)
     setLoadError('')
     setConnectionError('')
     setRuntimeError('')
-    setAccountError('')
     setSuccess('')
     setConnectionSuccess('')
     setTestState('idle')
     setTestMessage('')
-    setAccountPrefsReady(!selectedAccountId)
+    setSavingConnection(false)
+    setSavingRuntime(false)
+    setClearingKey(false)
 
-    const requests = [getAnswerConnection({ signal: controller.signal }), getRuntimeSettings({ signal: controller.signal })]
-    if (selectedAccountId) requests.push(getPreferences(selectedAccountId, { signal: controller.signal }))
-    const isCurrentLoad = () => (
-      mountedRef.current
-      && !controller.signal.aborted
-      && loadControllerRef.current === controller
-      && currentRequest === requestId.current
-      && currentLoadGeneration === loadGenerationRef.current
-      && String(selectedAccountIdRef.current ?? '') === String(selectedAccountId ?? '')
-    )
-    const [connectionResult, runtimeResult, accountResult] = await Promise.allSettled(requests)
-    if (!isCurrentLoad()) return
-
+    const [connectionResult, runtimeResult] = await Promise.allSettled([
+      getAnswerConnection({ signal: controller.signal }),
+      getRuntimeSettings({ signal: controller.signal }),
+    ])
+    if (!mountedRef.current || controller.signal.aborted || requestId !== requestIdRef.current) return
     const failures = []
     if (connectionResult.status === 'fulfilled') {
       const nextConnection = normalizeConnection(connectionResult.value)
       connectionRef.current = nextConnection
       setConnection(nextConnection)
-    } else {
-      failures.push(errorMessage(connectionResult.reason, '答题连接设置加载失败'))
-    }
-    if (runtimeResult.status === 'fulfilled') {
-      setRuntime(normalizeRuntime(runtimeResult.value))
-    } else {
-      failures.push(errorMessage(runtimeResult.reason, '运行设置加载失败'))
-    }
-    if (selectedAccountId && accountResult) {
-      if (accountResult.status === 'fulfilled') {
-        const source = unwrap(accountResult.value, ['preferences']) || {}
-        if (
-          !source
-          || typeof source !== 'object'
-          || Array.isArray(source)
-          || !source.notification_config
-          || typeof source.notification_config !== 'object'
-          || Array.isArray(source.notification_config)
-          || !source.ocr_config
-          || typeof source.ocr_config !== 'object'
-          || Array.isArray(source.ocr_config)
-        ) {
-          setAccountPrefsReady(false)
-          setAccountError('账户通知与 OCR 设置加载失败')
-          setSuccess('')
-          setLoadError(failures.join('；'))
-          setLoading(false)
-          if (loadControllerRef.current === controller) loadControllerRef.current = null
-          return
-        }
-        const notificationSource = safeConfig(source.notification_config, { notification: true })
-        const ocrSource = safeConfig(source.ocr_config)
-        originalNotificationRef.current = notificationSource
-        originalOcrRef.current = ocrSource
-        setNotification({
-          enabled: notificationSource.enabled === true,
-          provider: stringValue(notificationSource.provider),
-          // Notification destinations are replacement-only inputs.  The
-          // response carries only has_*/mask metadata, never the saved URL.
-          url: '',
-          token: '',
-          tg_chat_id: '',
-        })
-        setOcr({
-          enabled: ocrSource.enabled === true,
-          provider: stringValue(ocrSource.provider),
-          // ``endpoint`` is the runtime's canonical OCR field.  Accept the
-          // legacy base_url shape only as a read compatibility bridge.
-          endpoint: stringValue(ocrSource.endpoint ?? ocrSource.base_url),
-          model: stringValue(ocrSource.model),
-          api_key: '',
-        })
-        setAccountPrefsReady(true)
-      } else {
-        setAccountPrefsReady(false)
-        setAccountError(errorMessage(accountResult.reason, '账户通知与 OCR 设置加载失败'))
-        setSuccess('')
-      }
-    }
+    } else failures.push(errorMessage(connectionResult.reason, '答题连接设置加载失败'))
+    if (runtimeResult.status === 'fulfilled') setRuntime(normalizeRuntime(runtimeResult.value))
+    else failures.push(errorMessage(runtimeResult.reason, '运行设置加载失败'))
     setLoadError(failures.join('；'))
     setLoading(false)
     if (loadControllerRef.current === controller) loadControllerRef.current = null
-  }, [selectedAccountId])
+  }, [])
 
   useEffect(() => {
     loadSettings()
     return () => {
-      requestId.current += 1
+      requestIdRef.current += 1
       loadControllerRef.current?.abort()
       loadControllerRef.current = null
     }
   }, [loadSettings])
 
-  const selectedAccount = useMemo(
-    () => accounts.find((account) => String(account.id) === String(selectedAccountId)),
-    [accounts, selectedAccountId],
-  )
-
   const invalidateConnectionTest = () => {
-    testGeneration.current += 1
+    testGenerationRef.current += 1
     testControllerRef.current?.abort()
     testControllerRef.current = null
     setTestState('idle')
@@ -599,69 +294,24 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   const beginConnectionMutation = () => {
     connectionMutationControllerRef.current?.abort()
     const controller = new AbortController()
-    const epoch = connectionMutationEpochRef.current
     const operation = ++connectionMutationOperationRef.current
-    connectionMutationRef.current += 1
+    connectionMutationPendingRef.current = true
     connectionMutationControllerRef.current = controller
-    return { controller, epoch, operation }
+    return { controller, operation }
   }
 
-  const endConnectionMutation = ({ epoch, operation, controller } = {}) => {
-    if (
-      epoch !== connectionMutationEpochRef.current
-      || operation !== connectionMutationOperationRef.current
-    ) return
-    connectionMutationRef.current = Math.max(0, connectionMutationRef.current - 1)
-    if (connectionMutationControllerRef.current === controller) connectionMutationControllerRef.current = null
-  }
-
-  const isCurrentMutation = (context) => (
+  const isCurrentConnectionMutation = (context) => (
     Boolean(context)
     && mountedRef.current
-    && context.epoch === connectionMutationEpochRef.current
     && context.operation === connectionMutationOperationRef.current
     && connectionMutationControllerRef.current === context.controller
     && !context.controller.signal.aborted
   )
 
-  const isCurrentSettingsSave = (context) => (
-    isCurrentMutation(context?.mutation)
-    && context.operation === settingsSaveOperationRef.current
-    && settingsSaveControllerRef.current === context.controller
-    && !context.controller.signal.aborted
-    && context.loadGeneration === loadGenerationRef.current
-    && String(context.accountId ?? '') === String(selectedAccountIdRef.current ?? '')
-  )
-
-  const switchAccount = (nextAccountId) => {
-    const currentAccountId = selectedAccountIdRef.current
-    if (String(nextAccountId ?? '') === String(currentAccountId ?? '')) return
-
-    // Invalidate synchronously in the change handler. Waiting for the
-    // selectedAccountId effect would leave a microtask-sized window in which
-    // an old load/save response could still update the newly selected view.
-    selectedAccountIdRef.current = nextAccountId
-    requestId.current += 1
-    loadGenerationRef.current += 1
-    testGeneration.current += 1
-    settingsSaveOperationRef.current += 1
-    connectionMutationOperationRef.current += 1
-    connectionMutationEpochRef.current += 1
-    connectionMutationRef.current = 0
-    loadControllerRef.current?.abort()
-    testControllerRef.current?.abort()
-    connectionMutationControllerRef.current?.abort()
-    settingsSaveControllerRef.current?.abort()
-    loadControllerRef.current = null
-    testControllerRef.current = null
+  const endConnectionMutation = (context) => {
+    if (!isCurrentConnectionMutation(context)) return
+    connectionMutationPendingRef.current = false
     connectionMutationControllerRef.current = null
-    settingsSaveControllerRef.current = null
-    setLoading(true)
-    setAccountPrefsReady(!nextAccountId)
-    setSavingConnection(false)
-    setSavingSettings(false)
-    setClearingKey(false)
-    setSelectedAccountId(nextAccountId)
   }
 
   const updateConnection = (field) => (event) => {
@@ -672,7 +322,6 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       return next
     })
     setConnectionError('')
-    setRuntimeError('')
     setSuccess('')
     setConnectionSuccess('')
     invalidateConnectionTest()
@@ -684,29 +333,22 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setSuccess('')
   }
 
-  const updateAccountConfig = (setter, field) => (event) => {
-    const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value
-    setter((current) => ({ ...current, [field]: value }))
-    setAccountError('')
-    setSuccess('')
-  }
-
   const handleTestConnection = async () => {
-    if (connectionMutationRef.current > 0 || savingConnection || savingSettings || clearingKey) return
+    if (connectionMutationPendingRef.current || savingConnection || clearingKey) return
     const validationError = validateConnection(connection)
     if (validationError) {
       setConnectionError(validationError)
       setTestMessage('')
       return
     }
-    const generation = ++testGeneration.current
+    const generation = ++testGenerationRef.current
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
     testControllerRef.current?.abort()
     const controller = new AbortController()
     testControllerRef.current = controller
     const isCurrentTest = () => (
       mountedRef.current
-      && generation === testGeneration.current
+      && generation === testGenerationRef.current
       && testControllerRef.current === controller
       && !controller.signal.aborted
       && fingerprint === connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
@@ -715,10 +357,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setTestMessage('')
     setConnectionError('')
     try {
-      const result = unwrap(
-        await testAnswerConnection(answerPayload(connection, apiKey), { signal: controller.signal }),
-        ['result'],
-      ) || {}
+      const result = unwrap(await testAnswerConnection(answerPayload(connection, apiKey), { signal: controller.signal }), ['result']) || {}
       if (!isCurrentTest()) return
       if (result.ok === true && result.model_found !== false) {
         setTestState('success')
@@ -737,7 +376,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }
 
   const handleSaveConnection = async () => {
-    if (connectionMutationRef.current > 0) return
+    if (connectionMutationPendingRef.current) return
     const validationError = validateConnection(connection)
     if (validationError) {
       setConnectionError(validationError)
@@ -752,23 +391,12 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setSavingConnection(true)
     setConnectionError('')
     setSuccess('')
-    const isCurrentSave = () => isCurrentMutation(mutation)
     try {
-      const saved = await saveAnswerConnection(
-        answerPayload(connection, apiKey),
-        { signal: mutation.controller.signal },
-      )
-      if (!isCurrentSave()) return
-      // Invalidate both before the mutation and as soon as its response
-      // arrives, so a probe cannot become valid during a later save step.
+      const saved = await saveAnswerConnection(answerPayload(connection, apiKey), { signal: mutation.controller.signal })
+      if (!isCurrentConnectionMutation(mutation)) return
       invalidateConnectionTest()
       const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
-      const nextConnection = mergeSavedConnection(
-        connectionRef.current,
-        saved,
-        submittedApiKey,
-        draftChanged,
-      )
+      const nextConnection = mergeSavedConnection(connectionRef.current, saved, submittedApiKey, draftChanged)
       connectionRef.current = nextConnection
       setConnection(nextConnection)
       if (submittedApiKey === apiKeyRef.current) {
@@ -777,10 +405,10 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       }
       setConnectionSuccess('连接设置已保存')
     } catch (error) {
-      if (!isCurrentSave() || isAborted(error, mutation.controller.signal)) return
+      if (!isCurrentConnectionMutation(mutation) || isAborted(error, mutation.controller.signal)) return
       setConnectionError(errorMessage(error, '连接设置保存失败，请重试'))
     } finally {
-      if (isCurrentSave()) {
+      if (isCurrentConnectionMutation(mutation)) {
         invalidateConnectionTest()
         setSavingConnection(false)
       }
@@ -789,7 +417,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
   }
 
   const handleClearKey = async () => {
-    if (!confirmingClear || clearingKey || connectionMutationRef.current > 0) return
+    if (!confirmingClear || clearingKey || connectionMutationPendingRef.current) return
     const fingerprint = connectionDraftFingerprint(connection, apiKey)
     const submittedApiKey = apiKey
     const mutation = beginConnectionMutation()
@@ -798,10 +426,9 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     setConnectionSuccess('')
     setClearingKey(true)
     setConnectionError('')
-    const isCurrentClear = () => isCurrentMutation(mutation)
     try {
       const cleared = await clearAnswerKey({ signal: mutation.controller.signal })
-      if (!isCurrentClear()) return
+      if (!isCurrentConnectionMutation(mutation)) return
       invalidateConnectionTest()
       const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
       const nextConnection = {
@@ -821,10 +448,10 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
       setConfirmingClear(false)
       setConnectionSuccess('API Key 已清除')
     } catch (error) {
-      if (!isCurrentClear() || isAborted(error, mutation.controller.signal)) return
+      if (!isCurrentConnectionMutation(mutation) || isAborted(error, mutation.controller.signal)) return
       setConnectionError(errorMessage(error, 'API Key 清除失败，请重试'))
     } finally {
-      if (isCurrentClear()) {
+      if (isCurrentConnectionMutation(mutation)) {
         invalidateConnectionTest()
         setClearingKey(false)
       }
@@ -832,168 +459,88 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
     }
   }
 
-  const handleSaveSettings = async () => {
-    if (connectionMutationRef.current > 0) return
-    setAccountError('')
-    setConnectionSuccess('')
-    const validationError = validateRuntime(runtime, connection)
+  const handleSaveRuntime = async () => {
+    const validationError = validateRuntime(runtime)
     if (validationError) {
       setRuntimeError(validationError)
       setSuccess('')
       return
     }
-    const connectionErrorMessage = validateConnection(connection)
-    if (connectionErrorMessage) {
-      setConnectionError(connectionErrorMessage)
-      setSuccess('')
-      return
-    }
-    if (selectedAccountId && !accountPrefsReady) {
-      setSuccess('')
-      setAccountError('账户通知与 OCR 设置尚未成功加载，未保存任何设置。请重试加载。')
-      return
-    }
-
-    const fingerprint = connectionDraftFingerprint(connection, apiKey)
-    const submittedApiKey = apiKey
-    const mutation = beginConnectionMutation()
-    const saveContext = {
-      accountId: selectedAccountId,
-      loadGeneration: loadGenerationRef.current,
-      controller: mutation.controller,
-      mutation,
-    }
-    const operation = ++settingsSaveOperationRef.current
-    saveContext.operation = operation
-    settingsSaveControllerRef.current = mutation.controller
-    invalidateConnectionTest()
-    setSavingSettings(true)
+    runtimeSaveControllerRef.current?.abort()
+    const controller = new AbortController()
+    const operation = ++runtimeSaveOperationRef.current
+    runtimeSaveControllerRef.current = controller
+    const isCurrentSave = () => (
+      mountedRef.current
+      && operation === runtimeSaveOperationRef.current
+      && runtimeSaveControllerRef.current === controller
+      && !controller.signal.aborted
+    )
+    setSavingRuntime(true)
     setRuntimeError('')
-    setConnectionError('')
     setSuccess('')
-    let accountSaveStarted = false
     try {
       await saveRuntimeSettings(
         { max_active_accounts: Number(runtime.max_active_accounts) },
-        { signal: mutation.controller.signal },
+        { signal: controller.signal },
       )
-      if (!isCurrentSettingsSave(saveContext)) return
-      const savedConnection = await saveAnswerConnection(
-        answerPayload(connection, apiKey),
-        { signal: mutation.controller.signal },
-      )
-      // Invalidate at the response boundary as well as at mutation start;
-      // combined saves still have account preference work to finish.
-      invalidateConnectionTest()
-      if (!isCurrentSettingsSave(saveContext)) return
-      const draftChanged = fingerprint !== connectionDraftFingerprint(connectionRef.current, apiKeyRef.current)
-      const nextConnection = mergeSavedConnection(
-        connectionRef.current,
-        savedConnection,
-        submittedApiKey,
-        draftChanged,
-      )
-      connectionRef.current = nextConnection
-      setConnection(nextConnection)
-      if (submittedApiKey === apiKeyRef.current) {
-        apiKeyRef.current = ''
-        setApiKey('')
-      }
-      if (selectedAccountId && accountPrefsReady && isCurrentSettingsSave(saveContext)) {
-        accountSaveStarted = true
-        const accountPayload = preferenceConfigPayload(
-          notification,
-          ocr,
-          originalNotificationRef.current,
-          originalOcrRef.current,
-        )
-        const submittedAccountDraft = accountDraftFingerprint(notification, ocr)
-        await savePreferences(selectedAccountId, accountPayload, { signal: mutation.controller.signal })
-        if (isCurrentSettingsSave(saveContext)) {
-          originalNotificationRef.current = safeConfig(accountPayload.notification_config, { notification: true })
-          originalOcrRef.current = safeConfig(accountPayload.ocr_config)
-          // Only clear replacement secrets if the user has not changed this
-          // account draft since the request was sent.  This is the exact
-          // snapshot guard for a slow save response; newer input stays visible
-          // and will be sent by the next save.
-          setNotification((current) => (
-            accountDraftFingerprint(current, ocr) === submittedAccountDraft
-              ? { ...current, url: '', token: '', tg_chat_id: '' }
-              : current
-          ))
-          setOcr((current) => (
-            accountDraftFingerprint(notification, current) === submittedAccountDraft
-              ? { ...current, api_key: '' }
-              : current
-          ))
-          setAccountError('')
-        }
-      }
-      if (isCurrentSettingsSave(saveContext) && submittedApiKey === apiKeyRef.current) {
-        apiKeyRef.current = ''
-        setApiKey('')
-      }
-      if (isCurrentSettingsSave(saveContext)) setSuccess('设置已保存')
+      if (!isCurrentSave()) return
+      setSuccess('运行限制已保存')
     } catch (error) {
-      if (!isCurrentSettingsSave(saveContext)) return
-      if (accountSaveStarted) {
-        setAccountError(errorMessage(error, '账户通知与 OCR 设置保存失败，请重试'))
-        setSuccess('')
-      } else {
-        setRuntimeError(errorMessage(error, '设置保存失败，请重试'))
-      }
+      if (!isCurrentSave() || isAborted(error, controller.signal)) return
+      setRuntimeError(errorMessage(error, '运行限制保存失败，请重试'))
     } finally {
-      if (isCurrentSettingsSave(saveContext)) {
-        invalidateConnectionTest()
-        setSavingSettings(false)
+      if (isCurrentSave()) {
+        setSavingRuntime(false)
+        runtimeSaveControllerRef.current = null
       }
-      if (settingsSaveControllerRef.current === mutation.controller) settingsSaveControllerRef.current = null
-      endConnectionMutation(mutation)
     }
   }
 
   if (loading) {
     return (
       <section className={cn('mx-auto w-full max-w-5xl px-4 py-8 md:px-8', className)} aria-labelledby="settings-title">
-        <h1 id="settings-title" className="text-xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-2 text-sm text-label-secondary" role="status" aria-live="polite">正在加载设置…</p>
+        <h1 id="settings-title" className="text-balance text-xl font-semibold">全局设置</h1>
+        <p className="mt-2 text-pretty text-sm text-label-secondary" role="status" aria-live="polite">正在加载全局设置…</p>
       </section>
     )
   }
 
-  const connectionMask = connection.has_api_key
-    ? connection.api_key_mask || 'Configured (••••)'
-    : '未配置'
+  const connectionMask = connection.has_api_key ? connection.api_key_mask || CONFIG_MASK : '未配置'
 
   return (
     <section className={cn('mx-auto w-full max-w-5xl px-4 py-7 md:px-8 md:py-8', className)} aria-labelledby="settings-title">
       <div>
-        <p className="text-xs font-medium text-label-secondary">连接与运行</p>
-        <h1 id="settings-title" className="mt-1 text-xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-1 text-sm text-label-secondary">共享答题服务和本地运行限制。</p>
+        <p className="text-xs font-medium text-label-secondary">应用设置</p>
+        <h1 id="settings-title" className="mt-1 text-balance text-xl font-semibold">全局设置</h1>
+        <p className="mt-1 max-w-2xl text-pretty text-sm leading-5 text-label-secondary">
+          这里的答题服务和运行限制对所有账户生效。课程与学习参数仍在对应账户的课程工作台中设置。
+        </p>
       </div>
 
-      {loadError ? <Alert className="mt-5" variant="warning" aria-live="polite">{loadError}</Alert> : null}
+      {loadError ? (
+        <Alert className="mt-5" variant="warning" aria-live="polite">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span>{loadError}</span>
+            <Button type="button" variant="outline" onClick={loadSettings}>重新加载</Button>
+          </div>
+        </Alert>
+      ) : null}
       {success ? <Alert className="mt-5" variant="success" aria-live="polite">{success}</Alert> : null}
 
-      <div className="mt-7 space-y-0 border-y border-separator bg-surface">
+      <div className="mt-7 border-y border-separator bg-surface">
         <details open className="group border-b border-separator">
           <summary className="touch-target flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-inset [&::-webkit-details-marker]:hidden">
             <span>答题连接</span>
-            <span aria-hidden="true" className="text-label-tertiary transition-transform group-open:rotate-180 motion-reduce:transition-none">⌄</span>
+            <span aria-hidden="true" className="text-label-tertiary group-open:rotate-180">⌄</span>
           </summary>
           <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
+            <p className="text-pretty text-sm leading-5 text-label-secondary">所有账户共享这一答题服务。</p>
             {connectionSuccess ? <Alert variant="success" aria-live="polite">{connectionSuccess}</Alert> : null}
             {connectionError ? <Alert variant="danger" aria-live="polite">{connectionError}</Alert> : null}
-            {testMessage ? (
-              <Alert variant={testState === 'success' ? 'success' : 'danger'} aria-live="polite">{testMessage}</Alert>
-            ) : null}
+            {testMessage ? <Alert variant={testState === 'success' ? 'success' : 'danger'} aria-live="polite">{testMessage}</Alert> : null}
             <p className="text-xs text-label-secondary" role="status" aria-live="polite" data-testid="connection-test-status">
-              {testState === 'testing'
-                ? '正在测试当前连接…'
-                : testState === 'success'
-                  ? '当前连接已通过测试。'
-                  : '尚未测试当前连接，请重新测试。'}
+              {testState === 'testing' ? '正在测试当前连接…' : testState === 'success' ? '当前连接已通过测试。' : '尚未测试当前连接，请重新测试。'}
             </p>
 
             <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
@@ -1009,7 +556,7 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
               </span>
             </label>
 
-            <Field label="基础地址" htmlFor="answer-base-url" description="保留用户输入的地址格式，例如 http://localhost:8849/v1。">
+            <Field label="基础地址" htmlFor="answer-base-url" description="例如 http://localhost:8849/v1。">
               <Input id="answer-base-url" value={connection.base_url} onChange={updateConnection('base_url')} autoComplete="url" />
             </Field>
             <Field label="模型" htmlFor="answer-model">
@@ -1057,107 +604,30 @@ function SettingsPage({ accounts = [], accountId: explicitAccountId, className }
                     <Button type="button" variant="destructive" loading={clearingKey} onClick={handleClearKey}>确认清除</Button>
                   </div>
                 ) : (
-                  <Button type="button" variant="outline" disabled={savingConnection || savingSettings || clearingKey} onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
+                  <Button type="button" variant="outline" disabled={savingConnection || clearingKey} onClick={() => setConfirmingClear(true)}>清除 API Key</Button>
                 )
               ) : null}
-              <Button type="button" variant="outline" disabled={savingConnection || savingSettings || clearingKey} loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
-              <Button type="button" disabled={savingSettings || clearingKey} onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
+              <Button type="button" variant="outline" disabled={savingConnection || clearingKey} loading={testState === 'testing'} onClick={handleTestConnection}>测试连接</Button>
+              <Button type="button" disabled={clearingKey} onClick={handleSaveConnection} loading={savingConnection}>保存连接</Button>
             </div>
           </div>
         </details>
 
-        <details open className="group border-b border-separator">
+        <details open className="group">
           <summary className="touch-target flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-inset [&::-webkit-details-marker]:hidden">
             <span>运行限制</span>
-            <span aria-hidden="true" className="text-label-tertiary transition-transform group-open:rotate-180 motion-reduce:transition-none">⌄</span>
+            <span aria-hidden="true" className="text-label-tertiary group-open:rotate-180">⌄</span>
           </summary>
           <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
+            <p className="text-pretty text-sm leading-5 text-label-secondary">限制整套应用同时运行的账户数量。</p>
             {runtimeError ? <Alert variant="danger" aria-live="polite">{runtimeError}</Alert> : null}
             <Field label="最大同时运行账户数" htmlFor="max-active-accounts" description="范围 1 到 10。">
               <Input id="max-active-accounts" type="number" min="1" max="10" step="1" value={runtime.max_active_accounts} onChange={updateRuntime('max_active_accounts')} />
             </Field>
-            <p className="text-sm leading-5 text-label-secondary">全局答题并发数和请求超时在上方的答题连接中统一配置。</p>
+            <p className="text-pretty text-sm leading-5 text-label-secondary">答题并发数和请求超时在上方的答题连接中统一配置。</p>
             <div className="flex justify-end border-t border-separator pt-4">
-              <Button type="button" disabled={savingConnection || clearingKey} loading={savingSettings} onClick={handleSaveSettings}>保存设置</Button>
+              <Button type="button" loading={savingRuntime} onClick={handleSaveRuntime}>保存运行限制</Button>
             </div>
-          </div>
-        </details>
-
-        <details open={Boolean(accountError)} className="group border-b border-separator">
-          <summary className="touch-target flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-inset [&::-webkit-details-marker]:hidden">
-            <span>通知</span>
-            <span aria-hidden="true" className="text-label-tertiary transition-transform group-open:rotate-180 motion-reduce:transition-none">⌄</span>
-          </summary>
-          <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
-            {accountError ? (
-              <Alert variant="danger" aria-live="polite">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <span>{accountError}</span>
-                  <Button type="button" variant="outline" onClick={loadSettings}>重新加载账户设置</Button>
-                </div>
-              </Alert>
-            ) : null}
-            {selectedAccountId ? (
-              <p className="text-sm text-label-secondary">以下设置只作用于 {selectedAccount?.name || '当前账户'}。</p>
-            ) : (
-              <p className="text-sm text-label-secondary">从账户启动页进入设置后，可编辑对应账户的通知方式。</p>
-            )}
-            {accounts.length > 0 ? (
-              <Field label="当前账户" htmlFor="settings-account">
-                <select
-                  id="settings-account"
-                  value={selectedAccountId}
-                  onChange={(event) => {
-                    switchAccount(event.target.value)
-                  }}
-                  className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
-                >
-                  {accounts.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-                </select>
-              </Field>
-            ) : null}
-            <label className="touch-target flex min-h-11 items-center gap-3 text-sm">
-                <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(notification.enabled)} onChange={updateAccountConfig(setNotification, 'enabled')} disabled={!selectedAccountId || !accountPrefsReady} />
-              <span className="font-medium text-label-primary">启用通知</span>
-            </label>
-            <Field label="通知渠道" htmlFor="notification-provider">
-              <Input id="notification-provider" value={notification.provider} onChange={updateAccountConfig(setNotification, 'provider')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="例如：webhook" />
-            </Field>
-            <Field label="通知地址" htmlFor="notification-url">
-              <Input id="notification-url" value={notification.url} onChange={updateAccountConfig(setNotification, 'url')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="https://…" />
-            </Field>
-            <Field label="通知 Token" htmlFor="notification-token" description={configuredSecret(originalNotificationRef.current, ['token']) ? '已有 Token；留空表示保留' : '可选'}>
-              <Input id="notification-token" type="password" value={notification.token} onChange={updateAccountConfig(setNotification, 'token')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
-            </Field>
-            <Field label="替换 Telegram Chat ID" htmlFor="notification-chat-id" description={configuredSecret(originalNotificationRef.current, ['chat_id', 'tg_chat_id']) ? '已有 Chat ID；留空表示保留' : '可选'}>
-              <Input id="notification-chat-id" type="password" value={notification.tg_chat_id} onChange={updateAccountConfig(setNotification, 'tg_chat_id')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
-            </Field>
-          </div>
-        </details>
-
-        <details className="group">
-          <summary className="touch-target flex min-h-12 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-inset [&::-webkit-details-marker]:hidden">
-            <span>OCR</span>
-            <span aria-hidden="true" className="text-label-tertiary transition-transform group-open:rotate-180 motion-reduce:transition-none">⌄</span>
-          </summary>
-          <div className="space-y-5 border-t border-separator px-4 py-4 md:px-5">
-            <p className="text-sm text-label-secondary">OCR 设置只作用于当前账户；密钥输入框始终为空。</p>
-            <label className="touch-target flex min-h-11 items-center gap-3 text-sm">
-              <input type="checkbox" className="size-4 accent-accent-blue" checked={Boolean(ocr.enabled)} onChange={updateAccountConfig(setOcr, 'enabled')} disabled={!selectedAccountId || !accountPrefsReady} />
-              <span className="font-medium text-label-primary">启用 OCR</span>
-            </label>
-            <Field label="OCR 提供方" htmlFor="ocr-provider">
-              <Input id="ocr-provider" value={ocr.provider} onChange={updateAccountConfig(setOcr, 'provider')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="例如：openai" />
-            </Field>
-            <Field label="OCR 地址" htmlFor="ocr-endpoint">
-              <Input id="ocr-endpoint" value={ocr.endpoint} onChange={updateAccountConfig(setOcr, 'endpoint')} disabled={!selectedAccountId || !accountPrefsReady} placeholder="https://…" />
-            </Field>
-            <Field label="OCR 模型" htmlFor="ocr-model">
-              <Input id="ocr-model" value={ocr.model} onChange={updateAccountConfig(setOcr, 'model')} disabled={!selectedAccountId || !accountPrefsReady} />
-            </Field>
-            <Field label="替换 OCR API Key" htmlFor="ocr-api-key" description={configuredSecret(originalOcrRef.current, ['api']) ? '已有 OCR Key；留空表示保留' : '可选'}>
-              <Input id="ocr-api-key" type="password" value={ocr.api_key} onChange={updateAccountConfig(setOcr, 'api_key')} disabled={!selectedAccountId || !accountPrefsReady} autoComplete="new-password" />
-            </Field>
           </div>
         </details>
       </div>
@@ -1171,7 +641,6 @@ export {
   answerPayload,
   normalizeConnection,
   normalizeRuntime,
-  safeConfig,
   validateConnection,
   validateRuntime,
 }

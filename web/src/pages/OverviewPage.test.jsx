@@ -37,13 +37,14 @@ beforeEach(() => {
   verifyAccount.mockResolvedValue({ id: 'a', verification_status: 'valid' })
 })
 
-test('empty state focuses the add-account action', async () => {
+test('empty state points to the sidebar without rendering a duplicate add action', async () => {
   listAccounts.mockResolvedValue([])
   listTasks.mockResolvedValue([])
 
   renderOverview(<OverviewPage />)
 
-  expect(await screen.findByRole('button', { name: '添加第一个账户' })).toHaveFocus()
+  expect(await screen.findByText('请使用侧栏底部的“添加账户”。')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /添加.*账户/ })).not.toBeInTheDocument()
 })
 
 test.each([

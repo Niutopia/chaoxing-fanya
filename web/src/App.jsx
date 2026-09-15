@@ -170,7 +170,7 @@ function RouteTree({
             />
           )}
         />
-        <Route path="settings" element={<SettingsPage accounts={accounts} />} />
+        <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>

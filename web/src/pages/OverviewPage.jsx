@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { MoreHorizontal, Plus, Trash2, X } from 'lucide-react'
+import { MoreHorizontal, Trash2, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { deleteAccount, listAccounts, setAccountEnabled, verifyAccount } from '../api/accounts'
 import { listTasks } from '../api/tasks'
@@ -445,7 +445,6 @@ function OverviewPage({
   const [pendingAccountId, setPendingAccountId] = useState(null)
   const [actionMessage, setActionMessage] = useState('')
   const [actionErrors, setActionErrors] = useState({})
-  const emptyActionRef = useRef(null)
   const requestIdRef = useRef(0)
   const controlledData = suppliedAccounts !== undefined
     || suppliedTasks !== undefined
@@ -493,18 +492,6 @@ function OverviewPage({
     }
     if (suppliedTasks !== undefined) setTasks(Array.isArray(suppliedTasks) ? suppliedTasks : [])
   }, [suppliedAccounts, suppliedTasks])
-
-  useEffect(() => {
-    if (!visibleLoading && !visibleError && visibleAccounts.length === 0) emptyActionRef.current?.focus()
-  }, [visibleAccounts.length, visibleError, visibleLoading])
-
-  const openAddDialog = () => {
-    setMenuAccountId(null)
-    setEditingAccount(null)
-    setActionMessage('')
-    setActionErrors({})
-    setDialogOpen(true)
-  }
 
   const openEditDialog = (account) => {
     setMenuAccountId(null)
@@ -668,17 +655,13 @@ function OverviewPage({
   return (
     <>
       <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
-        <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
           <div>
-            <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
-            <p className="mt-1 text-sm text-label-secondary">
+            <h1 id="overview-title" className="text-balance text-xl font-semibold">账户概览</h1>
+            <p className="mt-1 text-pretty text-sm text-label-secondary">
               查看所有账户的任务状态与静态进度。
             </p>
           </div>
-          <Button type="button" variant="outline" onClick={openAddDialog}>
-            <Plus aria-hidden="true" size={15} strokeWidth={1.8} />
-            添加账户
-          </Button>
         </div>
 
         {actionMessage ? (
@@ -693,9 +676,9 @@ function OverviewPage({
             <p className="mx-auto mt-2 max-w-sm text-sm leading-5 text-label-secondary">
               添加一个账户后，这里会显示其任务状态、课程和章节进度。
             </p>
-            <Button ref={emptyActionRef} type="button" className="mt-5" onClick={openAddDialog}>
-              添加第一个账户
-            </Button>
+            <p className="mx-auto mt-4 max-w-sm text-pretty text-xs leading-5 text-label-tertiary">
+              请使用侧栏底部的“添加账户”。
+            </p>
           </div>
         ) : (
           <div className="mt-8 overflow-visible border-y border-separator bg-surface" role="table" aria-label="账户任务概览">

@@ -78,6 +78,13 @@ beforeEach(() => {
   })
 })
 
+test('keeps global settings in the sidebar instead of duplicating an advanced-settings link', async () => {
+  renderPage()
+
+  expect(await screen.findByRole('heading', { name: '本账户学习参数' })).toBeInTheDocument()
+  expect(screen.queryByRole('link', { name: '高级设置' })).not.toBeInTheDocument()
+})
+
 test('keeps course choices scoped to the current account', async () => {
   listCourses.mockResolvedValue([
     { courseId: 'math', title: '高等数学' },

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { getAnswerConnection } from '../api/settings'
 import { getPreferences, listCourses, savePreferences } from '../api/accounts'
 import { startTask } from '../api/tasks'
@@ -476,20 +476,14 @@ function LaunchPage({
 
   return (
     <section className={cn('mx-auto w-full max-w-6xl px-4 py-7 md:px-8 md:py-8', className)} aria-labelledby="launch-title">
-      <div className="flex flex-wrap items-start justify-between gap-4">
+      <div>
         <div className="min-w-0">
           <p className="text-xs font-medium text-label-secondary">课程工作台</p>
-          <h1 id="launch-title" className="mt-1 truncate text-xl font-semibold tracking-tight">
+          <h1 id="launch-title" className="mt-1 truncate text-balance text-xl font-semibold">
             {activeAccount?.name || '开始学习'}
           </h1>
-          <p className="mt-1 text-sm text-label-secondary">选择课程并确认本次学习任务的参数。</p>
+          <p className="mt-1 text-pretty text-sm text-label-secondary">选择课程并确认这个账户的学习参数。</p>
         </div>
-        <Link
-          to={`/settings${accountId ? `?account=${encodeURIComponent(accountId)}` : ''}`}
-          className="touch-target touch-target-compact inline-flex min-h-9 items-center rounded-md px-2.5 text-sm text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-        >
-          高级设置
-        </Link>
       </div>
 
       {loadError ? (
@@ -577,8 +571,8 @@ function LaunchPage({
 
         <aside className="min-w-0 border-y border-separator bg-surface md:sticky md:top-5" aria-labelledby="launch-inspector-title">
           <div className="border-b border-separator px-4 py-3">
-            <h2 id="launch-inspector-title" className="font-semibold">学习参数</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">这些参数只作用于当前账户。</p>
+            <h2 id="launch-inspector-title" className="font-semibold">本账户学习参数</h2>
+            <p className="mt-0.5 text-pretty text-xs text-label-secondary">保存在当前账户中，启动任务时使用。</p>
           </div>
           <div className="space-y-5 px-4 py-4">
             <Field label="播放速度" htmlFor="launch-speed" description="范围 1.0 到 2.0 倍。">

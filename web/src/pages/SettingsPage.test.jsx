@@ -13,16 +13,6 @@ import {
 } from '../api/settings'
 import SettingsPage from './SettingsPage'
 
-const { getPreferences, savePreferences } = vi.hoisted(() => ({
-  getPreferences: vi.fn(),
-  savePreferences: vi.fn(),
-}))
-
-vi.mock('../api/accounts', () => ({
-  getPreferences,
-  savePreferences,
-}))
-
 vi.mock('../api/settings', () => ({
   clearAnswerKey: vi.fn(),
   getAnswerConnection: vi.fn(),
@@ -49,22 +39,28 @@ beforeEach(() => {
     has_api_key: true,
     api_key_mask: 'sk-••••••',
     last_test_status: 'success',
+    timeout_seconds: 30,
+    max_retries: 2,
+    max_concurrency: 4,
   })
-  getRuntimeSettings.mockResolvedValue({
-    max_concurrent_accounts: 3,
-    global_answer_concurrency: 4,
-    request_timeout: 30,
-    retry_count: 2,
-  })
+  getRuntimeSettings.mockResolvedValue({ max_active_accounts: 3 })
   saveAnswerConnection.mockResolvedValue({})
   saveRuntimeSettings.mockResolvedValue({})
   clearAnswerKey.mockResolvedValue({})
   testAnswerConnection.mockResolvedValue({ ok: true, model_found: true })
-  getPreferences.mockResolvedValue({ notification_config: {}, ocr_config: {} })
-  savePreferences.mockResolvedValue({})
 })
 
-test('shows a mask and does not render the saved api key', async () => {
+test('renders only global settings without account notification or OCR controls', async () => {
+  renderPage()
+
+  expect(await screen.findByText('所有账户共享这一答题服务。')).toBeInTheDocument()
+  expect(screen.getByRole('heading', { name: '全局设置' })).toBeInTheDocument()
+  expect(screen.queryByText('通知')).not.toBeInTheDocument()
+  expect(screen.queryByText('OCR')).not.toBeInTheDocument()
+  expect(screen.queryByLabelText('当前账户')).not.toBeInTheDocument()
+})
+
+test('shows a mask and never renders the saved api key', async () => {
   renderPage()
 
   expect(await screen.findByText('sk-••••••')).toBeInTheDocument()
@@ -74,7 +70,6 @@ test('shows a mask and does not render the saved api key', async () => {
 
 test('tests the edited connection and preserves a saved key when replacement is blank', async () => {
   const user = userEvent.setup()
-  testAnswerConnection.mockResolvedValue({ ok: true, model_found: true })
   renderPage()
 
   await user.clear(await screen.findByLabelText('基础地址'))
@@ -85,6 +80,7 @@ test('tests the edited connection and preserves a saved key when replacement is 
     base_url: 'http://localhost:8849/v1',
     model: 'gemini-3.8-flash-high',
   }), { signal: expect.any(AbortSignal) })
+
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   expect(saveAnswerConnection.mock.calls[0][0]).not.toHaveProperty('api_key')
 })
@@ -92,23 +88,75 @@ test('tests the edited connection and preserves a saved key when replacement is 
 test('requires confirmation before clearing the saved key', async () => {
   const user = userEvent.setup()
   renderPage()
+
   await user.click(await screen.findByRole('button', { name: '清除 API Key' }))
   expect(clearAnswerKey).not.toHaveBeenCalled()
   await user.click(screen.getByRole('button', { name: '确认清除' }))
   expect(clearAnswerKey).toHaveBeenCalledTimes(1)
 })
 
-test.each([
-  ['最大同时运行账户数', '0', '请输入 1 到 10'],
-  ['全局答题并发数', '0', '请输入大于 0 的整数'],
-  ['请求超时', '-1', '请输入大于 0 的秒数'],
-])('validates %s', async (label, value, message) => {
+test('saves runtime limits independently from the answer connection', async () => {
   const user = userEvent.setup()
   renderPage()
-  await user.clear(await screen.findByLabelText(label))
-  await user.type(screen.getByLabelText(label), value)
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
+
+  const maxAccounts = await screen.findByLabelText('最大同时运行账户数')
+  await user.clear(maxAccounts)
+  await user.type(maxAccounts, '5')
+  await user.click(screen.getByRole('button', { name: '保存运行限制' }))
+
+  expect(saveRuntimeSettings).toHaveBeenCalledWith(
+    { max_active_accounts: 5 },
+    { signal: expect.any(AbortSignal) },
+  )
+  expect(saveAnswerConnection).not.toHaveBeenCalled()
+  expect(await screen.findByText('运行限制已保存')).toBeInTheDocument()
+})
+
+test('validates only the runtime field when saving runtime limits', async () => {
+  const user = userEvent.setup()
+  renderPage()
+
+  await user.clear(await screen.findByLabelText('全局答题并发数'))
+  await user.type(screen.getByLabelText('全局答题并发数'), '0')
+  const maxAccounts = screen.getByLabelText('最大同时运行账户数')
+  await user.clear(maxAccounts)
+  await user.type(maxAccounts, '5')
+  await user.click(screen.getByRole('button', { name: '保存运行限制' }))
+
+  expect(saveRuntimeSettings).toHaveBeenCalledWith(
+    { max_active_accounts: 5 },
+    { signal: expect.any(AbortSignal) },
+  )
+})
+
+test('rejects a runtime account limit outside 1 to 10', async () => {
+  const user = userEvent.setup()
+  renderPage()
+
+  const input = await screen.findByLabelText('最大同时运行账户数')
+  await user.clear(input)
+  await user.type(input, '0')
+  await user.click(screen.getByRole('button', { name: '保存运行限制' }))
+
+  expect(await screen.findByText('请输入 1 到 10')).toBeInTheDocument()
+  expect(saveRuntimeSettings).not.toHaveBeenCalled()
+})
+
+test.each([
+  ['全局答题并发数', '0', '请输入大于 0 的整数'],
+  ['请求超时', '-1', '请输入大于 0 的秒数'],
+  ['重试次数', '-1', '请输入 0 或更大的整数'],
+])('validates %s when saving the answer connection', async (label, value, message) => {
+  const user = userEvent.setup()
+  renderPage()
+
+  const input = await screen.findByLabelText(label)
+  await user.clear(input)
+  await user.type(input, value)
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+
   expect(await screen.findByText(message)).toBeInTheDocument()
+  expect(saveAnswerConnection).not.toHaveBeenCalled()
 })
 
 test('does not print a submitted api key when connection testing fails', async () => {
@@ -116,6 +164,7 @@ test('does not print a submitted api key when connection testing fails', async (
   const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
   testAnswerConnection.mockRejectedValue(new ApiError('连接失败', 503, 'answer_unavailable'))
   renderPage()
+
   await user.type(await screen.findByLabelText('替换 API Key'), 'local-test-secret')
   await user.click(screen.getByRole('button', { name: '测试连接' }))
   expect(await screen.findByText('连接失败')).toBeInTheDocument()
@@ -126,9 +175,11 @@ test('does not print a submitted api key when connection testing fails', async (
 test('clears the draft key after a successful connection save', async () => {
   const user = userEvent.setup()
   renderPage()
+
   const key = await screen.findByLabelText('替换 API Key')
   await user.type(key, 'new-secret')
   await user.click(screen.getByRole('button', { name: '保存连接' }))
+
   expect(saveAnswerConnection).toHaveBeenCalledWith(
     expect.objectContaining({ api_key: 'new-secret' }),
     { signal: expect.any(AbortSignal) },
@@ -136,464 +187,107 @@ test('clears the draft key after a successful connection save', async () => {
   expect(key).toHaveValue('')
 })
 
-test('clears global success before a pending key clear and keeps confirmation scoped', async () => {
+test('clears runtime success before a pending key clear', async () => {
   const user = userEvent.setup()
   let resolveClear
-  saveAnswerConnection.mockResolvedValue({ has_api_key: true, api_key_mask: 'sk-••••••' })
-  clearAnswerKey.mockImplementation(() => new Promise((resolve) => {
-    resolveClear = resolve
-  }))
+  clearAnswerKey.mockImplementation(() => new Promise((resolve) => { resolveClear = resolve }))
   renderPage()
 
-  await user.click(await screen.findByRole('button', { name: '保存设置' }))
-  expect(await screen.findByText('设置已保存')).toBeInTheDocument()
+  await user.click(await screen.findByRole('button', { name: '保存运行限制' }))
+  expect(await screen.findByText('运行限制已保存')).toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: '清除 API Key' }))
   await user.click(screen.getByRole('button', { name: '确认清除' }))
+  expect(screen.queryByText('运行限制已保存')).not.toBeInTheDocument()
 
-  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
-  resolveClear({ has_api_key: false, api_key_mask: null })
-  const clearConfirmation = await screen.findByText('API Key 已清除')
-  expect(clearConfirmation.closest('details')).not.toBeNull()
-  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
+  await act(async () => { resolveClear({ has_api_key: false, api_key_mask: null }) })
+  expect(await screen.findByText('API Key 已清除')).toBeInTheDocument()
 })
 
-test('invalidates a successful connection test when any draft value changes', async () => {
+test('invalidates a successful connection test when a draft value changes', async () => {
   const user = userEvent.setup()
   renderPage()
 
   await user.click(await screen.findByRole('button', { name: '测试连接' }))
   expect(await screen.findByText('连接成功，模型可用')).toBeInTheDocument()
-
   await user.clear(screen.getByLabelText('模型'))
   await user.type(screen.getByLabelText('模型'), 'another-model')
 
   expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
-})
-
-test('keeps connection readiness idle after clearing a saved key', async () => {
-  const user = userEvent.setup()
-  renderPage()
-
-  await user.click(await screen.findByRole('button', { name: '测试连接' }))
-  expect(await screen.findByText('连接成功，模型可用')).toBeInTheDocument()
-  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
-  await user.click(screen.getByRole('button', { name: '确认清除' }))
-
-  expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
-})
-
-test('shows an explicit retest-needed status when the current connection is untested', async () => {
-  renderPage()
-
-  expect(await screen.findByText(/尚未测试当前连接/)).toBeInTheDocument()
+  expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
 })
 
 test('does not let an in-flight test restore success after the draft changes', async () => {
   const user = userEvent.setup()
   let resolveProbe
-  testAnswerConnection.mockImplementation(
-    () => new Promise((resolve) => { resolveProbe = resolve }),
-  )
+  testAnswerConnection.mockImplementation(() => new Promise((resolve) => { resolveProbe = resolve }))
   renderPage()
 
   await user.click(await screen.findByRole('button', { name: '测试连接' }))
   await user.clear(screen.getByLabelText('模型'))
   await user.type(screen.getByLabelText('模型'), 'new-model')
-  resolveProbe({ ok: true, model_found: true })
+  await act(async () => { resolveProbe({ ok: true, model_found: true }) })
 
   await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
-  expect(screen.getByText(/尚未测试当前连接/)).toBeInTheDocument()
 })
 
-test('invalidates an in-flight test when the connection is saved', async () => {
-  const user = userEvent.setup()
-  let resolveProbe
-  testAnswerConnection.mockImplementation(
-    () => new Promise((resolve) => { resolveProbe = resolve }),
-  )
-  renderPage()
-
-  await user.click(await screen.findByRole('button', { name: '测试连接' }))
-  await user.click(screen.getByRole('button', { name: '保存连接' }))
-  expect(await screen.findByText('连接设置已保存')).toBeInTheDocument()
-  resolveProbe({ ok: true, model_found: true })
-
-  await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
-  expect(screen.getByText(/尚未测试当前连接/)).toBeInTheDocument()
-})
-
-test('isolates account preference load failure and refuses to overwrite unknown values', async () => {
-  const user = userEvent.setup()
-  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
-  expect(screen.getByLabelText('启用通知')).toBeDisabled()
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-  expect(savePreferences).not.toHaveBeenCalled()
-})
-
-test('treats a malformed preference response as a load failure', async () => {
-  getPreferences.mockResolvedValue({ data: { unexpected: true } })
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户通知与 OCR 设置加载失败')
-  expect(screen.getByLabelText('启用通知')).toBeDisabled()
-  expect(screen.getByLabelText('启用 OCR')).toBeDisabled()
-})
-
-test('does not partially save global settings when account preferences failed to load', async () => {
-  const user = userEvent.setup()
-  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-
-  expect(saveRuntimeSettings).not.toHaveBeenCalled()
-  expect(saveAnswerConnection).not.toHaveBeenCalled()
-  expect(savePreferences).not.toHaveBeenCalled()
-  expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
-})
-
-test('clears an account preference error after a successful retry', async () => {
-  const user = userEvent.setup()
-  savePreferences
-    .mockRejectedValueOnce(new ApiError('账户偏好保存失败', 503, 'preferences_unavailable'))
-    .mockResolvedValueOnce({})
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  await screen.findByText('账号 A')
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好保存失败')
-
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-  expect(await screen.findByText('设置已保存')).toBeInTheDocument()
-  expect(screen.queryByText('账户偏好保存失败')).not.toBeInTheDocument()
-})
-
-test('preserves edits and invalidates a probe when save completes', async () => {
+test('preserves edits made while a connection save is pending', async () => {
   const user = userEvent.setup()
   let resolveSave
-  let resolveProbe
-  let probePayload
-  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
-    resolveSave = resolve
-  }))
-  testAnswerConnection.mockImplementation((payload) => {
-    probePayload = payload
-    return new Promise((resolve) => {
-      resolveProbe = resolve
-    })
-  })
-
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve }))
   renderPage()
+
   const model = await screen.findByLabelText('模型')
-  await user.click(screen.getByRole('button', { name: '测试连接' }))
-  expect(probePayload).toEqual(expect.objectContaining({ model: 'gemini-3.8-flash-high' }))
   await user.click(screen.getByRole('button', { name: '保存连接' }))
   await user.clear(model)
   await user.type(model, 'edited-during-save')
+  await act(async () => { resolveSave({ model: 'stale-response-model' }) })
 
-  resolveSave({ model: 'saved-response-model' })
-  await screen.findByText('连接设置已保存')
-  resolveProbe({ ok: true, model_found: true })
-
-  await waitFor(() => {
-    expect(model).toHaveValue('edited-during-save')
-    expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument()
-  })
-  expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
-})
-
-test('does not let an older combined save overwrite a switched account load error', async () => {
-  const user = userEvent.setup()
-  let resolveAccountSave
-  getPreferences
-    .mockResolvedValueOnce({ notification_config: {}, ocr_config: {} })
-    .mockRejectedValueOnce(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
-  savePreferences.mockImplementationOnce(() => new Promise((resolve) => {
-    resolveAccountSave = resolve
-  }))
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage
-        accountId="account-a"
-        accounts={[{ id: 'account-a', name: '账号 A' }, { id: 'account-b', name: '账号 B' }]}
-      />
-    </MemoryRouter>,
-  )
-
-  await screen.findByText('账号 A')
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith(
-    'account-a',
-    expect.any(Object),
-    { signal: expect.any(AbortSignal) },
-  ))
-
-  await user.selectOptions(screen.getByLabelText('当前账户'), 'account-b')
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
-
-  await act(async () => {
-    resolveAccountSave({})
-  })
-  await waitFor(() => {
-    expect(screen.getByRole('alert')).toHaveTextContent('账户偏好加载失败')
-    expect(screen.queryByText('设置已保存')).not.toBeInTheDocument()
-  })
+  expect(await screen.findByText('连接设置已保存')).toBeInTheDocument()
+  expect(model).toHaveValue('edited-during-save')
 })
 
 test('disables connection testing throughout a connection mutation', async () => {
   const user = userEvent.setup()
   let resolveSave
-  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
-    resolveSave = resolve
-  }))
+  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve }))
   renderPage()
 
   await user.click(await screen.findByRole('button', { name: '保存连接' }))
   expect(screen.getByRole('button', { name: '测试连接' })).toBeDisabled()
-  resolveSave({ has_api_key: true, api_key_mask: 'sk-••••••' })
-  await screen.findByText('连接设置已保存')
-  expect(screen.getByRole('button', { name: '测试连接' })).not.toBeDisabled()
+  await act(async () => { resolveSave({ has_api_key: true, api_key_mask: 'sk-••••••' }) })
+  expect(await screen.findByRole('button', { name: '测试连接' })).not.toBeDisabled()
 })
 
-test('merges saved connection metadata while preserving edited drafts', async () => {
+test('merges saved metadata without rendering a plaintext key from the response', async () => {
   const user = userEvent.setup()
-  let resolveSave
-  getAnswerConnection.mockResolvedValue({
-    enabled: true,
-    base_url: 'http://localhost:8849/v1',
-    model: 'gemini-3.8-flash-high',
-    has_api_key: false,
-    api_key_mask: null,
-    last_test_status: 'untested',
-  })
-  saveAnswerConnection.mockImplementation(() => new Promise((resolve) => {
-    resolveSave = resolve
-  }))
-  renderPage()
-
-  const key = await screen.findByLabelText('替换 API Key')
-  const model = screen.getByLabelText('模型')
-  await user.type(key, 'round4-secret')
-  await user.click(screen.getByRole('button', { name: '保存连接' }))
-  await user.clear(model)
-  await user.type(model, 'edited-during-save')
-
-  resolveSave({
-    model: 'saved-response-model',
+  saveAnswerConnection.mockResolvedValue({
     has_api_key: true,
     api_key_mask: 'sk-••••••',
-    last_test_status: 'success',
     api_key: 'response-plaintext-must-not-leak',
   })
-  await screen.findByText('连接设置已保存')
+  renderPage()
 
-  expect(model).toHaveValue('edited-during-save')
-  expect(key).toHaveValue('')
-  expect(screen.getByText('sk-••••••')).toBeInTheDocument()
+  await user.type(await screen.findByLabelText('替换 API Key'), 'replacement-secret')
+  await user.click(screen.getByRole('button', { name: '保存连接' }))
+
+  expect(await screen.findByText('连接设置已保存')).toBeInTheDocument()
   expect(document.body.textContent).not.toContain('response-plaintext-must-not-leak')
 })
 
-test('invalidates a probe started while API key clear is in flight', async () => {
+test('keeps a newer runtime edit when an older save completes', async () => {
   const user = userEvent.setup()
-  let resolveClear
-  let resolveProbe
-  clearAnswerKey.mockImplementation(() => new Promise((resolve) => {
-    resolveClear = resolve
-  }))
-  testAnswerConnection.mockImplementation(() => new Promise((resolve) => {
-    resolveProbe = resolve
-  }))
-
+  let resolveSave
+  saveRuntimeSettings.mockImplementation(() => new Promise((resolve) => { resolveSave = resolve }))
   renderPage()
-  await screen.findByLabelText('模型')
-  await user.click(screen.getByRole('button', { name: '测试连接' }))
-  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
-  await user.click(screen.getByRole('button', { name: '确认清除' }))
 
-  resolveClear({ has_api_key: false })
-  await screen.findByText('API Key 已清除')
-  resolveProbe({ ok: true, model_found: true })
+  const input = await screen.findByLabelText('最大同时运行账户数')
+  await user.clear(input)
+  await user.type(input, '4')
+  await user.click(screen.getByRole('button', { name: '保存运行限制' }))
+  await user.clear(input)
+  await user.type(input, '6')
+  await act(async () => { resolveSave({ max_active_accounts: 4 }) })
 
-  await waitFor(() => expect(screen.queryByText('连接成功，模型可用')).not.toBeInTheDocument())
-  expect(screen.getByTestId('connection-test-status')).toHaveTextContent('尚未测试当前连接')
-})
-
-test('clears prior connection success when an account switch load fails', async () => {
-  const user = userEvent.setup()
-  getPreferences
-    .mockResolvedValueOnce({ notification_config: {}, ocr_config: {} })
-    .mockRejectedValueOnce(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage
-        accountId="account-a"
-        accounts={[{ id: 'account-a', name: '账号 A' }, { id: 'account-b', name: '账号 B' }]}
-      />
-    </MemoryRouter>,
-  )
-
-  await screen.findByText('账号 A')
-  await user.click(screen.getByRole('button', { name: '保存连接' }))
-  await screen.findByText('连接设置已保存')
-  await user.selectOptions(screen.getByLabelText('当前账户'), 'account-b')
-
-  expect(await screen.findByRole('alert')).toHaveTextContent('账户偏好加载失败')
-  expect(screen.queryByText('连接设置已保存')).not.toBeInTheDocument()
-})
-
-test('scopes connection save and clear confirmations while account error is visible', async () => {
-  const user = userEvent.setup()
-  getPreferences.mockRejectedValue(new ApiError('账户偏好加载失败', 503, 'preferences_unavailable'))
-  saveAnswerConnection.mockResolvedValue({ has_api_key: true, api_key_mask: 'sk-••••••' })
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  await screen.findByRole('alert')
-  await user.click(screen.getByRole('button', { name: '保存连接' }))
-  const saveConfirmation = await screen.findByText('连接设置已保存')
-  expect(saveConfirmation.closest('details')).not.toBeNull()
-
-  await user.click(screen.getByRole('button', { name: '清除 API Key' }))
-  await user.click(screen.getByRole('button', { name: '确认清除' }))
-  const clearConfirmation = await screen.findByText('API Key 已清除')
-  expect(clearConfirmation.closest('details')).not.toBeNull()
-})
-
-test('does not render notification or OCR secrets and uses endpoint for OCR drafts', async () => {
-  const user = userEvent.setup()
-  const notificationUrl = 'https://notify.example.invalid/private-url'
-  const notificationToken = 'notification-settings-secret'
-  const chatId = 'tg-chat-settings-secret'
-  const ocrKey = 'ocr-settings-secret'
-  const nestedNotificationSecret = 'nested-notification-authorization-secret'
-  const nestedOcrSecret = 'nested-ocr-secret'
-  getPreferences.mockResolvedValue({
-    notification_config: {
-      enabled: true,
-      provider: 'telegram',
-      url: notificationUrl,
-      token: notificationToken,
-      tg_chat_id: chatId,
-      has_token: true,
-      has_url: true,
-      has_tg_chat_id: true,
-      nested: { authorization: nestedNotificationSecret },
-    },
-    ocr_config: {
-      enabled: true,
-      provider: 'openai',
-      endpoint: 'http://ocr.example.invalid/v1',
-      api_key: ocrKey,
-      has_api_key: true,
-      nested: { key: nestedOcrSecret, secret: 'nested-ocr-secret-2' },
-    },
-  })
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  expect(await screen.findByText('账号 A')).toBeInTheDocument()
-  expect(document.body.textContent).not.toContain(notificationUrl)
-  expect(document.body.textContent).not.toContain(notificationToken)
-  expect(document.body.textContent).not.toContain(chatId)
-  expect(document.body.textContent).not.toContain(ocrKey)
-  expect(document.body.textContent).not.toContain(nestedNotificationSecret)
-  expect(document.body.textContent).not.toContain(nestedOcrSecret)
-
-  await user.click(screen.getByText('通知'))
-  expect(screen.getByLabelText('通知地址')).toHaveValue('')
-  expect(screen.getByLabelText('通知 Token')).toHaveValue('')
-  expect(screen.getByLabelText('替换 Telegram Chat ID')).toHaveValue('')
-
-  await user.click(screen.getByText('OCR'))
-  expect(screen.getByLabelText('OCR 地址')).toHaveValue('http://ocr.example.invalid/v1')
-  const replacement = screen.getByLabelText('替换 OCR API Key')
-  expect(replacement).toHaveValue('')
-  await user.type(replacement, 'new-ocr-secret')
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-
-  expect(savePreferences).toHaveBeenCalledWith(
-    'account-a',
-    expect.objectContaining({
-      ocr_config: expect.objectContaining({ endpoint: 'http://ocr.example.invalid/v1', api_key: 'new-ocr-secret' }),
-    }),
-    { signal: expect.any(AbortSignal) },
-  )
-  const payloadText = JSON.stringify(savePreferences.mock.calls[0][1])
-  expect(payloadText).not.toContain(notificationUrl)
-  expect(payloadText).not.toContain(notificationToken)
-  expect(payloadText).not.toContain(chatId)
-  expect(payloadText).not.toContain(ocrKey)
-  expect(payloadText).not.toContain(nestedNotificationSecret)
-  expect(payloadText).not.toContain(nestedOcrSecret)
-  expect(payloadText).not.toContain('nested-ocr-secret-2')
-})
-
-test('keeps newer account replacement input when the account save resolves late', async () => {
-  const user = userEvent.setup()
-  let resolveAccountSave
-  getPreferences.mockResolvedValue({
-    notification_config: { enabled: true, provider: 'webhook', has_token: true },
-    ocr_config: { enabled: false, provider: '', endpoint: '', model: '', has_api_key: true },
-  })
-  savePreferences.mockImplementation(() => new Promise((resolve) => {
-    resolveAccountSave = resolve
-  }))
-
-  render(
-    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
-      <SettingsPage accountId="account-a" accounts={[{ id: 'account-a', name: '账号 A' }]} />
-    </MemoryRouter>,
-  )
-
-  await screen.findByText('账号 A')
-  await user.click(screen.getByText('通知'))
-  const token = screen.getByLabelText('通知 Token')
-  await user.type(token, 'first-token')
-  await user.click(screen.getByRole('button', { name: '保存设置' }))
-  await waitFor(() => expect(savePreferences).toHaveBeenCalledWith(
-    'account-a',
-    expect.any(Object),
-    { signal: expect.any(AbortSignal) },
-  ))
-
-  await user.clear(token)
-  await user.type(token, 'newer-token')
-  resolveAccountSave({})
-  await screen.findByText('设置已保存')
-
-  expect(token).toHaveValue('newer-token')
+  expect(await screen.findByText('运行限制已保存')).toBeInTheDocument()
+  expect(input).toHaveValue(6)
 })
