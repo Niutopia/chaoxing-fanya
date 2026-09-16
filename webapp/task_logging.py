@@ -4,28 +4,70 @@ from __future__ import annotations
 
 import threading
 import weakref
+from collections.abc import Iterable
+from datetime import datetime
+import math
 from typing import TYPE_CHECKING, Any, Callable
 
-from api.logger import logger
+from api.logger import (
+    _normalise_secrets,
+    logger,
+    validate_task_id,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - imports used only by type checkers
     from .task_manager import TaskManager
 
 
 _SINK_LOCK = threading.RLock()
+# ``logger.complete()`` waits for Loguru's enqueue worker.  Serializing drains
+# keeps concurrent fast workers from contending in Loguru's private handler
+# bookkeeping, while deliberately using a different lock from ``_SINK_LOCK``
+# so a sink callback can always publish its manager snapshot during a drain.
+_SINK_COMPLETE_LOCK = threading.Lock()
 _SINK_ID: int | None = None
 _MANAGERS: weakref.WeakSet["TaskManager"] = weakref.WeakSet()
+_MANAGERS_SNAPSHOT: tuple["TaskManager", ...] = ()
+
+
+class _TaskLogSinkCapability:
+    """Unconstructible-by-value capability for the real Loguru sink."""
+
+    __slots__ = ()
+
+
+# Keep this object private to this module.  The manager checks object identity
+# when accepting a routed record, so an ordinary append caller cannot replay a
+# pre-terminal timestamp by guessing a keyword argument or creating a value
+# that merely compares equal to the capability.
+_TASK_LOG_SINK_CAPABILITY = _TaskLogSinkCapability()
+_INVALID_RECORD_TIME = object()
+
+
+def _refresh_manager_snapshot_locked() -> None:
+    global _MANAGERS_SNAPSHOT
+    _MANAGERS_SNAPSHOT = tuple(_MANAGERS)
 
 
 def run_with_task_context(
     task_id: str,
     target: Callable[..., Any],
     *args: Any,
+    log_secrets: Iterable[Any] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Run ``target`` with a Loguru ``task_id`` context value."""
 
-    with logger.contextualize(task_id=str(task_id)):
+    task_id = validate_task_id(task_id)
+    secrets = _normalise_secrets(log_secrets) if log_secrets is not None else None
+    # The logger patcher consumes ``_log_secrets`` before a record reaches any
+    # sink.  Keeping the values in Loguru's scoped context lets console/file
+    # sinks protect exceptions and direct logger calls from a task, while no
+    # credential-bearing value is serialized as an ``extra`` field.
+    context_values: dict[str, Any] = {"task_id": task_id}
+    if secrets is not None:
+        context_values["_log_secrets"] = secrets
+    with logger.contextualize(**context_values):
         return target(*args, **kwargs)
 
 
@@ -40,32 +82,67 @@ def _sink_is_installed(sink_id: int | None) -> bool:
     return sink_id in handlers
 
 
+def _task_record_filter(record: dict[str, Any]) -> bool:
+    """Filter only records carrying a valid, bounded task identifier."""
+
+    if record.get("extra", {}).get("diagnostic_only") is True:
+        return False
+    try:
+        validate_task_id(record.get("extra", {}).get("task_id"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _record_creation_time(record: Any) -> float | None | object:
+    """Extract a finite timestamp from Loguru's record creation field.
+
+    Real Loguru records always carry a ``datetime`` in ``time``.  Small
+    integrations/tests sometimes call ``_route_record`` with a minimal record
+    that omits it; ``None`` is retained as a compatibility fallback for a
+    currently-active task, while an explicitly malformed/non-finite value is
+    rejected before it reaches the manager.
+    """
+
+    if not isinstance(record, dict) or "time" not in record:
+        return None
+    value = record.get("time")
+    try:
+        timestamp = value.timestamp() if isinstance(value, datetime) else float(value)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return _INVALID_RECORD_TIME
+    return timestamp if math.isfinite(timestamp) else _INVALID_RECORD_TIME
+
+
 def _route_record(message: Any) -> None:
     record = getattr(message, "record", {})
     extra = record.get("extra", {}) if isinstance(record, dict) else {}
-    task_id = extra.get("task_id") if isinstance(extra, dict) else None
-    if not task_id:
+    try:
+        task_id = validate_task_id(extra.get("task_id"))
+    except (TypeError, ValueError):
         return
     text = record.get("message", "") if isinstance(record, dict) else ""
     level = record.get("level") if isinstance(record, dict) else None
     level_name = getattr(level, "name", level or "info")
-    timestamp = record.get("time") if isinstance(record, dict) else None
-    timestamp_value = (
-        timestamp.timestamp() if hasattr(timestamp, "timestamp") else timestamp
-    )
+    timestamp_value = _record_creation_time(record)
+    if timestamp_value is _INVALID_RECORD_TIME:
+        return
 
     # A task ID is globally unique, so exactly one manager should accept the
-    # record.  Iterating a weak set snapshot keeps callbacks safe if app/test
-    # teardown drops a manager while Loguru's enqueue worker is draining.
-    with _SINK_LOCK:
-        managers = tuple(_MANAGERS)
+    # record.  The immutable snapshot is refreshed under ``_SINK_LOCK`` by
+    # install/unregister operations, but read lock-free here.  This is
+    # important because ``logger.complete()`` may be called by code that is
+    # already holding the routing lock; taking the same lock in this callback
+    # would deadlock the enqueue worker while the caller waits for it.
+    managers = _MANAGERS_SNAPSHOT
     for manager in managers:
         try:
-            entry = manager.append_log(
-                str(task_id),
+            entry = manager._append_log_from_sink(
+                task_id,
                 text,
                 str(level_name).lower(),
                 timestamp=timestamp_value,
+                _capability=_TASK_LOG_SINK_CAPABILITY,
             )
         except Exception:
             # Logging must remain best-effort.  In particular, a manager may
@@ -83,10 +160,11 @@ def install_task_log_sink(manager: "TaskManager") -> int:
         if not _sink_is_installed(_SINK_ID):
             _SINK_ID = logger.add(
                 _route_record,
-                filter=lambda record: bool(record["extra"].get("task_id")),
+                filter=_task_record_filter,
                 enqueue=True,
             )
         _MANAGERS.add(manager)
+        _refresh_manager_snapshot_locked()
         return _SINK_ID
 
 
@@ -96,11 +174,22 @@ def remove_task_log_sink(sink_id: int | None = None) -> None:
     global _SINK_ID
     with _SINK_LOCK:
         target = _SINK_ID if sink_id is None else sink_id
-        if target is not None:
-            logger.remove(target)
-        if sink_id is None or sink_id == _SINK_ID:
+        if target is None:
+            return
+        should_clear = sink_id is None or sink_id == _SINK_ID
+        if should_clear:
             _SINK_ID = None
             _MANAGERS.clear()
+            _refresh_manager_snapshot_locked()
+    # ``logger.remove`` waits for an enqueue=True sink to drain.  Never hold
+    # the routing lock while waiting: the sink callback itself acquires that
+    # lock to append its record, otherwise teardown can deadlock forever.
+    try:
+        logger.remove(target)
+    except Exception:
+        # Teardown is best effort; a sink may already have been removed by a
+        # test fixture or by an embedding application's logger lifecycle.
+        return
 
 
 def unregister_task_log_sink(manager: "TaskManager") -> None:
@@ -115,16 +204,46 @@ def unregister_task_log_sink(manager: "TaskManager") -> None:
     global _SINK_ID
     with _SINK_LOCK:
         _MANAGERS.discard(manager)
+        _refresh_manager_snapshot_locked()
         if _MANAGERS:
             return
-        if _SINK_ID is not None:
-            logger.remove(_SINK_ID)
+        target = _SINK_ID
         _SINK_ID = None
+    if target is not None:
+        try:
+            logger.remove(target)
+        except Exception:
+            return
+
+
+def complete_task_log_sink() -> None:
+    """Drain queued task records without holding the routing lock.
+
+    The returned awaitable from :func:`loguru.logger.complete` is only needed
+    for coroutine sinks.  Its synchronous portion drains every
+    ``enqueue=True`` handler, which is the part required for task monitor
+    records.  A separate lock prevents a hundred workers finishing together
+    from repeatedly entering Loguru's handler core while still allowing the
+    callback itself to take the manager lock.
+    """
+
+    with _SINK_LOCK:
+        if _SINK_ID is None:
+            return
+    with _SINK_COMPLETE_LOCK:
+        try:
+            logger.complete()
+        except Exception:
+            # A host application may remove/reconfigure Loguru handlers while
+            # a worker is unwinding.  The timestamp cutoff remains the
+            # correctness boundary even if this best-effort drain fails.
+            return
 
 
 __all__ = [
     "install_task_log_sink",
     "remove_task_log_sink",
     "unregister_task_log_sink",
+    "complete_task_log_sink",
     "run_with_task_context",
 ]

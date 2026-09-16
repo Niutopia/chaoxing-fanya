@@ -1,5 +1,5 @@
 -r requirements.txt
-pytest>=8.4,<9
-pytest-cov>=6.2,<7
-pytest-repeat>=0.9.4,<1
-PyYAML>=6.0.2,<7
+pytest==8.4.2
+pytest-cov==6.3.0
+pytest-repeat==0.9.4
+PyYAML==6.0.3

@@ -12,14 +12,24 @@ export function usePolling(loader, { enabled, intervalMs = 2000, onData, onError
 
     let active = true
     let timer
+    let roundController = null
 
     const poll = async () => {
+      // Every request gets its own controller.  Aborting the active round on
+      // cleanup prevents a route change/unmount from leaving a network call
+      // alive, while keeping the next round independent from this one.
+      const controller = new AbortController()
+      roundController = controller
       try {
-        const data = await loader()
+        const data = await loader(controller.signal)
         if (active) onData?.(data)
       } catch (error) {
-        if (active) onError?.(toApiError(error))
+        const aborted = controller.signal.aborted
+          || error?.name === 'AbortError'
+          || error?.code === 'ERR_CANCELED'
+        if (active && !aborted) onError?.(toApiError(error))
       } finally {
+        if (roundController === controller) roundController = null
         if (active) timer = window.setTimeout(poll, intervalMs)
       }
     }
@@ -29,6 +39,8 @@ export function usePolling(loader, { enabled, intervalMs = 2000, onData, onError
     return () => {
       active = false
       window.clearTimeout(timer)
+      roundController?.abort()
+      roundController = null
     }
   }, [enabled, intervalMs, loader, onData, onError])
 }

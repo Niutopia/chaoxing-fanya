@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+import main
+
 from webapp.models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
+from webapp.limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from webapp.task_manager import (
     AccountTaskConflict,
     TaskCapacityReached,
     TaskManager,
-    TaskNotFound,
+    _secret_values,
 )
 
 
@@ -142,6 +146,30 @@ def test_same_account_cannot_start_twice(task_inputs):
     runner.release.set()
 
 
+@pytest.mark.parametrize(
+    "course_ids",
+    [
+        "course-1",
+        ["course"] * (MAX_SELECTED_COURSE_IDS + 1),
+        ["x" * (MAX_COURSE_ID_LENGTH + 1)],
+        ["   "],
+    ],
+)
+def test_manager_rejects_invalid_course_selection_before_admission(
+    task_inputs, course_ids
+):
+    runner = BlockingRunner()
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    values = task_inputs("account-a")
+    values["course_ids"] = course_ids
+
+    with pytest.raises((TypeError, ValueError)):
+        manager.start(**values)
+
+    assert manager.list_tasks() == []
+    assert manager.has_active_task("account-a") is False
+
+
 def test_global_account_limit_is_released_after_terminal_task(task_inputs):
     runner = ControllableRunner()
     manager = TaskManager(runner=runner, max_active_accounts=1)
@@ -263,8 +291,6 @@ def test_run_with_task_context_adds_task_id_to_log_context(task_inputs):
 
 
 def test_worker_exception_propagates_after_job_processor_shutdown(monkeypatch):
-    import main
-
     monkeypatch.setattr(
         main,
         "process_chapter",
@@ -292,6 +318,120 @@ def test_worker_exception_propagates_after_job_processor_shutdown(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="worker-boom"):
         processor.run()
+
+
+def test_cancelled_job_processor_is_bounded_and_releases_task_slot(monkeypatch, task_inputs):
+    started = threading.Event()
+    release = threading.Event()
+    late_callback_finished = threading.Event()
+    observed_late_callbacks: list[str] = []
+
+    def blocked_process_chapter(_chaoxing, course, point, _speed, config):
+        started.set()
+        release.wait(timeout=2)
+        try:
+            config["chapter_done_callback"](course, point)
+        finally:
+            late_callback_finished.set()
+        return main.ChapterResult.SUCCESS
+
+    monkeypatch.setattr(main, "process_chapter", blocked_process_chapter)
+
+    class ProcessorRunner:
+        def run(self, context):
+            if context.account_id == "account-b":
+                return
+            config = {
+                "speed": 1.0,
+                "jobs": 1,
+                "notopen_action": "continue",
+                "task_id": context.task_id,
+                "cancel_event": context.cancel_event,
+                "chapter_done_callback": lambda *_args: (
+                    observed_late_callbacks.append("late")
+                ),
+            }
+            processor = main.JobProcessor(
+                SimpleNamespace(),
+                {"title": "course"},
+                [main.ChapterTask(index=0, point={"title": "chapter"})],
+                config,
+            )
+            processor.run()
+
+    manager = TaskManager(runner=ProcessorRunner(), max_active_accounts=1)
+    first = manager.start(**task_inputs("account-a"))
+    assert started.wait(timeout=1)
+
+    try:
+        assert manager.cancel(first.id).state == "stopping"
+        started_wait = time.monotonic()
+        assert manager.wait(first.id, timeout=0.8)
+        assert time.monotonic() - started_wait < 0.8
+        assert manager.get_snapshot(first.id).state == "stopped"
+
+        # A bounded cancellation must release admission for another account
+        # even though the original daemon worker is still in the controlled
+        # blocking call.
+        second = manager.start(**task_inputs("account-b"))
+        assert manager.wait(second.id, timeout=1)
+        assert manager.get_snapshot(second.id).state == "completed"
+    finally:
+        release.set()
+        assert late_callback_finished.wait(timeout=1)
+        manager.wait(first.id, timeout=1)
+
+    assert observed_late_callbacks == []
+
+
+def test_cancelled_process_chapter_does_not_wait_for_blocked_job_future(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    cancel_event = threading.Event()
+    captured: list[BaseException] = []
+
+    def blocked_process_job(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return SimpleNamespace(is_failure=lambda: False)
+
+    class ChapterEngine:
+        rate_limiter = SimpleNamespace(limit_rate=lambda **_kwargs: None)
+
+        def get_job_list(self, *_args):
+            return ([{"type": "document", "jobid": "job"}], {})
+
+    monkeypatch.setattr(main, "process_job", blocked_process_job)
+
+    def invoke():
+        try:
+            main.process_chapter(
+                ChapterEngine(),
+                {"courseId": "course", "title": "course"},
+                {"id": "chapter", "title": "chapter"},
+                1.0,
+                {
+                    "cancel_event": cancel_event,
+                    "task_id": "chapter-cancel-task",
+                    "jobs": 1,
+                    "notopen_action": "continue",
+                },
+            )
+        except BaseException as exc:
+            captured.append(exc)
+
+    caller = threading.Thread(target=invoke)
+    caller.start()
+    assert started.wait(timeout=1)
+    try:
+        cancel_event.set()
+        caller.join(timeout=0.8)
+        assert not caller.is_alive()
+        assert len(captured) == 1
+        assert isinstance(captured[0], main.StudyCancelled)
+    finally:
+        release.set()
+        caller.join(timeout=1)
 
 
 def test_ocr_secret_is_redacted_from_worker_failure_and_logs(
@@ -372,6 +512,11 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
     chat_id = "telegram-chat-id-secret"
     token = "provider-token-secret"
     nested_alias = "nested-secret-alias"
+    push_key = "provider-push-key-value"
+    app_key = "provider-app-key-value"
+    auth = "provider-auth-value"
+    sign = "provider-sign-value"
+    signature = "provider-signature-value"
 
     class FailureRunner:
         def run(self, context):
@@ -384,10 +529,14 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
                 {"job": {"chat_id": chat_id, "nested": {"token": token}}}
             )
             context.reporter.append_log(
-                f"notify {notification_url} {chat_id} {token} {nested_alias}"
+                "notify "
+                f"{notification_url} {chat_id} {token} {nested_alias} "
+                f"{push_key} {app_key} {auth} {sign} {signature}"
             )
             raise RuntimeError(
-                f"notification failed: {notification_url} {chat_id} {token} {nested_alias}"
+                "notification failed: "
+                f"{notification_url} {chat_id} {token} {nested_alias} "
+                f"{push_key} {app_key} {auth} {sign} {signature}"
             )
 
     values = task_inputs("notification-account")
@@ -397,6 +546,11 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
             "provider": "Telegram",
             "url": notification_url,
             "tg_chat_id": chat_id,
+            "push_key": push_key,
+            "app_key": app_key,
+            "auth": auth,
+            "sign": sign,
+            "signature": signature,
             "nested": {"token": token, "secret_alias": nested_alias},
         },
     )
@@ -411,11 +565,61 @@ def test_notification_secrets_are_redacted_from_snapshot_details_logs_and_error(
             repr(manager.get_logs(task.id).items),
         ]
     )
-    for secret in (notification_url, chat_id, token, nested_alias):
+    for secret in (
+        notification_url,
+        chat_id,
+        token,
+        nested_alias,
+        push_key,
+        app_key,
+        auth,
+        sign,
+        signature,
+    ):
         assert secret not in visible
 
 
-def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
+def test_task_manager_collects_provider_specific_config_alias_secrets(task_inputs):
+    values = task_inputs("provider-alias-account")
+    ocr_config = {
+        "appKey": "ocr-app-key-value",
+        "auth": "ocr-auth-value",
+        "sign": "ocr-sign-value",
+        "signature": "ocr-signature-value",
+        "nested": {"push_key": "ocr-push-key-value"},
+    }
+    notification_config = {
+        "push_key": "notification-push-key-value",
+        "app_key": "notification-app-key-value",
+        "auth": "notification-auth-value",
+        "sign": "notification-sign-value",
+        "signature": "notification-signature-value",
+    }
+
+    secrets = _secret_values(
+        values["auth"],
+        values["answer"],
+        ocr_config=ocr_config,
+        notification_config=notification_config,
+    )
+
+    assert set(
+        (
+            "ocr-app-key-value",
+            "ocr-auth-value",
+            "ocr-sign-value",
+            "ocr-signature-value",
+            "ocr-push-key-value",
+            "notification-push-key-value",
+            "notification-app-key-value",
+            "notification-auth-value",
+            "notification-sign-value",
+            "notification-signature-value",
+        )
+    ).issubset(secrets)
+
+
+def test_new_task_keeps_prior_terminal_record_and_owned_state(task_inputs):
     runner = OutcomeRunner("completed")
     manager = TaskManager(runner=runner, max_active_accounts=1)
     first = manager.start(**task_inputs("evict-account"))
@@ -424,10 +628,47 @@ def test_new_task_evicts_prior_terminal_record_and_owned_state(task_inputs):
 
     second = manager.start(**task_inputs("evict-account"))
     assert manager.wait(second.id, timeout=1)
-    assert [snapshot.id for snapshot in manager.list_tasks()] == [second.id]
-    with pytest.raises(TaskNotFound):
-        manager.get_snapshot(first.id)
-    with pytest.raises(TaskNotFound):
-        manager.get_details(first.id)
-    with pytest.raises(TaskNotFound):
-        manager.get_logs(first.id)
+    assert [snapshot.id for snapshot in manager.list_tasks()] == [second.id, first.id]
+    assert manager.get_snapshot(first.id).state == "completed"
+    assert manager.get_details(first.id).courses == []
+    assert manager.get_logs(first.id).items == []
+
+
+def test_terminal_task_releases_decrypted_credentials(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    task = manager.start(**task_inputs("scrub-account"))
+    assert manager.wait(task.id, timeout=1)
+    context = manager.get_context(task.id)
+    assert context.auth.username == ""
+    assert context.auth.password == ""
+    assert context.auth.cookies == {}
+    assert context.answer.api_key is None
+    assert context.preferences.notification_config == {}
+    assert context.preferences.ocr_config == {}
+
+
+def test_late_terminal_log_is_dropped_after_secret_scrub(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(runner=runner, max_active_accounts=1)
+    task = manager.start(**task_inputs("late-log-account"))
+    assert manager.wait(task.id, timeout=1)
+
+    late_secret = "late-log-secret-that-must-not-be-retained"
+    assert manager.append_log(task.id, late_secret) is None
+    assert manager.get_logs(task.id).items == []
+
+
+def test_terminal_task_history_is_globally_bounded(task_inputs):
+    runner = OutcomeRunner("completed")
+    manager = TaskManager(
+        runner=runner,
+        max_active_accounts=1,
+        terminal_task_capacity=2,
+    )
+    ids = []
+    for account in ("a", "b", "c"):
+        task = manager.start(**task_inputs(account))
+        assert manager.wait(task.id, timeout=1)
+        ids.append(task.id)
+    assert [item.id for item in manager.list_tasks()] == list(reversed(ids[-2:]))

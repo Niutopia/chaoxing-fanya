@@ -2,17 +2,19 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { ArrowLeft, ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
-import { cancelTask, getTask, getTaskDetails, getTaskLogs } from '../api/tasks'
+import { cancelTask, getTask, getTaskDetails, getTaskLogs, refreshAnswerReport } from '../api/tasks'
 import usePolling from '../hooks/usePolling'
 import Alert from '../components/ui/Alert'
 import Button from '../components/ui/Button'
 import TaskLog from '../components/tasks/TaskLog'
+import AnswerReport from '../components/tasks/AnswerReport'
 import TaskProgress from '../components/tasks/TaskProgress'
 import TaskStatus, { taskStatusLabel } from '../components/tasks/TaskStatus'
 import { cn } from '../lib/utils'
 
 const ACTIVE_STATES = new Set(['running', 'stopping'])
 const TERMINAL_STATES = new Set(['completed', 'failed', 'stopped'])
+const KNOWN_TASK_STATES = new Set([...ACTIVE_STATES, ...TERMINAL_STATES])
 
 function unwrap(value, keys = []) {
   if (value && typeof value === 'object') {
@@ -149,8 +151,14 @@ function formatElapsed(value) {
 function normalizeSnapshot(value, taskId = '') {
   const source = unwrap(value, ['task', 'snapshot'])
   if (!source || typeof source !== 'object' || Array.isArray(source)) return null
-  const id = scalarText(source.id ?? source.task_id ?? source.taskId) ?? String(taskId)
-  const state = scalarText(source.state) ?? 'running'
+  const id = scalarText(source.id) ?? scalarText(source.task_id) ?? scalarText(source.taskId)
+  const routeId = scalarText(taskId)
+  const state = scalarText(source.state)?.toLowerCase()
+  // A task response is only useful when it identifies the task that the
+  // route is currently displaying. Never synthesize an id from the route or
+  // a running state from an empty/partial response: doing so can make `{}`
+  // look like a live task and keep polling forever.
+  if (!id || !routeId || id !== routeId || !state || !KNOWN_TASK_STATES.has(state)) return null
   return {
     id,
     account_id: scalarText(source.account_id ?? source.accountId),
@@ -174,8 +182,12 @@ function normalizeDetails(value) {
   }
   const courses = Array.isArray(source.courses) ? source.courses.filter((course) => course && typeof course === 'object') : []
   const activeJobs = source.active_jobs ?? source.activeJobs
+  const serializedCourses = JSON.stringify(source.courses ?? [])
   return {
     courses,
+    answer_report: source.answer_report && typeof source.answer_report === 'object' ? source.answer_report : {},
+    truncated: serializedCourses.includes('[redacted-depth]')
+      || serializedCourses.includes('[redacted-size]'),
     active_jobs: activeJobs && typeof activeJobs === 'object' && !Array.isArray(activeJobs) ? activeJobs : {},
     counts: source.counts && typeof source.counts === 'object' && !Array.isArray(source.counts) ? source.counts : {},
   }
@@ -205,6 +217,12 @@ function isNotFound(error) {
   return error?.status === 404 || error?.code === 'task_not_found'
 }
 
+function invalidSnapshotError() {
+  const error = new Error('任务状态响应格式异常')
+  error.code = 'task_response_invalid'
+  return error
+}
+
 function safeErrorMessage(error, fallback) {
   const message = scalarText(error?.message)
   if (!message) return fallback
@@ -218,6 +236,7 @@ function accountValue(account, snakeCase, camelCase = snakeCase) {
 }
 
 function courseTitle(course) {
+  if (course?.title === '[redacted-depth]' || course?.id === '[redacted-depth]') return '历史课程详情缺失'
   return scalarText(course?.title ?? course?.name ?? course?.course_name ?? course?.courseName)
     ?? scalarText(course?.id ?? course?.course_id ?? course?.courseId)
     ?? '未命名课程'
@@ -253,11 +272,6 @@ function taskAccountLabel(snapshot, account, accounts) {
   return scalarText(supplied?.name) ?? scalarText(snapshot?.account_name ?? snapshot?.accountName) ?? snapshot?.account_id ?? '当前账户'
 }
 
-function currentJobLabel(activeJobs) {
-  const first = Object.entries(activeJobs ?? {})[0]
-  return first ? jobName(first[1], first[0]) : null
-}
-
 function UnknownTask({ accountId }) {
   return (
     <section className="mx-auto w-full max-w-4xl px-4 py-8 md:px-8" aria-labelledby="task-not-found-title">
@@ -281,6 +295,89 @@ function UnknownTask({ accountId }) {
         </Link>
       ) : null}
     </section>
+  )
+}
+
+function formatDate(value) {
+  const seconds = timestampSeconds(value)
+  if (seconds === null) return '时间未记录'
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(seconds * 1000))
+}
+
+function unfinishedCourses(courses, terminal) {
+  const needsAttention = (item) => terminal
+    ? !isComplete(item)
+    : ['failed', 'blocked', 'not_open', 'skipped'].includes(item?.status)
+  return courses.flatMap((course) => {
+    const chapters = courseChapters(course).filter(needsAttention)
+    return chapters.length || needsAttention(course) ? [{ course, chapters }] : []
+  })
+}
+
+function issueExplanation(item) {
+  const checked = item?.diagnosis
+  if (checked?.reason && checked?.checked_at) {
+    return { reason: checked.reason, action: checked.next_action, checkedAt: checked.checked_at }
+  }
+  if (scalarText(item?.reason)) return { reason: item.reason, action: item.next_action }
+  const fallbacks = {
+    blocked: ['平台条件尚未满足', '在学习通确认开放状态后，再运行该课程。'],
+    not_open: ['章节未开放，可能需要先完成前置章节', '在学习通查看开放时间及前置要求，满足后再运行。'],
+    skipped: ['该任务仍需手动完成', '在学习通检查是否有待提交的答案或未完成的任务点。'],
+    pending: ['本次尚未处理到这里', '返回课程启动，重新选择该课程继续。'],
+    running: ['运行结束前未确认完成', '在学习通确认进度后，重新运行该课程。'],
+    stopped: ['处理已停止，尚未确认完成', '返回课程启动，重新选择该课程继续。'],
+  }
+  const [reason, action] = fallbacks[item?.status] ?? [
+    '执行失败，这条记录没有保存具体原因', '查看下方运行日志，确认原因后再重试。',
+  ]
+  return { reason, action }
+}
+
+function UnfinishedList({ groups }) {
+  return (
+    <div className="divide-y divide-separator">
+      {groups.map(({ course, chapters }, courseIndex) => {
+        const entries = chapters.length ? chapters : [course]
+        const explanations = entries.flatMap((chapter) => {
+          const jobs = Array.isArray(chapter.jobs) ? chapter.jobs.filter((job) => job && !isComplete(job)) : []
+          return (jobs.length ? jobs : [chapter]).map(issueExplanation)
+        })
+        const actions = [...new Set(explanations.map((item) => item.action).filter(Boolean))]
+        return (
+          <div key={course.id ?? courseIndex} className="px-5 py-4">
+            <h3 className="text-balance text-sm font-semibold">{courseTitle(course)}</h3>
+            <ul className="mt-3 space-y-3">
+              {entries.map((chapter, chapterIndex) => {
+                const jobs = Array.isArray(chapter.jobs) ? chapter.jobs.filter((job) => job && !isComplete(job)) : []
+                return (
+                  <li key={chapter.id ?? chapterIndex} className="grid gap-x-4 border-l-2 border-warning/50 pl-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+                    <p className="text-pretty text-sm font-medium">{chapters.length ? chapterTitle(chapter) : '课程未完成，缺少章节详情'}</p>
+                    <div>{(jobs.length ? jobs : [chapter]).map((job, jobIndex) => {
+                      const explanation = issueExplanation(job)
+                      return (
+                        <div key={job.id ?? jobIndex} className="text-pretty text-sm leading-6 text-label-secondary">
+                          {jobs.length > 1 ? <span>{jobName(job, '任务点')} · </span> : null}
+                          <span className="text-label-primary">{safeErrorMessage({ message: explanation.reason }, '')}</span>
+                          {explanation.checkedAt ? <span className="ml-2 text-xs">（{formatDate(explanation.checkedAt)}复查）</span> : null}
+                        </div>
+                      )
+                    })}</div>
+                  </li>
+                )
+              })}
+            </ul>
+            {actions.length ? (
+              <div className="mt-4 rounded-md bg-canvas px-3 py-2.5 text-pretty text-sm leading-6">
+                <span className="font-medium">下一步：</span>{actions.map((action) => safeErrorMessage({ message: action }, '')).join(' ')}
+              </div>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
   )
 }
 
@@ -310,8 +407,8 @@ function TaskCourseList({ courses, expanded, onToggle }) {
                 ? <ChevronDown aria-hidden="true" size={16} strokeWidth={1.8} />
                 : <ChevronRight aria-hidden="true" size={16} strokeWidth={1.8} />}
               <span className="min-w-0 flex-1 truncate font-medium">{title}</span>
-              <span className="shrink-0 text-xs text-label-tertiary">{chapters.length} 章节</span>
-              <span className="sr-only">{isExpanded ? `收起${title}` : `展开${title}`}</span>
+              <span className="shrink-0 text-xs tabular-nums text-label-secondary">{chapters.filter(isComplete).length} / {chapters.length} 章</span>
+              <TaskStatus state={course.status ?? 'pending'} className="shrink-0 text-xs" />
             </button>
             {isExpanded ? (
               <div id={`task-course-${id}`} className="border-t border-separator bg-black/[0.018] px-4 py-2.5">
@@ -422,12 +519,17 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const [logs, setLogs] = useState([])
   const [notFound, setNotFound] = useState(false)
   const [snapshotError, setSnapshotError] = useState(false)
+  const [snapshotFormatError, setSnapshotFormatError] = useState(false)
   const [detailsError, setDetailsError] = useState(false)
   const [logsError, setLogsError] = useState(false)
+  const [terminalLogsLoaded, setTerminalLogsLoaded] = useState(false)
   const [requestError, setRequestError] = useState('')
   const [confirmCancel, setConfirmCancel] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [cancelError, setCancelError] = useState('')
+  const [refreshingGrades, setRefreshingGrades] = useState(false)
+  const [gradesError, setGradesError] = useState('')
+  const gradeControllerRef = useRef(null)
   const [expandedCourses, setExpandedCourses] = useState(() => new Set())
   const [clockNow, setClockNow] = useState(() => Date.now())
   const cursorRef = useRef(0)
@@ -435,6 +537,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const cancelRequestedRef = useRef(false)
   const cancelTriggerRef = useRef(null)
   const monitorBackLinkRef = useRef(null)
+  const cancelControllerRef = useRef(null)
 
   const currentGeneration = taskGenerationRef.current.generation
 
@@ -444,17 +547,29 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     setLogs([])
     setNotFound(false)
     setSnapshotError(false)
+    setSnapshotFormatError(false)
     setDetailsError(false)
     setLogsError(false)
+    setTerminalLogsLoaded(false)
     setRequestError('')
     setConfirmCancel(false)
     setCancelling(false)
     setCancelError('')
+    setRefreshingGrades(false)
+    setGradesError('')
+    gradeControllerRef.current?.abort()
     setExpandedCourses(new Set())
     setClockNow(Date.now())
     cursorRef.current = 0
     seenSequencesRef.current = new Set()
     cancelRequestedRef.current = false
+    cancelControllerRef.current?.abort()
+    cancelControllerRef.current = null
+    return () => {
+      gradeControllerRef.current?.abort()
+      cancelControllerRef.current?.abort()
+      cancelControllerRef.current = null
+    }
   }, [taskId])
 
   useEffect(() => {
@@ -463,20 +578,32 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     return () => window.clearInterval(timer)
   }, [snapshot?.state])
 
-  const loadSnapshotAndDetails = useCallback(async () => {
-    const [snapshotResult, detailsResult] = await Promise.allSettled([
-      getTask(taskId),
-      getTaskDetails(taskId),
-    ])
-    if (snapshotResult.status === 'rejected') throw snapshotResult.reason
+  const loadSnapshotAndDetails = useCallback(async (signal) => {
+    // Start both requests together so the details panel keeps its existing
+    // latency, but validate the authoritative snapshot as soon as it settles.
+    // A malformed snapshot therefore stops this polling round immediately
+    // instead of waiting for a potentially stalled details request.
+    const snapshotPromise = getTask(taskId, { signal })
+    const detailsPromise = Promise.resolve(getTaskDetails(taskId, { signal }))
+      .then(
+        (value) => ({ status: 'fulfilled', value }),
+        (reason) => ({ status: 'rejected', reason }),
+      )
+    const snapshotValue = await snapshotPromise
+    const nextSnapshot = normalizeSnapshot(snapshotValue, taskId)
+    if (!nextSnapshot) throw invalidSnapshotError()
+    const detailsResult = await detailsPromise
     return {
-      snapshot: normalizeSnapshot(snapshotResult.value, taskId),
+      snapshot: nextSnapshot,
       details: detailsResult.status === 'fulfilled' ? normalizeDetails(detailsResult.value) : null,
       detailsError: detailsResult.status === 'rejected' ? detailsResult.reason : null,
     }
   }, [taskId])
 
-  const monitorEnabled = Boolean(taskId) && !notFound && (snapshot === null || ACTIVE_STATES.has(snapshot.state))
+  const monitorEnabled = Boolean(taskId)
+    && !notFound
+    && !snapshotFormatError
+    && (snapshot === null || ACTIVE_STATES.has(snapshot.state) || detailsError || details.answer_report?.status === 'running')
 
   const handleSnapshotData = useCallback((result) => {
     const nextSnapshot = result?.snapshot
@@ -502,6 +629,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     }
     setSnapshotError(true)
     setRequestError(safeErrorMessage(error, '任务状态加载失败'))
+    if (error?.code === 'task_response_invalid') setSnapshotFormatError(true)
   }, [])
 
   usePolling(loadSnapshotAndDetails, {
@@ -511,10 +639,11 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     onError: handleSnapshotError,
   })
 
-  const loadLogs = useCallback(async () => {
-    const page = await getTaskLogs(taskId, { after: cursorRef.current })
-    return normalizeLogPage(page)
-  }, [taskId])
+  const terminalState = TERMINAL_STATES.has(snapshot?.state)
+  const loadLogs = useCallback(async (signal) => {
+    const page = await getTaskLogs(taskId, { after: cursorRef.current, signal })
+    return { ...normalizeLogPage(page), terminalRead: terminalState }
+  }, [taskId, terminalState])
 
   const handleLogsData = useCallback((page) => {
     if (!page) return
@@ -537,6 +666,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       return next
     })
     setLogsError(false)
+    if (page.terminalRead) setTerminalLogsLoaded(true)
   }, [])
 
   const handleLogsError = useCallback((error) => {
@@ -548,7 +678,8 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   }, [])
 
   usePolling(loadLogs, {
-    enabled: monitorEnabled,
+    enabled: Boolean(taskId) && !notFound && !snapshotFormatError
+      && (!terminalState || !terminalLogsLoaded),
     intervalMs: 2000,
     onData: handleLogsData,
     onError: handleLogsError,
@@ -557,8 +688,6 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
   const accountLabel = taskAccountLabel(snapshot, account, accounts)
   const courseLabel = snapshot?.current_course
     ?? (details.courses.length > 0 ? courseTitle(details.courses[0]) : '当前课程')
-  const activeJobLabel = currentJobLabel(details.active_jobs)
-  const currentVideo = snapshot?.current_task ?? activeJobLabel
   const reconnecting = snapshotError || detailsError || logsError
   const isStopping = Boolean(snapshot && (snapshot.state === 'stopping' || cancelling))
   const canCancel = Boolean(snapshot && ACTIVE_STATES.has(snapshot.state) && !notFound)
@@ -568,10 +697,21 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     : null
   const counts = useMemo(() => aggregateCounts(snapshot, details), [snapshot, details])
   const elapsed = formatElapsed(elapsedSeconds(snapshot, clockNow))
+  const unfinished = unfinishedCourses(details.courses, terminalState)
+  const unfinishedChapters = unfinished.reduce((total, group) => total + group.chapters.length, 0)
+  const resultHeading = snapshot?.state === 'completed'
+    ? '本次所选课程已全部完成'
+    : snapshot?.state === 'stopped'
+      ? '运行已停止，可稍后继续'
+      : terminalState
+        ? unfinishedChapters > 0
+          ? `本次运行结束，仍有 ${unfinishedChapters} 个章节未完成`
+          : '本次运行未完成'
+        : isStopping ? '正在停止，请稍候' : '正在学习所选课程'
 
   const jobs = useMemo(
-    () => Object.entries(details.active_jobs ?? {}).filter(([, job]) => job && typeof job === 'object'),
-    [details.active_jobs],
+    () => terminalState ? [] : Object.entries(details.active_jobs ?? {}).filter(([, job]) => job && typeof job === 'object'),
+    [details.active_jobs, terminalState],
   )
 
   const toggleCourse = (courseId) => {
@@ -581,6 +721,27 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       else next.add(courseId)
       return next
     })
+  }
+
+  const handleRefreshGrades = async () => {
+    if (refreshingGrades || details.answer_report?.status === 'running') return
+    setRefreshingGrades(true)
+    setGradesError('')
+    const generation = currentGeneration
+    const controller = new AbortController()
+    gradeControllerRef.current = controller
+    try {
+      const next = normalizeDetails(await refreshAnswerReport(taskId, { signal: controller.signal }))
+      if (taskGenerationRef.current.generation !== generation || controller.signal.aborted) return
+      setDetails(next)
+      const updated = { ...snapshot, stats: { ...snapshot.stats, ...next.counts } }
+      setSnapshot(updated)
+      onSnapshot?.(updated)
+    } catch (error) {
+      if (taskGenerationRef.current.generation === generation && !controller.signal.aborted) setGradesError(safeErrorMessage(error, '刷新判分失败，请重试'))
+    } finally {
+      if (taskGenerationRef.current.generation === generation) setRefreshingGrades(false)
+    }
   }
 
   const handleCancel = async () => {
@@ -594,10 +755,13 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
     cancelRequestedRef.current = true
     setCancelling(true)
     setCancelError('')
+    const controller = new AbortController()
+    cancelControllerRef.current = controller
     try {
-      const result = await cancelTask(requestTaskId)
+      const result = await cancelTask(requestTaskId, { signal: controller.signal })
       if (!isCurrentRequest()) return
-      const nextSnapshot = normalizeSnapshot(result, taskId) ?? { ...snapshot, state: 'stopping' }
+      const nextSnapshot = normalizeSnapshot(result, requestTaskId)
+      if (!nextSnapshot) throw invalidSnapshotError()
       setSnapshot(nextSnapshot)
       onSnapshot?.(nextSnapshot)
       setConfirmCancel(false)
@@ -612,7 +776,11 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
         setCancelError(safeErrorMessage(error, '停止任务失败，请重试'))
       }
     } finally {
-      if (!isCurrentRequest()) return
+      if (cancelControllerRef.current === controller) cancelControllerRef.current = null
+      if (isCurrentRequest()) {
+        cancelRequestedRef.current = false
+        setCancelling(false)
+      }
     }
   }
 
@@ -641,9 +809,10 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
             <ArrowLeft aria-hidden="true" size={15} strokeWidth={1.8} />
             返回任务总览
           </Link>
-          <p className="mt-5 text-xs font-medium text-label-secondary">任务监视器</p>
-          <h1 id="task-title" className="mt-1 truncate text-xl font-semibold tracking-tight">{accountLabel}</h1>
-          <p className="mt-1 truncate text-sm text-label-secondary">任务 {snapshot.id || taskId}</p>
+          <h1 id="task-title" className="mt-4 text-balance text-xl font-semibold">{accountLabel} · {terminalState ? '学习结果' : '学习进度'}</h1>
+          <p className="mt-2 text-sm tabular-nums text-label-secondary">
+            {formatDate(snapshot.started_at)} 开始 · 用时 <span aria-label="任务已用时间">{elapsed}</span>
+          </p>
         </div>
         <div className="flex items-center gap-3">
           <TaskStatus state={snapshot.state} />
@@ -673,96 +842,101 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
       </header>
 
       {reconnecting ? <Alert className="mt-5" variant="warning" aria-live="polite">正在重新连接</Alert> : null}
-      {snapshot.error ? <Alert className="mt-5" variant="danger" aria-live="polite">{snapshot.error}</Alert> : null}
+      {snapshotFormatError && requestError ? <Alert className="mt-5" variant="danger" aria-live="polite">{requestError}</Alert> : null}
 
-      <div className="mt-7 grid items-start gap-6 md:grid-cols-[minmax(0,1.1fr)_minmax(260px,0.9fr)]">
-        <section className="min-w-0 border-y border-separator bg-surface" aria-labelledby="task-progress-title">
-          <div className="border-b border-separator px-4 py-3">
-            <h2 id="task-progress-title" className="font-semibold">任务进度</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">当前账户的实时学习快照。</p>
-          </div>
-          <div className="space-y-5 px-4 py-4">
-            <TaskProgress progress={snapshot.progress} total={snapshot.total} label="总进度" />
-            <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 border-t border-separator pt-4 text-sm">
-              <dt className="text-label-secondary">账户</dt>
-              <dd className="min-w-0 truncate text-right font-medium">{accountLabel}</dd>
-              <dt className="text-label-secondary">当前课程</dt>
-              <dd className="min-w-0 truncate text-right font-medium">{snapshot.current_course ?? '—'}</dd>
-              <dt className="text-label-secondary">当前章节</dt>
-              <dd className="min-w-0 truncate text-right font-medium">{snapshot.current_chapter ?? '—'}</dd>
-              <dt className="text-label-secondary">当前视频</dt>
-              <dd className="min-w-0 truncate text-right font-medium">{currentVideo ?? '—'}</dd>
-              <dt className="text-label-secondary">已用时间</dt>
-              <dd aria-label="任务已用时间" className="min-w-0 truncate text-right font-medium tabular-nums">{elapsed}</dd>
-            </dl>
-          </div>
-        </section>
-
-        <section className="min-w-0 border-y border-separator bg-surface" aria-labelledby="task-jobs-title">
-          <div className="border-b border-separator px-4 py-3">
-            <h2 id="task-jobs-title" className="font-semibold">当前作业</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">视频和章节任务的细节。</p>
-          </div>
-          {jobs.length === 0 ? (
-            <p className="px-4 py-6 text-sm text-label-secondary">暂无进行中的作业</p>
-          ) : (
-            <div className="divide-y divide-separator">
-              {jobs.map(([key, job]) => {
-                const label = jobName(job, key)
-                const currentTime = job.current_time ?? job.currentTime
-                const duration = job.duration
-                return (
-                  <div key={key} className="space-y-2 px-4 py-4">
-                    <TaskProgress value={job.progress} label={label} showCount={false} />
-                    {currentTime !== undefined || duration !== undefined ? (
-                      <p className="text-right text-xs tabular-nums text-label-secondary">
-                        {formatDuration(currentTime)} / {formatDuration(duration)}
-                      </p>
-                    ) : null}
-                  </div>
-                )
-              })}
-            </div>
-          )}
-        </section>
-      </div>
-
-      <section className="mt-6 border-y border-separator bg-surface" aria-labelledby="task-counts-title">
-        <div className="border-b border-separator px-4 py-3">
-          <h2 id="task-counts-title" className="font-semibold">任务统计</h2>
-          <p className="mt-0.5 text-xs text-label-secondary">当前账户本次任务的聚合数量。</p>
+      <section className="mt-6 rounded-lg border border-separator bg-surface" aria-labelledby="task-progress-title">
+        <div className="px-5 pt-5">
+          <h2 id="task-progress-title" className="text-balance text-lg font-semibold">{resultHeading}</h2>
+          {snapshot.error && !/^有 \d+ 门课程尚未完成/.test(snapshot.error) ? <p className="mt-2 text-pretty text-sm leading-6 text-label-secondary">{snapshot.error}</p> : null}
+          {!terminalState && jobs.length === 0 ? (
+            <p className="mt-2 text-pretty text-sm text-label-secondary">
+              {snapshot.current_course ? `正在检查：${snapshot.current_course}${snapshot.current_chapter ? ` · ${snapshot.current_chapter}` : ''}` : '正在连接平台并读取课程，请稍候。'}
+            </p>
+          ) : null}
         </div>
-        <dl className="grid gap-4 px-4 py-4 sm:grid-cols-3">
+        <dl className="grid grid-cols-1 gap-4 px-5 py-5 sm:grid-cols-3">
           <div>
-            <dt className="text-xs text-label-secondary">课程</dt>
-            <dd aria-label="已完成课程数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.courses)}</dd>
+            <dt className="text-sm text-label-secondary">已完成课程</dt>
+            <dd aria-label="已完成课程数量" className="mt-1 text-2xl font-semibold tabular-nums">{formatCountPair(counts.courses)}</dd>
           </div>
           <div>
-            <dt className="text-xs text-label-secondary">章节</dt>
-            <dd aria-label="已完成章节数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.chapters)}</dd>
+            <dt className="text-sm text-label-secondary">已完成章节</dt>
+            <dd aria-label="已完成章节数量" className="mt-1 text-2xl font-semibold tabular-nums">{formatCountPair(counts.chapters)}</dd>
           </div>
           <div>
-            <dt className="text-xs text-label-secondary">任务</dt>
-            <dd aria-label="已完成任务数量" className="mt-1 text-sm font-semibold tabular-nums">{formatCountPair(counts.tasks)}</dd>
+            <dt className="text-sm text-label-secondary">本次读取的任务点</dt>
+            <dd aria-label="已完成任务数量" className="mt-1 text-2xl font-semibold tabular-nums">{formatCountPair(counts.tasks)}</dd>
           </div>
         </dl>
+        <div className="border-t border-separator px-5 py-3">
+          <TaskProgress progress={counts.courses.completed} total={counts.courses.total} label="课程完成进度" showCount={false} />
+          <p className="mt-2 text-pretty text-xs leading-5 text-label-secondary">数量均为已完成 / 总数。已完成章节不再读取任务点，因此任务点数量仅包含本次读取的部分。</p>
+        </div>
       </section>
 
-      <section className="mt-6 border-y border-separator bg-surface" aria-labelledby="task-courses-title">
+      {unfinished.length > 0 ? (
+        <section className="mt-5 overflow-hidden rounded-lg border border-separator bg-surface" aria-labelledby="task-issues-title">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-separator px-5 py-3">
+            <h2 id="task-issues-title" className="text-balance font-semibold">需要处理的事项</h2>
+            <span className="text-xs tabular-nums text-label-secondary">{unfinished.length} 门课程{unfinishedChapters > 0 ? ` · ${unfinishedChapters} 个章节` : ''}</span>
+          </div>
+          <UnfinishedList groups={unfinished} />
+        </section>
+      ) : terminalState && snapshot.state !== 'completed' ? (
+        <Alert className="mt-5" variant="warning">{detailsError ? '章节详情暂时未能加载，正在重试。' : '当前记录未提供可定位的未完成章节。请查看运行日志，或返回课程启动重新读取课程。'}</Alert>
+      ) : null}
+
+      {!terminalState && jobs.length > 0 ? (
+        <section className="mt-5 rounded-lg border border-separator bg-surface" aria-labelledby="task-jobs-title">
+          <div className="flex items-center justify-between border-b border-separator px-5 py-3">
+            <h2 id="task-jobs-title" className="text-balance font-semibold">正在处理</h2>
+            <span className="text-xs tabular-nums text-label-secondary">{jobs.length} 项</span>
+          </div>
+          <div className="divide-y divide-separator">
+            {jobs.map(([key, job]) => (
+              <div key={key} className="space-y-2 px-5 py-4">
+                {job.course || job.chapter ? <p className="text-pretty text-xs text-label-secondary">{[job.course, job.chapter].filter(Boolean).join(' · ')}</p> : null}
+                {job.progress !== undefined ? (
+                  <TaskProgress value={job.progress} label={jobName(job, key)} showCount={false} />
+                ) : <p className="text-pretty text-sm font-medium">{jobName(job, key)}</p>}
+                {job.current_time !== undefined || job.currentTime !== undefined || job.duration !== undefined ? (
+                  <p className="text-right text-xs tabular-nums text-label-secondary">{formatDuration(job.current_time ?? job.currentTime)} / {formatDuration(job.duration)}</p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <AnswerReport key={taskId} report={details.answer_report} stats={{ ...snapshot.stats, ...details.counts }} active={ACTIVE_STATES.has(snapshot.state)} pending={refreshingGrades} error={gradesError} onRefresh={handleRefreshGrades} />
+
+      <section className="mt-5 rounded-lg border border-separator bg-surface" aria-labelledby="task-courses-title">
         <div className="border-b border-separator px-4 py-3">
-          <h2 id="task-courses-title" className="font-semibold">课程详情</h2>
-          <p className="mt-0.5 text-xs text-label-secondary">展开课程查看章节状态。</p>
+          <h2 id="task-courses-title" className="text-balance font-semibold">全部课程</h2>
+          <p className="mt-0.5 text-xs text-label-secondary">右侧显示已完成章节 / 总章节，展开可查看每章状态。</p>
         </div>
+        {details.truncated ? (
+          <Alert className="m-4" variant="warning">
+            这条历史任务的部分课程详情已被旧版本截断，无法从历史记录恢复；新任务会完整保留课程详情。
+          </Alert>
+        ) : null}
         <TaskCourseList courses={details.courses} expanded={expandedCourses} onToggle={toggleCourse} />
       </section>
 
-      <section className="mt-6 border-y border-separator bg-surface" aria-labelledby="task-logs-title">
+      <section className="mt-5 rounded-lg border border-separator bg-surface" aria-labelledby="task-logs-title">
         <div className="border-b border-separator px-4 py-3">
-          <h2 id="task-logs-title" className="font-semibold">任务日志</h2>
-          <p className="mt-0.5 text-xs text-label-secondary">日志只属于当前任务，并按游标增量加载。</p>
+          <h2 id="task-logs-title" className="text-balance font-semibold">运行日志</h2>
+          <p className="mt-0.5 text-pretty text-xs text-label-secondary">{snapshot.error ? <>本次记录的结束原因：<span>{snapshot.error}</span></> : '保留本次运行过程，供排查具体问题。'}</p>
         </div>
+        {logs.some((entry) => entry.message === '历史敏感日志已清理') ? (
+          <Alert className="m-4" variant="warning">
+            这条任务的部分历史日志已被旧版本清理，原文无法恢复；新日志会保留进度和失败原因。
+          </Alert>
+        ) : null}
         <TaskLog items={logs} />
       </section>
+
+      <p className="mt-4 break-all text-xs text-label-tertiary">运行编号：{snapshot.id || taskId}</p>
 
       <CancelDialog
         open={confirmCancel}
@@ -784,6 +958,7 @@ function TaskPage({ account, accounts = [], onSnapshot, className }) {
 export {
   ACTIVE_STATES,
   TERMINAL_STATES,
+  KNOWN_TASK_STATES,
   normalizeDetails,
   normalizeLogPage,
   normalizeSnapshot,

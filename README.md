@@ -1,173 +1,117 @@
-﻿# 超星学习通自动化刷课工具（Web + CLI 全量可视化）
+<div align="center">
 
-<p align="center">
-  <a href="https://github.com/ymylive/chaoxing-fanya" target="_blank">
-    <img src="https://img.shields.io/github/stars/ymylive/chaoxing-fanya" alt="GitHub Stars" />
-  </a>
-  <a href="https://github.com/ymylive/chaoxing-fanya" target="_blank">
-    <img src="https://img.shields.io/github/forks/ymylive/chaoxing-fanya" alt="GitHub Forks" />
-  </a>
-  <a href="https://github.com/ymylive/chaoxing-fanya" target="_blank">
-    <img src="https://img.shields.io/github/license/ymylive/chaoxing-fanya" alt="License" />
-  </a>
-  <a href="https://github.com/ymylive/chaoxing-fanya" target="_blank">
-    <img src="https://img.shields.io/github/languages/code-size/ymylive/chaoxing-fanya" alt="Code Size" />
-  </a>
-</p>
+# Niutopia · 学习通助手
 
-> 基于 [Samueli924/chaoxing](https://github.com/Samueli924/chaoxing) 二次开发：补全 Web 可视化、OCR、题库、外部通知与便携打包能力，向原作者致敬。
+**在本机管理课程、运行学习任务，查看进度与真实答题表现。**
 
-## 功能亮点
+面向单机、本地、单用户使用的学习通 Web 工作台。
 
-- **可视化覆盖 100% 功能**：React + TailwindCSS 前端，桌面/移动自适应，实时日志与进度
-- **一键上手**：Windows `start.bat` 检查依赖后即启动前后端；支持 Docker 与便携打包
-- **题库全家桶**：Yanxi / LIKE / TikuAdapter / AI / SiliconFlow，可调覆盖率与自动提交
-- **OCR 多方案**：内置 PaddleOCR 或外部大模型（OpenAI / Claude / Qwen / SiliconFlow 等）
-- **通知渠道**：Server酱 / Qmsg / Bark / Telegram 等完成 & 错误推送
-- **CLI 同步**：命令行模式与 Web 功能一致，便于集成与自动化
+[![CI](https://img.shields.io/github/actions/workflow/status/Niutopia/chaoxing-fanya/main.yml?label=CI)](https://github.com/Niutopia/chaoxing-fanya/actions/workflows/main.yml) [![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&logoColor=white)](pyproject.toml) [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
 
-## 快速开始（推荐一键）
+[快速开始](QUICKSTART.md) · [使用指南](WEB_FRONTEND_GUIDE.md) · [功能说明](WEB_FEATURES.md) · [备份与恢复](docs/operations.md) · [问题反馈](https://github.com/Niutopia/chaoxing-fanya/issues)
+
+</div>
+
+---
+
+## 从选课到结果，都能看清楚
+
+新版工作台将账户、课程选择、学习参数和任务结果放在一起。启动后可以查看正在处理的章节、完成数量和失败原因，结束后继续保留任务历史与测验成绩。
+
+| 你要做的事 | 工作台提供的能力 |
+| --- | --- |
+| 管理自己的账户 | 密码或 Cookie Header 验证，账户与参数保存在本机 |
+| 选择学习内容 | 读取、搜索、多选课程，保存每个账户的课程选择 |
+| 执行学习任务 | 视频、音频、文档、阅读、直播及章节测验，按平台实际状态处理 |
+| 配置自动答题 | 接入兼容 Chat Completions 的服务，设置模型、并发、覆盖率和自动提交 |
+| 看懂完成情况 | 分别显示课程、章节和任务点进度，列出未完成事项 |
+| 看懂答题表现 | 正确题数 / 已判分题数、测验分数、待判分和未提交明细 |
+| 中断后继续 | 停止任务或重启服务后重新开始，读取平台已有进度与作答结果 |
+
+**完成任务、提交答案和答对题目是三个不同的结果。** 页面分别展示这些信息，待批阅题目不计入正确率分母；成绩回退时保留此前记录供对照。
+
+## 几步启动
+
+推荐使用 Docker Desktop，或已经安装 Docker Compose 的环境：
 
 ```bash
-git clone --depth=1 https://github.com/ymylive/chaoxing-fanya
+git clone https://github.com/Niutopia/chaoxing-fanya.git
 cd chaoxing-fanya
-start.bat  # Windows 双击或命令行运行
+docker compose up --build -d
 ```
 
-启动后浏览器会自动打开 `http://localhost:3000`，按界面提示登录并开始学习。
+打开 **[http://127.0.0.1:5001](http://127.0.0.1:5001)**。
 
-### 其他运行方式
+首次使用按以下顺序操作：
 
-**手动启动（前后端分开）**
-```bash
-# 后端
-pip install -r requirements.txt
-python app.py        # 默认 http://localhost:5000
+1. **添加账户**：填写超星账户信息，保存并验证。
+2. **配置答题**：需要答题时，在全局设置填写服务地址、模型和 API Key，先保存，再测试连接。
+3. **选择课程**：进入账户工作台，至少选择一门课程，确认倍速、并发及自动提交选项。
+4. **开始学习**：查看实时进度与日志；运行结束后，可刷新判分读取所选课程的已有成绩。
 
-# 前端（新终端）
-cd web
-npm ci
-npm run dev          # 默认 http://localhost:3000
-```
+已有数据保存在 Docker 命名卷中，普通停止、重启和镜像更新都会保留。初次构建需要下载依赖，稍后可用 `docker compose ps` 查看状态。
 
-**Docker（本地 Web 部署）**
+更多安装方式见 [快速开始](QUICKSTART.md)，Windows 脚本、本地开发和 CLI 也在那里说明。
+
+## 日常使用
+
+| 操作 | 命令或入口 |
+| --- | --- |
+| 查看服务 | `docker compose ps` |
+| 查看最近日志 | `docker compose logs --tail=100 web` |
+| 停止服务 | `docker compose stop web` |
+| 启动已有服务 | `docker compose up -d` |
+| 更新当前代码构建 | `docker compose up --build -d` |
+| 检查服务是否响应 | `curl -fsS http://127.0.0.1:5001/api/health` |
+| 备份、恢复或迁移 | [完整操作步骤](docs/operations.md) |
+
+**更新前先停止正在执行的学习任务。** 数据库、`secret.key` 和答案缓存需要一并备份；仅复制数据库无法完整迁移账户配置。
+
+## 答题与进度如何计算
+
+- **正确率**：平台判定完全正确的题数 ÷ 已有逐题判定的题数。待判分、未提交和无法读取判分的题目分别显示。
+- **题库覆盖率**：查到答案的比例，用于控制保存或提交；它不代表答案正确。
+- **提交成功**：平台确认接收表单；判分可能稍后才出现。
+- **课程完成**：按实际任务结果统计。未开放章节、未开始的直播和失败任务会保留未完成状态。
+- **重新开始**：先检查平台已有完成状态和测验结果；服务重启不会自动恢复旧任务的运行线程。
+
+“刷新判分”只读取成绩，不会重做或提交测验。模型答案、教师批阅和平台开放状态仍会影响最终结果，项目不承诺满分。
+
+## 功能范围
+
+新版 Web 使用共享的 AI 答题连接；其他题库适配器、外部通知和部分 OCR 配置由 CLI 或后端兼容能力提供。具体入口见 [功能对照](FEATURE_COMPARISON.md)。
+
+本地 SQLite 保存账户、偏好、任务历史和判分报告。任务异常时保留原因，测验请求另有可追踪的操作记录。完整流程验收覆盖取消后重跑、提交响应丢失、进程中断恢复和数据备份恢复，参见 [验证说明](docs/verification.md)。
+
+## 开发与文档
+
+后端使用 Python 3.13+ / Flask，前端使用 React / Vite / TailwindCSS。
 
 ```text
-Web UI:            http://127.0.0.1:5001
-Container Web:     0.0.0.0:5000
-Host answer API:   http://localhost:8849/v1
-Container target:  http://host.docker.internal:8849/v1
-Persistent data:   named volume chaoxing-data at /app/data
+chaoxing-fanya/
+├── app.py              # Web 服务入口
+├── main.py             # CLI 与共享学习调度
+├── api/                # 平台交互、任务处理、题目解析与答题
+├── webapp/             # 账户、任务管理、SQLite 持久化
+├── web/                # 新版 Web 界面
+├── tests/              # 后端与完整流程测试
+├── compose.yaml        # 本机 Docker 部署
+└── docs/               # 部署、验证与维护文档
 ```
 
-The Web UI keeps the answer-service base URL visible and saved as
-`http://localhost:8849/v1`. When the app makes an outbound request from the
-container, it translates only that loopback destination to
-`http://host.docker.internal:8849/v1`; the user's configured value is never
-rewritten in the UI or persisted settings.
+| 文档 | 适合什么时候看 |
+| --- | --- |
+| [快速开始](QUICKSTART.md) | 第一次安装，或搭建本地开发环境 |
+| [使用指南](WEB_FRONTEND_GUIDE.md) | 配置账户、答题连接和学习参数 |
+| [功能说明](WEB_FEATURES.md) | 确认页面能力、任务状态与统计口径 |
+| [部署与备份](docs/operations.md) | 更新、迁移、备份、恢复及 CLI 配置 |
+| [验证说明](docs/verification.md) | 运行测试、理解已覆盖的异常场景 |
+| [前端开发](web/README.md) | 修改和构建 Web 界面 |
 
-Start and inspect the deployment with:
+反馈问题时，请附上运行方式、具体操作、预期与实际结果，以及相关错误日志；先移除账户密码、Cookie 和 API Key。
 
-```bash
-docker compose up --build -d
-docker compose ps
-curl -fsS http://127.0.0.1:5001/api/health
-docker compose logs --tail=100 web
-container_id="$(docker compose ps -q web)"
-if [ -z "$container_id" ]; then
-  echo "无法备份：Compose 服务 web 未运行，请先执行 docker compose up -d。" >&2
-  exit 1
-fi
-data_volume="$(docker inspect "$container_id" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
-if [ -z "$data_volume" ]; then
-  echo "无法备份：运行中的 web 容器没有 /app/data 命名卷。" >&2
-  exit 1
-fi
-backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-backup.XXXXXX")"
-docker run --rm -v "${data_volume}:/source:ro" -v "$backup_dir:/backup" alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
-echo "Backup written to $backup_dir/chaoxing-data-backup.tgz"
-docker compose stop web
-```
+## 致谢与许可
 
-Enter the answer API key once in Settings using the password-style Replace API
-Key field, then save the connection through the Web UI. The key is encrypted
-in the local `chaoxing-data` volume and is not placed in `.env`, source files,
-the Dockerfile, the Compose file, the image build context, or image layers.
-Configure account limits and answer settings in Web Settings; `.env.example`
-contains deployment guidance only. The volume preserves
-accounts, preferences, and answer-connection state across container restarts.
+基于 [Samueli924/chaoxing](https://github.com/Samueli924/chaoxing) 和 [sweetcornna/chaoxing-fanya](https://github.com/sweetcornna/chaoxing-fanya) 继续开发，感谢原作者及社区贡献者。
 
-To stop the Web service without removing its data, run `docker compose stop web`.
-To back up the named volume, use the commands above; they write
-`chaoxing-data-backup.tgz` under a temporary directory outside the repository.
-
-**便携打包**
-```bash
-clean_and_build_portable.bat
-```
-生成 `chaoxing_portable` 目录，免安装 Python 直接分发。
-
-**命令行模式**
-```bash
-python main.py                               # 交互式运行（按提示输入账号密码）
-cp config.ini.example config.ini             # 首次使用时复制配置模板
-python main.py -c config.ini                 # 读取指定配置文件运行
-python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a [retry|ask|continue]
-```
-
-## 配置要点（config.ini）
-
-- **登录**：支持账号密码或 cookies.txt（同后端配置说明）
-- **题库 `[tiku]`**：`provider=Yanxi|Like|TikuAdapter|AI|SiliconFlow`；`cover_rate=0.0-1.0`；`submit=true|false`
-- **未开放任务处理 `[common]`**：`notopen_action=retry|ask|continue`（命令行可用 `-a/--notopen-action` 覆盖）
-- **通知 `[notify]`**：`provider=ServerChan|Qmsg|Bark|Telegram`，按注释填写 `url` / `token` / `chat_id` 等
-- **OCR**：
-  - 本地 PaddleOCR：安装 `paddlepaddle`、`paddlex`，并设置 `CHAOXING_ENABLE_OCR=1`
-  - 外部大模型（推荐）：
-    ```bash
-    export CHAOXING_VISION_OCR_PROVIDER=openai
-    export CHAOXING_VISION_OCR_KEY="YOUR_VISION_KEY"
-    export CHAOXING_VISION_OCR_MODEL=gpt-4o
-    # 可选：CHAOXING_VISION_OCR_ENDPOINT, CHAOXING_VISION_OCR_PROMPT
-    ```
-
-更多详细说明见 `WEB_FRONTEND_GUIDE.md`、`QUICKSTART.md`、`FEATURE_COMPARISON.md`、`WEB_FEATURES.md`。
-
-## 使用流程
-
-1) 登录：手机号+密码或上传 cookies  
-2) 选课：多选或默认全部课程  
-3) 配置：倍速、并发、题库、通知、OCR  
-4) 开始：一键启动任务，实时查看进度/日志  
-5) 监控：完成/异常自动推送（如启用通知）
-
-## 目录速览
-
-```
-chaoxing/
-├── app.py                      # Flask 后端入口
-├── main.py                     # 命令行入口
-├── start.bat                   # Windows 一键启动
-├── clean_and_build_portable.bat
-├── config.ini.example          # 配置模板
-├── api/                        # 后端接口
-├── web/                        # 前端（React + Vite + TailwindCSS）
-└── resource/                   # 静态资源、模型等
-```
-
-## 常见问题
-
-- Docker 端口被占用：确认宿主机 `127.0.0.1:5001` 未被占用；容器内 Web 服务监听 `0.0.0.0:5000`
-- 依赖安装失败：后端 `pip install -r requirements.txt --force-reinstall`；前端保留 `package-lock.json`，删除 `node_modules` 后在 `web/` 执行 `npm ci`
-- Web 页面未自动打开：手动访问 `http://127.0.0.1:5001`，查看 `docker compose ps` 与健康检查输出
-- Docker 设置未生效：打开 Web 设置页面确认配置，并检查持久化数据是否挂载到 `/app/data`
-
-## 致谢
-
-- 原项目：[Samueli924/chaoxing](https://github.com/Samueli924/chaoxing)
-- 社区贡献者与所有用户
-
-## 许可与声明
-
-- 许可证：GPL-3.0，仅允许在相同许可证下开源免费使用与再分发，禁止闭源商业化及任何盈利行为
-- 本项目仅供学习交流，使用者需自行承担法律与合规责任
+项目使用 [GNU GPL v3](LICENSE)。使用、修改和分发请遵循许可证；平台使用请遵守对应课程与服务规则。

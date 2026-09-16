@@ -8,6 +8,10 @@ const STATUS_LABELS = {
   completed: '已完成',
   failed: '失败',
   stopped: '已停止',
+  pending: '待处理',
+  not_open: '未开放',
+  skipped: '待手动完成',
+  blocked: '待条件满足',
 }
 
 const STATUS_COLORS = {
@@ -17,6 +21,9 @@ const STATUS_COLORS = {
   completed: 'bg-success',
   failed: 'bg-danger',
   stopped: 'bg-label-tertiary',
+  blocked: 'bg-warning',
+  not_open: 'bg-warning',
+  skipped: 'bg-warning',
 }
 
 const STATUS_TEXT_COLORS = {

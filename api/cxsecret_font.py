@@ -26,6 +26,9 @@ KX_RADICALS_TAB = str.maketrans(
     # 对应汉字
     "一丨丶丿乙亅二亠人儿入八冂冖冫几凵刀力勹匕匚匸十卜卩厂厶又口囗土士夂夊夕大女子宀寸小尢尸屮山巛工己巾干幺广廴廾弋弓彐彡彳心戈戶手支攴文斗斤方无日曰月木欠止歹殳毋比毛氏气水火爪父爻爿片牙牛犬玄玉瓜瓦甘生用田疋疒癶白皮皿目矛矢石示禸禾穴立竹米糸缶网羊羽老而耒耳聿肉臣自至臼舌舛舟艮色艸虍虫血行衣襾見角言谷豆豕豸貝赤走足身車辛辰辵邑酉采里金長門阜隶隹雨青非面革韋韭音頁風飛食首香馬骨高高髟鬥鬯鬲鬼魚鳥鹵鹿麥麻黃黍黑黹黽鼎鼓鼠鼻齊齒龍龜龠民齐黄马飞见母长",
 )
+# Supplemental radicals used by current platform fonts are outside the
+# original Kangxi block and need the same normalization.
+KX_RADICALS_TAB.update(str.maketrans('⻚⻛⻘', '页风青'))
 
 
 def resource_path(relative_path: str) -> str:
@@ -71,7 +74,16 @@ class FontHashDAO:
         try:
             with open(full_path, "r", encoding="utf-8") as fp:
                 self.char_map = json.load(fp)
-                self.hash_map = {hash_val: char for char, hash_val in self.char_map.items()}
+                self.hash_map = {}
+                for char, hash_val in self.char_map.items():
+                    existing = self.hash_map.get(hash_val)
+                    # Identical glyphs may represent both a Chinese radical
+                    # and a phonetic symbol. Prefer the radical that our
+                    # existing normalization maps to the ordinary character;
+                    # otherwise 广 can become ㄬ in decoded question text.
+                    if existing and self._is_normalized_radical(existing):
+                        continue
+                    self.hash_map[hash_val] = char
         except (FileNotFoundError, json.JSONDecodeError) as e:
             raise FontDecodeError(f"加载字体映射表失败: {full_path} - {e}") from e
 
@@ -86,6 +98,13 @@ class FontHashDAO:
             对应的Unicode字符编码，如果未找到则返回None
         """
         return self.hash_map.get(font_hash)
+
+    @staticmethod
+    def _is_normalized_radical(name: str) -> bool:
+        try:
+            return name.startswith('uni') and int(name[3:], 16) in KX_RADICALS_TAB
+        except ValueError:
+            return False
 
     def find_hash(self, char: str) -> Optional[str]:
         """
@@ -103,8 +122,8 @@ class FontHashDAO:
 # 初始化字体哈希DAO单例
 try:
     fonthash_dao = FontHashDAO()
-except Exception as e:
-    logger.warning(f"初始化字体哈希数据失败 - {e}")
+except Exception:
+    logger.warning("初始化字体哈希数据失败（异常内容已省略）")
     fonthash_dao = FontHashDAO.__new__(FontHashDAO)
     fonthash_dao.char_map = {}
     fonthash_dao.hash_map = {}

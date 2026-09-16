@@ -96,3 +96,29 @@ test('does not report an in-flight rejection after unmount', async () => {
   expect(loader).toHaveBeenCalledTimes(1)
   vi.useRealTimers()
 })
+
+test('passes a per-round signal and aborts it when polling is disabled', async () => {
+  vi.useFakeTimers()
+  let requestSignal
+  let rejectLoader
+  const loader = vi.fn((signal) => {
+    requestSignal = signal
+    return new Promise((_, reject) => {
+      rejectLoader = reject
+    })
+  })
+  const onError = vi.fn()
+  const { rerender } = renderHook(
+    ({ enabled }) => usePolling(loader, { enabled, intervalMs: 2000, onError }),
+    { initialProps: { enabled: true } },
+  )
+
+  await Promise.resolve()
+  expect(requestSignal).toBeInstanceOf(AbortSignal)
+  rerender({ enabled: false })
+  expect(requestSignal.aborted).toBe(true)
+  rejectLoader(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+  await Promise.resolve()
+  expect(onError).not.toHaveBeenCalled()
+  vi.useRealTimers()
+})

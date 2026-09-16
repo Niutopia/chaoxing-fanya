@@ -50,8 +50,8 @@ class FontDecoder:
             font_base64 = match.group(1)
             font_data_url = self.FONT_DATA_URL_PREFIX + font_base64
             self.__font_map = cxfont.font2map(font_data_url)
-        except Exception as e:
-            logger.warning(f"初始化字体映射失败: {e}")
+        except Exception:
+            logger.warning("初始化字体映射失败（异常内容已省略）")
             self.__font_map = None
     
     def decode(self, target_str: str) -> str:

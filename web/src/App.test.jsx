@@ -1,8 +1,10 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation } from 'react-router-dom'
-import { vi } from 'vitest'
-import { RouteTree } from './App'
+import { beforeEach, vi } from 'vitest'
+import { listAccounts } from './api/accounts'
+import { listTasks } from './api/tasks'
+import { AppContent, RouteTree } from './App'
 
 vi.mock('./api/accounts', () => ({
   createAccount: vi.fn(),
@@ -16,6 +18,10 @@ vi.mock('./api/accounts', () => ({
 vi.mock('./api/tasks', () => ({
   listTasks: vi.fn(),
 }))
+
+beforeEach(() => {
+  vi.clearAllMocks()
+})
 
 function LocationProbe() {
   const location = useLocation()
@@ -88,4 +94,51 @@ test('clicking the backdrop closes the routed new-account dialog without reopeni
   await expectDismissedToEmptyOverview(async ({ dialog, user }) => {
     await user.click(dialog.previousElementSibling)
   })
+})
+
+test('aborts the overview transport when the app unmounts', async () => {
+  let accountSignal
+  let taskSignal
+  listAccounts.mockImplementation(({ signal }) => {
+    accountSignal = signal
+    return new Promise(() => {})
+  })
+  listTasks.mockImplementation(({ signal }) => {
+    taskSignal = signal
+    return new Promise(() => {})
+  })
+
+  const { unmount } = render(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <AppContent />
+    </MemoryRouter>,
+  )
+  await waitFor(() => expect(listAccounts).toHaveBeenCalledTimes(1))
+  expect(accountSignal.aborted).toBe(false)
+  expect(taskSignal.aborted).toBe(false)
+
+  unmount()
+
+  expect(accountSignal.aborted).toBe(true)
+  expect(taskSignal.aborted).toBe(true)
+})
+
+
+test('overview refreshes grading after it changes in the background', async () => {
+  vi.useFakeTimers()
+  listAccounts.mockResolvedValue([{ id: 'a', name: 'Example', enabled: true }])
+  const task = { id: 'task', account_id: 'a', state: 'completed', progress: 1, total: 1 }
+  let stats = {}
+  listTasks.mockImplementation(() => Promise.resolve([{ ...task, stats }]))
+  const { unmount } = render(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AppContent /></MemoryRouter>)
+  try {
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByLabelText('答题正确率')).toHaveTextContent('—')
+    stats = { answer_correct_questions: 9, answer_graded_questions: 10, answer_scope_current_courses: 1 }
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
+    expect(screen.getByLabelText('答题正确率')).toHaveTextContent('90%')
+  } finally {
+    unmount()
+    vi.useRealTimers()
+  }
 })

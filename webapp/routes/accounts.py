@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import math
-import re
 from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
+from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -16,7 +16,21 @@ from ..account_service import (
     AccountValidationError,
     CourseRetrievalError,
 )
+from ..config_security import (
+    is_sensitive_config_key as _is_sensitive_config_key,
+    normalize_config_key,
+)
 from ..models import AccountPreferences
+from ..limits import (
+    MAX_ACCOUNT_NAME_LENGTH,
+    MAX_ACCOUNT_PASSWORD_LENGTH,
+    MAX_ACCOUNT_USERNAME_LENGTH,
+    MAX_COOKIE_HEADER_LENGTH,
+    MAX_COURSE_ID_LENGTH,
+    MAX_SELECTED_COURSE_IDS,
+    validate_config_shape,
+    validate_cookie_mapping,
+)
 
 
 accounts = Blueprint("accounts", __name__, url_prefix="/api/accounts")
@@ -123,11 +137,11 @@ def _account_data(profile) -> dict[str, Any]:
 def _preferences_data(preferences: AccountPreferences) -> dict[str, Any]:
     """Serialize preferences without returning account-owned secrets.
 
-    Account notification and OCR settings are consumed by workers, so their
-    stored values still need to remain available on the server.  They must
-    never be sent back through this public endpoint, though: return only
-    ordinary configuration values plus presence/mask metadata for fields that
-    can contain credentials or private destinations.
+    OCR settings remain available to the Web worker chain, while notification
+    settings are retained only as a legacy/deprecated database/API contract.
+    Their stored values must never be sent back through this public endpoint:
+    return only ordinary configuration values plus presence/mask metadata for
+    fields that can contain credentials or private destinations.
     """
 
     return {
@@ -141,7 +155,9 @@ def _preferences_data(preferences: AccountPreferences) -> dict[str, Any]:
         "notification_config": _safe_config(
             preferences.notification_config, notification=True
         ),
-        "ocr_config": _safe_config(preferences.ocr_config),
+        "ocr_config": _safe_config(
+            preferences.ocr_config, include_destinations=True
+        ),
     }
 
 
@@ -149,8 +165,7 @@ _CONFIG_MASK = "Configured (••••)"
 
 
 def _config_key(key: Any) -> str:
-    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key).strip())
-    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalize_config_key(key)
 
 
 def _config_compact_key(key: Any) -> str:
@@ -164,43 +179,6 @@ def _is_config_metadata_key(key: Any) -> bool:
         or normalized.endswith("_mask")
         or normalized.endswith("_configured")
     )
-
-
-def _is_sensitive_config_key(key: Any, *, notification: bool = False) -> bool:
-    """Recognize credential and private-destination aliases in config maps."""
-
-    compact = _config_compact_key(key)
-    if not compact:
-        return False
-
-    # Keep this deliberately provider-agnostic.  Integrations frequently use
-    # ``key``/``apikey``/``authorization`` aliases, including nested maps.
-    if (
-        compact == "key"
-        or any(
-            marker in compact
-            for marker in (
-                "apikey",
-                "accesstoken",
-                "accesskey",
-                "token",
-                "secret",
-                "authorization",
-                "password",
-                "credential",
-                "cookie",
-                "privatekey",
-            )
-        )
-    ):
-        return True
-
-    if notification and any(
-        marker in compact
-        for marker in ("url", "uri", "endpoint", "webhook", "chatid", "chat")
-    ):
-        return True
-    return False
 
 
 def _masked_config_value(value: Any) -> tuple[bool, str | None]:
@@ -217,7 +195,12 @@ def _masked_config_value(value: Any) -> tuple[bool, str | None]:
     return present, _CONFIG_MASK if present else None
 
 
-def _safe_config(value: Any, *, notification: bool = False) -> dict[str, Any]:
+def _safe_config(
+    value: Any,
+    *,
+    notification: bool = False,
+    include_destinations: bool | None = None,
+) -> dict[str, Any]:
     """Deeply redact secret-bearing config values for a public response."""
 
     if not isinstance(value, Mapping):
@@ -229,24 +212,50 @@ def _safe_config(value: Any, *, notification: bool = False) -> dict[str, Any]:
         # not persist its derived metadata as if it were provider config.
         if _is_config_metadata_key(key):
             continue
-        if _is_sensitive_config_key(key, notification=notification):
+        if _is_sensitive_config_key(
+            key,
+            notification=notification,
+            include_destinations=include_destinations,
+        ):
             present, mask = _masked_config_value(item)
             normalized = _config_key(key)
             result[f"has_{normalized}"] = present
             result[f"{normalized}_mask"] = mask
             continue
-        if isinstance(item, Mapping):
-            result[str(key)] = _safe_config(item, notification=notification)
-        elif isinstance(item, list):
-            result[str(key)] = [
-                _safe_config(entry, notification=notification)
-                if isinstance(entry, Mapping)
-                else entry
-                for entry in item
-            ]
-        elif isinstance(item, (str, int, float, bool)) or item is None:
-            result[str(key)] = item
+        result[str(key)] = _safe_config_item(
+            item,
+            notification=notification,
+            include_destinations=include_destinations,
+        )
     return result
+
+
+def _safe_config_item(
+    value: Any,
+    *,
+    notification: bool = False,
+    include_destinations: bool | None = None,
+) -> Any:
+    """Recursively sanitize a JSON-compatible config value."""
+
+    if isinstance(value, Mapping):
+        return _safe_config(
+            value,
+            notification=notification,
+            include_destinations=include_destinations,
+        )
+    if isinstance(value, (list, tuple)):
+        return [
+            _safe_config_item(
+                entry,
+                notification=notification,
+                include_destinations=include_destinations,
+            )
+            for entry in value
+        ]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
 
 
 def _merge_config(
@@ -284,6 +293,104 @@ def _merge_config(
     return result
 
 
+_OCR_ENDPOINT_KEYS = frozenset(
+    {"endpoint", "ocrendpoint", "httpendpoint", "fallbackendpoint", "url"}
+)
+
+
+def _ocr_endpoint(config: Any) -> str | None:
+    """Return the configured OCR endpoint from a provider mapping.
+
+    OCR integrations in the wild use both ``endpoint`` and the legacy
+    ``ocr_endpoint``/``http_endpoint`` spellings.  We compare only the
+    endpoint value; loopback and private-network addresses remain valid and
+    are deliberately not blocked here.
+    """
+
+    if not isinstance(config, Mapping):
+        return None
+    for raw_key, value in config.items():
+        compact = _config_compact_key(raw_key)
+        if compact in _OCR_ENDPOINT_KEYS and isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return _normalize_ocr_endpoint(candidate)
+    return None
+
+
+def _normalize_ocr_endpoint(endpoint: str) -> str:
+    """Validate a custom OCR URL while preserving local-network services."""
+
+    if not isinstance(endpoint, str):
+        raise ValueError("invalid OCR endpoint")
+    candidate = endpoint.strip()
+    if not candidate or candidate != endpoint or any(
+        character.isspace() for character in candidate
+    ):
+        raise ValueError("invalid OCR endpoint")
+    try:
+        parsed = urlsplit(candidate)
+        # Accessing ``port`` is itself validation for malformed values.
+        parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("invalid OCR endpoint") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid OCR endpoint")
+    # A trailing slash does not identify a different OCR service.
+    return candidate.rstrip("/")
+
+
+def _ocr_key_is_explicit(config: Any) -> bool:
+    """Whether an incoming OCR config contains a non-blank replacement key."""
+
+    if not isinstance(config, Mapping):
+        return False
+    for raw_key, value in config.items():
+        if _is_sensitive_config_key(raw_key, notification=False):
+            if value is not None and not isinstance(value, (Mapping, list)):
+                if str(value).strip():
+                    return True
+        elif isinstance(value, Mapping):
+            if _ocr_key_is_explicit(value):
+                return True
+        elif isinstance(value, list):
+            if any(_ocr_key_is_explicit(item) for item in value):
+                return True
+    return False
+
+
+def _validate_ocr_endpoint_change(
+    current: AccountPreferences, incoming: Any
+) -> None:
+    """Require a fresh OCR key when a saved custom endpoint changes.
+
+    Blank/omitted keys normally mean "keep the saved key" for partial
+    preference updates.  That rule is unsafe across endpoints, because the
+    old credential could be sent to an unrelated service.  Requiring a
+    non-blank key for an endpoint change preserves local/private endpoints
+    while preventing accidental cross-service credential reuse.
+    """
+
+    if not isinstance(incoming, Mapping):
+        return
+    old_endpoint = _ocr_endpoint(current.ocr_config)
+    new_endpoint = _ocr_endpoint(incoming)
+    if new_endpoint is None:
+        return
+    if (old_endpoint or "") == new_endpoint:
+        return
+    if not _ocr_key_is_explicit(incoming):
+        raise ValueError("a new OCR endpoint requires an explicit API key")
+
+
 def _json_mapping() -> Mapping[str, Any] | None:
     payload = request.get_json(silent=True)
     return payload if isinstance(payload, Mapping) else None
@@ -301,14 +408,13 @@ def _parse_cookies(value: Any) -> dict[str, str] | None:
     if value is None:
         return None
     if isinstance(value, Mapping):
-        parsed: dict[str, str] = {}
-        for key, item in value.items():
-            key_text = str(key).strip()
-            if not key_text:
-                raise ValueError("invalid cookies")
-            parsed[key_text] = str(item)
-        return parsed
+        try:
+            return validate_cookie_mapping(value)
+        except (TypeError, ValueError):
+            raise ValueError("invalid cookies") from None
     if not isinstance(value, str):
+        raise ValueError("invalid cookies")
+    if len(value) > MAX_COOKIE_HEADER_LENGTH:
         raise ValueError("invalid cookies")
 
     parsed = {}
@@ -323,7 +429,10 @@ def _parse_cookies(value: Any) -> dict[str, str] | None:
         if not key:
             raise ValueError("invalid cookies")
         parsed[key] = item.strip()
-    return parsed
+    try:
+        return validate_cookie_mapping(parsed)
+    except (TypeError, ValueError):
+        raise ValueError("invalid cookies") from None
 
 
 def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, Any]:
@@ -334,17 +443,28 @@ def _account_payload(payload: Mapping[str, Any], *, partial: bool) -> dict[str, 
     values: dict[str, Any] = {}
     if not partial or "name" in payload:
         name = payload.get("name")
-        if not isinstance(name, str) or not name.strip():
+        if (
+            not isinstance(name, str)
+            or len(name) > MAX_ACCOUNT_NAME_LENGTH
+            or not name.strip()
+        ):
             raise ValueError("invalid account name")
         values["name"] = name.strip()
     if not partial or "username" in payload:
         username = payload.get("username")
-        if not isinstance(username, str) or not username.strip():
+        if (
+            not isinstance(username, str)
+            or len(username) > MAX_ACCOUNT_USERNAME_LENGTH
+            or not username.strip()
+        ):
             raise ValueError("invalid account username")
         values["username"] = username.strip()
     if "password" in payload:
         password = payload["password"]
-        if password is not None and not isinstance(password, str):
+        if password is not None and (
+            not isinstance(password, str)
+            or len(password) > MAX_ACCOUNT_PASSWORD_LENGTH
+        ):
             raise ValueError("invalid account password")
         # Empty secret fields mean "keep the existing value" in the edit UI.
         # Omitting the field is also important for the active-task guard: a
@@ -407,10 +527,21 @@ def _preferences_payload(
     baseline["ocr_config"] = deepcopy(current.ocr_config)
     for field, value in payload.items():
         if field == "notification_config":
+            # Keep this legacy/deprecated API field writable for compatibility;
+            # the Web execution path does not use it to send notifications.
+            try:
+                validate_config_shape(value, field_name="notification_config")
+            except (TypeError, ValueError):
+                raise ValueError("invalid preference config") from None
             baseline[field] = _merge_config(
                 current.notification_config, value, notification=True
             )
         elif field == "ocr_config":
+            try:
+                validate_config_shape(value, field_name="ocr_config")
+            except (TypeError, ValueError):
+                raise ValueError("invalid preference config") from None
+            _validate_ocr_endpoint_change(current, value)
             baseline[field] = _merge_config(current.ocr_config, value)
         else:
             baseline[field] = value
@@ -418,6 +549,10 @@ def _preferences_payload(
     selected = baseline["selected_course_ids"]
     if not isinstance(selected, list) or not all(
         isinstance(course_id, str) for course_id in selected
+    ):
+        raise ValueError("invalid selected courses")
+    if len(selected) > MAX_SELECTED_COURSE_IDS or any(
+        len(course_id) > MAX_COURSE_ID_LENGTH for course_id in selected
     ):
         raise ValueError("invalid selected courses")
 
@@ -445,6 +580,12 @@ def _preferences_payload(
     ocr = baseline["ocr_config"]
     if not isinstance(notification, Mapping) or not isinstance(ocr, Mapping):
         raise ValueError("invalid preference config")
+    try:
+        validate_config_shape(notification, field_name="notification_config")
+        validate_config_shape(ocr, field_name="ocr_config")
+        _ocr_endpoint(ocr)
+    except (TypeError, ValueError):
+        raise ValueError("invalid preference config") from None
 
     return AccountPreferences(
         selected_course_ids=list(selected),

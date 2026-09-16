@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { MoreHorizontal, Plus, Trash2, X } from 'lucide-react'
+import { MoreHorizontal, Trash2, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { deleteAccount, listAccounts, setAccountEnabled, verifyAccount } from '../api/accounts'
 import { listTasks } from '../api/tasks'
@@ -9,6 +9,7 @@ import Alert from '../components/ui/Alert'
 import Button from '../components/ui/Button'
 import Progress from '../components/ui/Progress'
 import StatusDot from '../components/ui/StatusDot'
+import AnswerAccuracy from '../components/tasks/AnswerAccuracy'
 import { cn } from '../lib/utils'
 
 const TASK_LABELS = {
@@ -75,6 +76,12 @@ function requestMessage(error, fallback) {
   return typeof message === 'string' && message.trim() ? message : fallback
 }
 
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
+}
+
 function accountField(account, snakeCase, camelCase = snakeCase) {
   return account?.[snakeCase] ?? account?.[camelCase]
 }
@@ -114,7 +121,7 @@ function mergedAccount(previous, next) {
   return { ...previous, ...safeNext }
 }
 
-function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
+function AccountActionsMenu({ account, open, pending = false, onToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
   const triggerRef = useRef(null)
   const itemRefs = useRef([])
@@ -203,6 +210,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   }
 
   const runAction = (action, { restoreFocus = false } = {}) => {
+    if (pending) return
     closeMenu(restoreFocus)
     action()
   }
@@ -223,6 +231,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
         aria-label={`${account.name}的更多操作`}
         aria-haspopup="menu"
         aria-expanded={open}
+        disabled={pending}
         onClick={onToggle}
       >
         <MoreHorizontal aria-hidden="true" size={17} strokeWidth={1.8} />
@@ -242,6 +251,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
               type="button"
               role="menuitem"
               tabIndex={-1}
+              disabled={pending}
               className={cn(
                 'touch-target touch-target-compact flex min-h-9 w-full items-center gap-2 rounded px-2.5 text-left text-sm hover:bg-black/[0.05] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue',
                 item.danger ? 'text-danger hover:bg-danger/[0.06] focus-visible:ring-danger' : 'text-label-primary',
@@ -258,7 +268,7 @@ function AccountActionsMenu({ account, open, onToggle, onEdit, onVerify, onToggl
   )
 }
 
-function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
+function AccountRow({ account, task, actionError, menuOpen, pending, onMenuToggle, onEdit, onVerify, onToggleEnabled, onDelete }) {
   const enabled = accountField(account, 'enabled') !== false
   const state = enabled ? task?.state ?? 'idle' : 'disabled'
   const label = enabled ? taskStateLabel(state) : '已停用'
@@ -267,7 +277,6 @@ function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit
   const progress = Number(task?.progress)
   const total = Number(task?.total)
   const safeProgress = Number.isFinite(progress) ? Math.max(progress, 0) : 0
-  const safeTotal = Number.isFinite(total) && total > 0 ? total : 1
   const verificationStatus = accountField(account, 'verification_status', 'verificationStatus')
   const verificationLabel = {
     valid: '已验证',
@@ -277,96 +286,77 @@ function AccountRow({ account, task, actionError, menuOpen, onMenuToggle, onEdit
   const username = accountField(account, 'username')
   const taskId = taskIdOf(task)
 
+  const stats = task?.stats ?? {}
+  const completedCourses = Number.isFinite(Number(stats.completed_courses)) ? Number(stats.completed_courses) : safeProgress
+  const totalCourses = Number.isFinite(Number(stats.total_courses)) ? Number(stats.total_courses) : (Number.isFinite(total) && total > 0 ? total : null)
+  const completedChapters = stats.completed_chapters
+  const totalChapters = stats.total_chapters
+  const active = ACTIVE_TASK_STATES.has(task?.state)
+  const ended = task && !active
+  const remaining = totalCourses === null ? null : Math.max(0, totalCourses - completedCourses)
+  const resultTitle = !enabled ? '账户已停用'
+    : !task ? '准备开始学习'
+      : active ? (state === 'stopping' ? '正在停止学习' : '学习任务进行中')
+        : task.state === 'completed' ? '所选课程已全部完成'
+          : task.state === 'stopped' ? '学习已停止，可继续运行'
+            : remaining > 0 ? `还有 ${remaining} 门课程需要处理` : '本次运行需要检查'
+
   return (
-    <div
-      role="row"
+    <article
+      aria-label={`${account.name}的学习概况`}
       data-account-id={account.id}
-      className={cn(
-        'grid gap-4 border-t border-separator px-4 py-4 md:grid-cols-[minmax(180px,1.1fr)_minmax(180px,1fr)_minmax(180px,1.1fr)_auto] md:items-center',
-        !enabled && 'bg-black/[0.025] text-label-secondary',
-      )}
+      className={cn('rounded-xl border border-separator bg-surface', !enabled && 'text-label-secondary')}
     >
-      <div role="cell" className="min-w-0">
-        <div className="flex min-w-0 items-center gap-2">
-          <StatusDot
-            status={state}
-            label={`${account.name}：${label}`}
-          />
-          <span className="min-w-0 truncate font-medium text-label-primary">{account.name}</span>
+      <header className="flex items-center justify-between gap-4 px-5 py-5 sm:px-6">
+        <div className="flex min-w-0 items-center gap-3">
+          <div aria-hidden="true" className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-accent-blue/10 text-lg font-semibold text-accent-blue">{String(account.name || '账').slice(0, 1).toUpperCase()}</div>
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-semibold text-label-primary">{account.name}</h2>
+            <p className="mt-1 text-xs text-label-secondary">
+              <span title="手机号已遮罩">{maskUsername(username)}</span>
+              {verificationLabel ? <span className="ml-2">· {verificationLabel}</span> : null}
+            </p>
+          </div>
         </div>
-        <p className="mt-1 truncate text-xs text-label-secondary">
-          <span title="手机号已遮罩">{maskUsername(username)}</span>
-          {verificationLabel ? <span className="ml-2">· {verificationLabel}</span> : null}
-        </p>
-      </div>
-
-      <div role="cell" className="min-w-0">
-        <div className="flex items-center gap-2 text-sm">
-          <span className={cn('font-medium', !enabled && 'text-label-secondary')}>{label}</span>
-          {task?.error ? (
-            <span className="truncate text-xs text-danger" title={task.error}>
-              {task.error}
-            </span>
-          ) : null}
+        <div className="flex shrink-0 items-center gap-3">
+          <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full bg-canvas px-3 py-1.5 text-xs font-medium">
+            <StatusDot status={state} label={`${account.name}：${label}`} />{label}
+          </span>
+          <AccountActionsMenu account={account} open={menuOpen} pending={pending} onToggle={onMenuToggle} onEdit={onEdit} onVerify={onVerify} onToggleEnabled={onToggleEnabled} onDelete={onDelete} />
         </div>
-        <dl className="mt-1 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 text-xs leading-5 text-label-secondary">
-          <dt>课程</dt>
-          <dd className="truncate">{currentCourse || '—'}</dd>
-          <dt>章节</dt>
-          <dd className="truncate">{currentChapter || '—'}</dd>
-        </dl>
+      </header>
+
+      <div className="grid gap-5 border-t border-separator px-5 py-5 sm:grid-cols-3 sm:px-6">
+        <div>
+          <p className="text-xs text-label-secondary">已完成课程</p>
+          <p className="mt-2 text-2xl font-semibold tabular-nums text-label-primary">{task && totalCourses !== null ? <>{completedCourses}<span className="ml-1 text-base font-normal text-label-secondary">/ {totalCourses} 门</span></> : '—'}</p>
+          {task && totalCourses > 0 ? <Progress value={completedCourses} max={totalCourses} aria-label={`${account.name}课程完成进度`} className="mt-3 max-w-xs" /> : null}
+        </div>
+        <div className="sm:border-l sm:border-separator sm:pl-6">
+          <p className="text-xs text-label-secondary">已完成章节</p>
+          <p className="mt-2 text-2xl font-semibold tabular-nums text-label-primary">{completedChapters !== undefined && totalChapters !== undefined ? <>{completedChapters}<span className="ml-1 text-base font-normal text-label-secondary">/ {totalChapters} 章</span></> : '—'}</p>
+          <p className="mt-2 text-xs text-label-secondary">{ended ? '最近一次运行的完成情况' : task ? '随学习进度更新' : '启动学习后显示进度'}</p>
+        </div>
+        <div className="sm:border-l sm:border-separator sm:pl-6"><AnswerAccuracy stats={stats} compact /></div>
       </div>
 
-      <div role="cell" className="min-w-0">
-        <Progress
-          value={enabled ? safeProgress : 0}
-          max={safeTotal}
-          label={`${account.name}任务进度`}
-          showValue
-        />
-      </div>
-
-      <div role="cell" className="flex justify-end">
-        <div className="flex items-center gap-2">
-          {enabled && taskId != null && ACTIVE_TASK_STATES.has(task?.state) ? (
-            <Link
-              to={`/tasks/${encodeURIComponent(String(taskId))}`}
-              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            >
-              查看任务
-            </Link>
-          ) : enabled && taskId != null && ['failed', 'stopped', 'completed'].includes(task?.state) ? (
-            <Link
-              to={`/tasks/${encodeURIComponent(String(taskId))}`}
-              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            >
-              {task?.state === 'failed' ? '查看错误' : '查看结果'}
-            </Link>
-          ) : enabled ? (
-            <Link
-              to={`/accounts/${encodeURIComponent(account.id)}/launch`}
-              className="touch-target touch-target-compact inline-flex min-h-8 items-center rounded-md px-2.5 text-sm font-medium text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            >
-              配置并开始
+      <footer className="flex flex-wrap items-center justify-between gap-4 rounded-b-xl border-t border-separator bg-canvas/60 px-5 py-4 sm:px-6">
+        <div className="min-w-0 flex-1 basis-64">
+          <p className="text-sm font-medium text-label-primary">{resultTitle}</p>
+          {active && (currentCourse || currentChapter) ? <p className="mt-1 text-pretty text-sm text-label-secondary">{[currentCourse, currentChapter].filter(Boolean).join(' · ')}</p> : null}
+          {task?.error ? <p className="mt-1 break-words text-pretty text-xs leading-5 text-label-secondary">{task.error}</p> : !task ? <p className="mt-1 text-xs text-label-secondary">选择课程后即可启动，运行结果会保留在这里。</p> : null}
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {enabled && taskId != null ? (
+            <Link to={`/tasks/${encodeURIComponent(String(taskId))}`} className="touch-target touch-target-compact inline-flex items-center justify-center rounded-lg border border-separator bg-surface px-3.5 py-2 text-sm font-medium text-label-primary hover:bg-canvas focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
+              {active ? '查看任务' : task.state === 'failed' ? '查看错误' : '查看结果'}
             </Link>
           ) : null}
-          <AccountActionsMenu
-            account={account}
-            open={menuOpen}
-            onToggle={onMenuToggle}
-            onEdit={onEdit}
-            onVerify={onVerify}
-            onToggleEnabled={onToggleEnabled}
-            onDelete={onDelete}
-          />
+          {enabled && !active ? <Link to={`/accounts/${encodeURIComponent(account.id)}/launch`} className="touch-target touch-target-compact inline-flex items-center justify-center rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-medium text-white hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2">{task ? '选择课程' : '配置并开始'}</Link> : null}
         </div>
-      </div>
-      {actionError ? (
-        <div className="md:col-span-4">
-          <Alert variant="danger" aria-live="polite">{actionError}</Alert>
-        </div>
-      ) : null}
-    </div>
+      </footer>
+      {actionError ? <Alert className="m-5" variant="danger" aria-live="polite">{actionError}</Alert> : null}
+    </article>
   )
 }
 
@@ -378,6 +368,12 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
         <Dialog.Content
           className="fixed left-1/2 top-1/2 z-50 w-[min(420px,calc(100vw-32px))] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-separator bg-surface p-5 text-label-primary outline-none"
           aria-describedby="delete-account-description"
+          onEscapeKeyDown={(event) => {
+            if (pending) event.preventDefault()
+          }}
+          onPointerDownOutside={(event) => {
+            if (pending) event.preventDefault()
+          }}
         >
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
@@ -394,6 +390,7 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
                 type="button"
                 className="touch-target touch-target-compact inline-flex size-8 shrink-0 items-center justify-center rounded-md text-label-secondary hover:bg-black/[0.06] hover:text-label-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                 aria-label="关闭删除确认对话框"
+                disabled={pending}
               >
                 <X aria-hidden="true" size={17} strokeWidth={1.8} />
               </button>
@@ -408,11 +405,11 @@ function DeleteAccountDialog({ account, pending, error, onOpenChange, onConfirm 
 
           <div className="mt-5 flex justify-end gap-2 border-t border-separator pt-4">
             <Dialog.Close asChild>
-              <Button type="button" variant="ghost">
+              <Button type="button" variant="ghost" disabled={pending}>
                 取消
               </Button>
             </Dialog.Close>
-            <Button type="button" variant="destructive" loading={pending} onClick={onConfirm}>
+            <Button type="button" variant="destructive" disabled={pending} loading={pending} onClick={onConfirm}>
               确认删除
             </Button>
           </div>
@@ -428,6 +425,7 @@ function OverviewPage({
   loading: suppliedLoading,
   error: suppliedError,
   onRefresh,
+  refreshWarning = false,
   onAccountsChange,
   onTasksChange,
   onAccountSaved: reportAccountSaved,
@@ -442,11 +440,18 @@ function OverviewPage({
   const [confirmAccount, setConfirmAccount] = useState(null)
   const [confirmPending, setConfirmPending] = useState(false)
   const [confirmError, setConfirmError] = useState('')
-  const [pendingAccountId, setPendingAccountId] = useState(null)
+  const [pendingAccountIds, setPendingAccountIds] = useState({})
+  const [pendingAccountActions, setPendingAccountActions] = useState({})
   const [actionMessage, setActionMessage] = useState('')
   const [actionErrors, setActionErrors] = useState({})
-  const emptyActionRef = useRef(null)
   const requestIdRef = useRef(0)
+  const loadControllerRef = useRef(null)
+  const pendingAccountIdsRef = useRef(new Set())
+  const mountedRef = useRef(false)
+  const accountOperationRef = useRef(new Map())
+  const accountGenerationRef = useRef(new Map())
+  const deleteOperationRef = useRef(null)
+  const deleteGenerationRef = useRef(0)
   const controlledData = suppliedAccounts !== undefined
     || suppliedTasks !== undefined
     || suppliedLoading !== undefined
@@ -462,28 +467,51 @@ function OverviewPage({
   const visibleError = suppliedError !== undefined ? String(suppliedError || '') : error
 
   const loadData = useCallback(async () => {
+    loadControllerRef.current?.abort()
+    const controller = new AbortController()
+    loadControllerRef.current = controller
     const requestId = ++requestIdRef.current
     setLoading(true)
     setError('')
     try {
-      const [accountResult, taskResult] = await Promise.all([listAccounts(), listTasks()])
-      if (requestId !== requestIdRef.current) return
+      const [accountResult, taskResult] = await Promise.all([
+        listAccounts({ signal: controller.signal }),
+        listTasks({ signal: controller.signal }),
+      ])
+      if (!mountedRef.current || controller.signal.aborted || requestId !== requestIdRef.current) return
       setAccounts(asArray(accountResult, 'accounts').map(publicAccount).filter((account) => account?.id))
       setTasks(asArray(taskResult, 'tasks'))
     } catch (requestError) {
-      if (requestId !== requestIdRef.current) return
+      if (!mountedRef.current || requestId !== requestIdRef.current || isAborted(requestError, controller.signal)) return
       setError(requestMessage(requestError, '账户概览加载失败，请重试'))
     } finally {
-      if (requestId === requestIdRef.current) setLoading(false)
+      if (loadControllerRef.current === controller) loadControllerRef.current = null
+      if (mountedRef.current && !controller.signal.aborted && requestId === requestIdRef.current) setLoading(false)
     }
   }, [])
 
   const refreshData = typeof onRefresh === 'function' ? onRefresh : loadData
 
   useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      requestIdRef.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
+      accountOperationRef.current.forEach((operation) => operation.controller.abort())
+      accountOperationRef.current.clear()
+      deleteOperationRef.current?.controller.abort()
+      deleteOperationRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
     if (!controlledData) loadData()
     return () => {
       requestIdRef.current += 1
+      loadControllerRef.current?.abort()
+      loadControllerRef.current = null
     }
   }, [controlledData, loadData])
 
@@ -493,18 +521,6 @@ function OverviewPage({
     }
     if (suppliedTasks !== undefined) setTasks(Array.isArray(suppliedTasks) ? suppliedTasks : [])
   }, [suppliedAccounts, suppliedTasks])
-
-  useEffect(() => {
-    if (!visibleLoading && !visibleError && visibleAccounts.length === 0) emptyActionRef.current?.focus()
-  }, [visibleAccounts.length, visibleError, visibleLoading])
-
-  const openAddDialog = () => {
-    setMenuAccountId(null)
-    setEditingAccount(null)
-    setActionMessage('')
-    setActionErrors({})
-    setDialogOpen(true)
-  }
 
   const openEditDialog = (account) => {
     setMenuAccountId(null)
@@ -539,18 +555,73 @@ function OverviewPage({
     })
   }
 
+  const beginAccountAction = (accountId, accountName, action) => {
+    const key = String(accountId)
+    if (!mountedRef.current || pendingAccountIdsRef.current.has(key)) return null
+    const generation = (accountGenerationRef.current.get(key) ?? 0) + 1
+    const operation = {
+      accountId,
+      controller: new AbortController(),
+      generation,
+      key,
+    }
+    accountGenerationRef.current.set(key, generation)
+    accountOperationRef.current.set(key, operation)
+    pendingAccountIdsRef.current.add(key)
+    setPendingAccountIds((current) => ({ ...current, [key]: true }))
+    setPendingAccountActions((current) => ({
+      ...current,
+      [key]: { accountName: String(accountName ?? '未命名账户'), action },
+    }))
+    return operation
+  }
+
+  const isMountedCurrentAccountAction = (operation) => (
+    Boolean(operation)
+    && mountedRef.current
+    && accountOperationRef.current.get(operation.key) === operation
+    && accountGenerationRef.current.get(operation.key) === operation.generation
+  )
+
+  const isCurrentAccountAction = (operation) => (
+    isMountedCurrentAccountAction(operation)
+    && !operation.controller.signal.aborted
+  )
+
+  const endAccountAction = (operation) => {
+    if (!isMountedCurrentAccountAction(operation)) return
+    const { key } = operation
+    accountOperationRef.current.delete(key)
+    pendingAccountIdsRef.current.delete(key)
+    setPendingAccountIds((current) => {
+      if (!current[key]) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+    setPendingAccountActions((current) => {
+      if (!current[key]) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+  }
+
   const handleVerify = async (account) => {
+    const operation = beginAccountAction(account.id, account.name, '验证')
+    if (!operation) return
     setMenuAccountId(null)
-    setPendingAccountId(account.id)
     setActionMessage('')
     setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     try {
-      const verified = await verifyAccount(account.id)
+      const verified = await verifyAccount(account.id, { signal: operation.controller.signal })
+      if (!isCurrentAccountAction(operation)) return
       const safeVerified = publicAccount(verified)
       if (safeVerified?.verification_status !== 'valid') {
         throw new Error('账户验证失败，请重试')
       }
       setAccounts((current) => {
+        if (!isCurrentAccountAction(operation)) return current
         const targetId = safeVerified.id ?? account.id
         const next = current.map((item) => (
           String(item.id) === String(targetId) ? mergedAccount(item, safeVerified) : item
@@ -558,27 +629,32 @@ function OverviewPage({
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentAccountAction(operation)) return
       setActionMessage('账户验证成功')
       setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
+      if (!isCurrentAccountAction(operation) || isAborted(requestError, operation.controller.signal)) return
       setActionErrors((current) => ({
         ...current,
         [String(account.id)]: requestMessage(requestError, '账户验证失败，请重试'),
       }))
     } finally {
-      setPendingAccountId(null)
+      endAccountAction(operation)
     }
   }
 
   const handleToggleEnabled = async (account) => {
+    const nextEnabled = accountField(account, 'enabled') === false
+    const operation = beginAccountAction(account.id, account.name, nextEnabled ? '启用' : '停用')
+    if (!operation) return
     setMenuAccountId(null)
-    setPendingAccountId(account.id)
     setActionMessage('')
     setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
-    const nextEnabled = accountField(account, 'enabled') === false
     try {
-      const updated = await setAccountEnabled(account.id, nextEnabled)
+      const updated = await setAccountEnabled(account.id, nextEnabled, { signal: operation.controller.signal })
+      if (!isCurrentAccountAction(operation)) return
       setAccounts((current) => {
+        if (!isCurrentAccountAction(operation)) return current
         const next = current.map((item) => (
           String(item.id) === String(account.id)
             ? mergedAccount(item, updated || { enabled: nextEnabled })
@@ -587,15 +663,17 @@ function OverviewPage({
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentAccountAction(operation)) return
       setActionMessage(nextEnabled ? '账户已启用' : '账户已停用')
       setActionErrors((current) => ({ ...current, [String(account.id)]: '' }))
     } catch (requestError) {
+      if (!isCurrentAccountAction(operation) || isAborted(requestError, operation.controller.signal)) return
       setActionErrors((current) => ({
         ...current,
         [String(account.id)]: requestMessage(requestError, '账户状态更新失败，请重试'),
       }))
     } finally {
-      setPendingAccountId(null)
+      endAccountAction(operation)
     }
   }
 
@@ -613,24 +691,38 @@ function OverviewPage({
   }
 
   const handleDelete = async () => {
-    if (!confirmAccount || confirmPending) return
+    const account = confirmAccount
+    if (!account || deleteOperationRef.current || !mountedRef.current) return
+    const operation = {
+      accountId: account.id,
+      controller: new AbortController(),
+      generation: deleteGenerationRef.current + 1,
+    }
+    deleteGenerationRef.current = operation.generation
+    deleteOperationRef.current = operation
     setConfirmPending(true)
     setConfirmError('')
     try {
-      await deleteAccount(confirmAccount.id)
+      await deleteAccount(account.id, { signal: operation.controller.signal })
+      if (!isCurrentDeleteOperation(operation)) return
       setAccounts((current) => {
-        const next = current.filter((item) => String(item.id) !== String(confirmAccount.id))
+        if (!isCurrentDeleteOperation(operation)) return current
+        const next = current.filter((item) => String(item.id) !== String(account.id))
         onAccountsChange?.(next)
         return next
       })
+      if (!isCurrentDeleteOperation(operation)) return
       setTasks((current) => {
-        const next = current.filter((item) => String(accountIdOf(item)) !== String(confirmAccount.id))
+        if (!isCurrentDeleteOperation(operation)) return current
+        const next = current.filter((item) => String(accountIdOf(item)) !== String(account.id))
         onTasksChange?.(next)
         return next
       })
+      if (!isCurrentDeleteOperation(operation)) return
       setConfirmAccount(null)
       setActionMessage('账户已删除')
     } catch (requestError) {
+      if (!isCurrentDeleteOperation(operation) || isAborted(requestError, operation.controller.signal)) return
       const code = requestError?.code
       if (code === 'account_active') {
         setConfirmError('请先停止该账户的任务')
@@ -638,13 +730,31 @@ function OverviewPage({
         setConfirmError(requestMessage(requestError, '删除账户失败，请重试'))
       }
     } finally {
-      setConfirmPending(false)
+      endDeleteOperation(operation)
     }
+  }
+
+  const isMountedCurrentDeleteOperation = (operation) => (
+    Boolean(operation)
+    && mountedRef.current
+    && deleteOperationRef.current === operation
+    && deleteGenerationRef.current === operation.generation
+  )
+
+  const isCurrentDeleteOperation = (operation) => (
+    isMountedCurrentDeleteOperation(operation)
+    && !operation.controller.signal.aborted
+  )
+
+  const endDeleteOperation = (operation) => {
+    if (!isMountedCurrentDeleteOperation(operation)) return
+    deleteOperationRef.current = null
+    setConfirmPending(false)
   }
 
   if (visibleLoading) {
     return (
-      <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
+      <section className="mx-auto w-full max-w-5xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
         <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
         <p className="mt-2 text-sm text-label-secondary" role="status" aria-live="polite">正在加载账户…</p>
       </section>
@@ -653,7 +763,7 @@ function OverviewPage({
 
   if (visibleError) {
     return (
-      <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
+      <section className="mx-auto w-full max-w-5xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
         <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
         <Alert className="mt-5 max-w-xl" variant="danger" aria-live="polite">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -667,19 +777,17 @@ function OverviewPage({
 
   return (
     <>
-      <section className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
-        <div className="flex flex-wrap items-start justify-between gap-4">
+      <section className="mx-auto w-full max-w-5xl px-4 py-8 md:px-8" aria-labelledby="overview-title">
+        <div>
           <div>
-            <h1 id="overview-title" className="text-xl font-semibold tracking-tight">账户概览</h1>
-            <p className="mt-1 text-sm text-label-secondary">
-              查看所有账户的任务状态与静态进度。
+            <h1 id="overview-title" className="text-balance text-xl font-semibold">账户概览</h1>
+            <p className="mt-1 text-pretty text-sm text-label-secondary">
+              查看课程进度、答题正确率和需要处理的事项。
             </p>
           </div>
-          <Button type="button" variant="outline" onClick={openAddDialog}>
-            <Plus aria-hidden="true" size={15} strokeWidth={1.8} />
-            添加账户
-          </Button>
         </div>
+
+        {refreshWarning ? <Alert className="mt-5" variant="warning">任务状态更新暂时失败，正在重试；当前保留上次读取的结果。</Alert> : null}
 
         {actionMessage ? (
           <Alert className="mt-5" variant="info" aria-live="polite" onDismiss={() => setActionMessage('')}>
@@ -693,18 +801,12 @@ function OverviewPage({
             <p className="mx-auto mt-2 max-w-sm text-sm leading-5 text-label-secondary">
               添加一个账户后，这里会显示其任务状态、课程和章节进度。
             </p>
-            <Button ref={emptyActionRef} type="button" className="mt-5" onClick={openAddDialog}>
-              添加第一个账户
-            </Button>
+            <p className="mx-auto mt-4 max-w-sm text-pretty text-xs leading-5 text-label-tertiary">
+              请使用侧栏底部的“添加账户”。
+            </p>
           </div>
         ) : (
-          <div className="mt-8 overflow-visible border-y border-separator bg-surface" role="table" aria-label="账户任务概览">
-            <div role="row" className="hidden gap-4 px-4 py-2 text-xs font-medium text-label-tertiary md:grid md:grid-cols-[minmax(180px,1.1fr)_minmax(180px,1fr)_minmax(180px,1.1fr)_auto]">
-              <div role="columnheader">账户</div>
-              <div role="columnheader">任务状态</div>
-              <div role="columnheader">进度</div>
-              <div role="columnheader" aria-label="操作" />
-            </div>
+          <div className="mt-7 space-y-5" aria-label="账户任务概览">
             {visibleAccounts.map((account) => (
               <AccountRow
                 key={account.id}
@@ -712,6 +814,7 @@ function OverviewPage({
                 task={taskForAccount(visibleTasks, account.id)}
                 actionError={actionErrors[String(account.id)]}
                 menuOpen={String(menuAccountId) === String(account.id)}
+                pending={Boolean(pendingAccountIds[String(account.id)])}
                 onMenuToggle={() => setMenuAccountId((current) => (
                   String(current) === String(account.id) ? null : account.id
                 ))}
@@ -740,9 +843,12 @@ function OverviewPage({
         onConfirm={handleDelete}
       />
 
-      {pendingAccountId ? (
-        <span className="sr-only" role="status" aria-live="polite">
-          正在更新账户
+      {Object.keys(pendingAccountActions).length > 0 || confirmPending ? (
+        <span className="sr-only" role="status" aria-live="polite" data-testid="overview-pending-status">
+          {[
+            ...Object.values(pendingAccountActions).map(({ accountName, action }) => `正在${action}账户“${accountName}”…`),
+            ...(confirmPending && confirmAccount ? [`正在删除账户“${confirmAccount.name}”…`] : []),
+          ].join('；')}
         </span>
       ) : null}
     </>

@@ -146,6 +146,7 @@ class TaskDetails:
     courses: list[dict[str, Any]] = field(default_factory=list)
     active_jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     counts: dict[str, Any] = field(default_factory=dict)
+    answer_report: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

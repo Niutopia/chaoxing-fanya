@@ -1,12 +1,12 @@
 import { StrictMode } from 'react'
-import { render, screen } from '@testing-library/react'
+import { act, createEvent, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, vi } from 'vitest'
 import { ApiError } from '../api/client'
 import { deleteAccount, listAccounts, setAccountEnabled, verifyAccount } from '../api/accounts'
 import { listTasks } from '../api/tasks'
-import OverviewPage from './OverviewPage'
+import OverviewPage, { AccountRow } from './OverviewPage'
 
 function renderOverview(ui) {
   return render(
@@ -37,13 +37,82 @@ beforeEach(() => {
   verifyAccount.mockResolvedValue({ id: 'a', verification_status: 'valid' })
 })
 
-test('empty state focuses the add-account action', async () => {
+test('empty state points to the sidebar without rendering a duplicate add action', async () => {
   listAccounts.mockResolvedValue([])
   listTasks.mockResolvedValue([])
 
   renderOverview(<OverviewPage />)
 
-  expect(await screen.findByRole('button', { name: '添加第一个账户' })).toHaveFocus()
+  expect(await screen.findByText('请使用侧栏底部的“添加账户”。')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /添加.*账户/ })).not.toBeInTheDocument()
+})
+
+test('uses one managed signal for the default account and task loads and aborts it on effect rerun', async () => {
+  let resolveAccounts
+  let resolveTasks
+  let accountSignal
+  let taskSignal
+  listAccounts.mockImplementation((options) => {
+    accountSignal = options?.signal
+    return new Promise((resolve) => { resolveAccounts = resolve })
+  })
+  listTasks.mockImplementation((options) => {
+    taskSignal = options?.signal
+    return new Promise((resolve) => { resolveTasks = resolve })
+  })
+
+  const { rerender } = renderOverview(<OverviewPage />)
+
+  expect(accountSignal).toBeInstanceOf(AbortSignal)
+  expect(taskSignal).toBe(accountSignal)
+
+  rerender(
+    <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <OverviewPage accounts={[{ id: 'new', name: '新账户' }]} tasks={[]} loading={false} />
+    </MemoryRouter>,
+  )
+
+  expect(accountSignal.aborted).toBe(true)
+  await act(async () => {
+    resolveAccounts([{ id: 'old', name: '旧账户' }])
+    resolveTasks([])
+  })
+  expect(screen.getByText('新账户')).toBeInTheDocument()
+  expect(screen.queryByText('旧账户')).not.toBeInTheDocument()
+})
+
+test('aborts the shared overview load signal when unmounted', async () => {
+  let resolveAccounts
+  let resolveTasks
+  let signal
+  listAccounts.mockImplementation((options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveAccounts = resolve })
+  })
+  listTasks.mockImplementation((options) => new Promise((resolve) => { resolveTasks = resolve }))
+
+  const { unmount } = renderOverview(<OverviewPage />)
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(false)
+
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => {
+    resolveAccounts([])
+    resolveTasks([])
+  })
+})
+
+test('does not show an error when the default overview load is aborted', async () => {
+  const aborted = new Error('request cancelled')
+  aborted.name = 'AbortError'
+  listAccounts.mockRejectedValue(aborted)
+  listTasks.mockResolvedValue([])
+
+  renderOverview(<OverviewPage />)
+
+  expect(await screen.findByText('还没有账户')).toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 })
 
 test.each([
@@ -174,6 +243,133 @@ test('renders account action failures as a nearby danger alert', async () => {
   expect(await screen.findByRole('alert')).toHaveTextContent('验证失败，请重试')
 })
 
+test('disables the current account menu during verification and ignores duplicate calls', async () => {
+  const user = userEvent.setup()
+  let resolveVerify
+  verifyAccount.mockImplementation(() => new Promise((resolve) => { resolveVerify = resolve }))
+  renderOverview(
+    <OverviewPage
+      accounts={[
+        { id: 'a', name: '张三', enabled: true },
+        { id: 'b', name: '李四', enabled: true },
+      ]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  const currentTrigger = screen.getByRole('button', { name: '张三的更多操作' })
+  await user.click(currentTrigger)
+  const verifyItem = screen.getByRole('menuitem', { name: '重新验证' })
+  await user.click(verifyItem)
+  fireEvent.click(verifyItem)
+
+  expect(verifyAccount).toHaveBeenCalledTimes(1)
+  expect(currentTrigger).toBeDisabled()
+  expect(screen.getByRole('button', { name: '李四的更多操作' })).not.toBeDisabled()
+
+  await act(async () => { resolveVerify({ id: 'a', verification_status: 'valid' }) })
+  expect(await screen.findByText('账户验证成功')).toBeInTheDocument()
+  expect(currentTrigger).not.toBeDisabled()
+})
+
+test('disables the current account menu during enable or disable and ignores duplicate calls', async () => {
+  const user = userEvent.setup()
+  let resolveToggle
+  setAccountEnabled.mockImplementation(() => new Promise((resolve) => { resolveToggle = resolve }))
+  renderOverview(
+    <OverviewPage
+      accounts={[
+        { id: 'a', name: '张三', enabled: true },
+        { id: 'b', name: '李四', enabled: true },
+      ]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  const currentTrigger = screen.getByRole('button', { name: '张三的更多操作' })
+  await user.click(currentTrigger)
+  const toggleItem = screen.getByRole('menuitem', { name: '停用账户' })
+  await user.click(toggleItem)
+  fireEvent.click(toggleItem)
+
+  expect(setAccountEnabled).toHaveBeenCalledTimes(1)
+  expect(currentTrigger).toBeDisabled()
+  expect(screen.getByRole('button', { name: '李四的更多操作' })).not.toBeDisabled()
+
+  await act(async () => { resolveToggle({ id: 'a', enabled: false }) })
+  expect(await screen.findByText('账户已停用')).toBeInTheDocument()
+  expect(currentTrigger).not.toBeDisabled()
+})
+
+test('keeps every delete dismissal control disabled and blocks dismissal while delete is pending', async () => {
+  const user = userEvent.setup()
+  let resolveDelete
+  deleteAccount.mockImplementation(() => new Promise((resolve) => { resolveDelete = resolve }))
+  renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '删除账户' }))
+  await user.click(screen.getByRole('button', { name: '确认删除' }))
+
+  const dialog = screen.getByRole('dialog')
+  expect(screen.getByRole('button', { name: '关闭删除确认对话框' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '取消' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: '确认删除' })).toBeDisabled()
+
+  const escape = createEvent.keyDown(dialog, { key: 'Escape' })
+  fireEvent(dialog, escape)
+  expect(escape.defaultPrevented).toBe(true)
+  expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+  const outside = createEvent.pointerDown(document.body)
+  fireEvent(document.body, outside)
+  expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+  await act(async () => { resolveDelete({}) })
+  expect(await screen.findByText('账户已删除')).toBeInTheDocument()
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})
+
+test('makes overview pending status identify each account and action concurrently', async () => {
+  const user = userEvent.setup()
+  let resolveVerify
+  let resolveToggle
+  verifyAccount.mockImplementation(() => new Promise((resolve) => { resolveVerify = resolve }))
+  setAccountEnabled.mockImplementation(() => new Promise((resolve) => { resolveToggle = resolve }))
+  renderOverview(
+    <OverviewPage
+      accounts={[
+        { id: 'a', name: '张三', enabled: true },
+        { id: 'b', name: '李四', enabled: true },
+      ]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '重新验证' }))
+  await user.click(screen.getByRole('button', { name: '李四的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '停用账户' }))
+
+  const status = screen.getByTestId('overview-pending-status')
+  expect(status).toHaveTextContent('正在验证账户“张三”')
+  expect(status).toHaveTextContent('正在停用账户“李四”')
+
+  await act(async () => {
+    resolveVerify({ id: 'a', verification_status: 'valid' })
+    resolveToggle({ id: 'b', enabled: false })
+  })
+})
+
 test('uses the actual task identity for every task state without a full-page reload', async () => {
   const taskCases = [
     { account: 'running-account', state: 'running', task: { id: 'running-id' }, label: '查看任务' },
@@ -299,6 +495,150 @@ test('successful enable or disable closes More and restores its trigger focus', 
   expect(trigger).toHaveFocus()
 })
 
+test('does not update parent state when verification resolves after unmount', async () => {
+  const user = userEvent.setup()
+  const onAccountsChange = vi.fn()
+  let resolveVerify
+  let signal
+  verifyAccount.mockImplementation((_accountId, options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveVerify = resolve })
+  })
+  const { unmount } = renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+      onAccountsChange={onAccountsChange}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '重新验证' }))
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(false)
+
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveVerify({ id: 'a', verification_status: 'valid' }) })
+
+  expect(onAccountsChange).not.toHaveBeenCalled()
+})
+
+test('does not update parent state when enable or disable resolves after unmount', async () => {
+  const user = userEvent.setup()
+  const onAccountsChange = vi.fn()
+  let resolveToggle
+  let signal
+  setAccountEnabled.mockImplementation((_accountId, _enabled, options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveToggle = resolve })
+  })
+  const { unmount } = renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+      onAccountsChange={onAccountsChange}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '停用账户' }))
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(false)
+
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveToggle({ id: 'a', enabled: false }) })
+
+  expect(onAccountsChange).not.toHaveBeenCalled()
+})
+
+test('does not update parent state when delete resolves after unmount', async () => {
+  const user = userEvent.setup()
+  const onAccountsChange = vi.fn()
+  const onTasksChange = vi.fn()
+  let resolveDelete
+  let signal
+  deleteAccount.mockImplementation((_accountId, options) => {
+    signal = options?.signal
+    return new Promise((resolve) => { resolveDelete = resolve })
+  })
+  const { unmount } = renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[{ id: 'task-a', account_id: 'a', state: 'completed' }]}
+      loading={false}
+      onAccountsChange={onAccountsChange}
+      onTasksChange={onTasksChange}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '删除账户' }))
+  await user.click(screen.getByRole('button', { name: '确认删除' }))
+  expect(signal).toBeInstanceOf(AbortSignal)
+  expect(signal.aborted).toBe(false)
+
+  unmount()
+  expect(signal.aborted).toBe(true)
+  await act(async () => { resolveDelete({}) })
+
+  expect(onAccountsChange).not.toHaveBeenCalled()
+  expect(onTasksChange).not.toHaveBeenCalled()
+})
+
+test('uses a ref guard to issue only one delete for consecutive stale confirmation clicks', async () => {
+  const user = userEvent.setup()
+  let resolveDelete
+  deleteAccount.mockImplementation(() => new Promise((resolve) => { resolveDelete = resolve }))
+  renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '删除账户' }))
+  const confirmButton = screen.getByRole('button', { name: '确认删除' })
+  act(() => {
+    fireEvent.click(confirmButton)
+    fireEvent.click(confirmButton)
+  })
+
+  expect(deleteAccount).toHaveBeenCalledTimes(1)
+  await act(async () => { resolveDelete({}) })
+})
+
+test('releases delete pending state after failure so the account can be retried', async () => {
+  const user = userEvent.setup()
+  deleteAccount
+    .mockRejectedValueOnce(new ApiError('暂时无法删除', 500, 'delete_failed'))
+    .mockResolvedValueOnce({})
+  renderOverview(
+    <OverviewPage
+      accounts={[{ id: 'a', name: '张三', enabled: true }]}
+      tasks={[]}
+      loading={false}
+    />,
+  )
+
+  await user.click(screen.getByRole('button', { name: '张三的更多操作' }))
+  await user.click(screen.getByRole('menuitem', { name: '删除账户' }))
+  const confirmButton = screen.getByRole('button', { name: '确认删除' })
+  await user.click(confirmButton)
+
+  expect(await screen.findByRole('alert')).toHaveTextContent('暂时无法删除')
+  expect(confirmButton).not.toBeDisabled()
+  await user.click(confirmButton)
+
+  expect(await screen.findByText('账户已删除')).toBeInTheDocument()
+  expect(deleteAccount).toHaveBeenCalledTimes(2)
+})
+
 test('keeps More menu focus behavior under React StrictMode', async () => {
   const user = userEvent.setup()
   renderOverview(
@@ -327,4 +667,13 @@ test('keeps More menu focus behavior under React StrictMode', async () => {
   await user.click(screen.getByRole('menuitem', { name: '停用账户' }))
   expect(await screen.findByText('账户已停用')).toBeInTheDocument()
   expect(trigger).toHaveFocus()
+})
+
+
+test('accuracy uses platform-graded questions and ended cards hide stale chapter labels', async () => {
+  render(<MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AccountRow account={{ id: 'accuracy', name: 'Accuracy', enabled: true }} task={{ id: 'finished', state: 'failed', progress: 5, total: 6, current_course: '旧课程', current_chapter: '旧章节', stats: { completed_chapters: 460, total_chapters: 462, answer_correct_questions: 9, answer_graded_questions: 10 } }} onMenuToggle={() => {}} /></MemoryRouter>)
+  expect(screen.getByLabelText('答题正确率')).toHaveTextContent('90%')
+  expect(screen.queryByText('旧课程')).not.toBeInTheDocument()
+  expect(screen.queryByText('旧章节')).not.toBeInTheDocument()
+  expect(screen.getByText('还有 1 门课程需要处理')).toBeInTheDocument()
 })

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { getAnswerConnection } from '../api/settings'
 import { getPreferences, listCourses, savePreferences } from '../api/accounts'
 import { startTask } from '../api/tasks'
@@ -80,7 +80,10 @@ function accountIsEnabled(account) {
 
 function activeTaskFor(accountId, task, tasks) {
   const candidate = task || (Array.isArray(tasks)
-    ? tasks.find((item) => String(item?.account_id ?? item?.accountId) === String(accountId))
+    ? tasks.find((item) => (
+      String(item?.account_id ?? item?.accountId) === String(accountId)
+      && ACTIVE_TASK_STATES.has(item.state)
+    ))
     : null)
   return candidate && ACTIVE_TASK_STATES.has(candidate.state) ? candidate : null
 }
@@ -88,6 +91,12 @@ function activeTaskFor(accountId, task, tasks) {
 function errorMessage(error, fallback) {
   const message = error?.message
   return typeof message === 'string' && message.trim() ? message : fallback
+}
+
+function isAborted(error, signal) {
+  return Boolean(signal?.aborted)
+    || error?.name === 'AbortError'
+    || error?.code === 'ERR_CANCELED'
 }
 
 function startErrorMessage(error) {
@@ -182,6 +191,41 @@ function LaunchPage({
   const [saving, setSaving] = useState(false)
   const requestId = useRef(0)
   const hasCoursesRef = useRef(false)
+  const accountGenerationRef = useRef(0)
+  const accountIdRef = useRef(accountId)
+  const startOperationRef = useRef(0)
+  const loadControllerRef = useRef(null)
+  const startControllerRef = useRef(null)
+
+  // Keep the identity available to async callbacks during the render in
+  // which the route/prop changes.  The effect below also clears all
+  // account-scoped state before the new account's requests can complete.
+  accountIdRef.current = accountId
+
+  useEffect(() => {
+    loadControllerRef.current?.abort()
+    startControllerRef.current?.abort()
+    loadControllerRef.current = null
+    startControllerRef.current = null
+    const previousGeneration = accountGenerationRef.current
+    accountGenerationRef.current = previousGeneration + 1
+    requestId.current += 1
+    startOperationRef.current += 1
+    hasCoursesRef.current = false
+    setCourses([])
+    setPreferences({ ...DEFAULT_PREFERENCES })
+    setAnswerConnection(null)
+    setSearch('')
+    setInitialReady(false)
+    setLoading(Boolean(accountId))
+    setCoursesLoading(Boolean(accountId))
+    setRefreshing(false)
+    setStale(false)
+    setLoadError('')
+    setAnswerError('')
+    setActionError('')
+    setSaving(false)
+  }, [accountId])
 
   const loadPage = useCallback(async ({ refresh = false } = {}) => {
     if (!accountId) {
@@ -192,7 +236,18 @@ function LaunchPage({
       return
     }
 
+    loadControllerRef.current?.abort()
+    const controller = new AbortController()
+    loadControllerRef.current = controller
     const currentRequest = ++requestId.current
+    const currentGeneration = accountGenerationRef.current
+    const isCurrentRequest = () => (
+      currentRequest === requestId.current
+      && loadControllerRef.current === controller
+      && !controller.signal.aborted
+      && currentGeneration === accountGenerationRef.current
+      && String(accountIdRef.current ?? '') === String(accountId ?? '')
+    )
     if (refresh) {
       setRefreshing(true)
     } else {
@@ -205,40 +260,44 @@ function LaunchPage({
     setActionError('')
 
     const coursePromise = refresh
-      ? listCourses(accountId, { refresh: true })
-      : listCourses(accountId)
-    const preferencesPromise = refresh ? null : getPreferences(accountId)
-    const connectionPromise = refresh ? null : getAnswerConnection()
+      ? listCourses(accountId, { refresh: true, signal: controller.signal })
+      : listCourses(accountId, { signal: controller.signal })
+    const preferencesPromise = refresh ? null : getPreferences(accountId, { signal: controller.signal })
+    const connectionPromise = refresh ? null : getAnswerConnection({ signal: controller.signal })
+    // Attach rejection handlers now: the course request may take much longer
+    // or be aborted during navigation before we reach the settings below.
+    const settingsResults = refresh ? null : Promise.allSettled([
+      preferencesPromise,
+      connectionPromise,
+    ])
 
     let coursesSucceeded = false
     try {
       const courseResult = await coursePromise
-      if (currentRequest !== requestId.current) return
+      if (!isCurrentRequest()) return
       setCourses(asCourses(courseResult))
       coursesSucceeded = true
       hasCoursesRef.current = true
       setStale(false)
       setLoadError('')
     } catch (error) {
-      if (currentRequest !== requestId.current) return
+      if (!isCurrentRequest()) return
+      if (isAborted(error, controller.signal)) return
       if (refresh && hasCoursesRef.current) {
         setStale(true)
       } else {
         setLoadError(errorMessage(error, '课程加载失败，请重试'))
       }
     } finally {
-      if (currentRequest === requestId.current) {
+      if (isCurrentRequest()) {
         setCoursesLoading(false)
         setRefreshing(false)
       }
     }
 
     if (!refresh) {
-      const [preferencesResult, connectionResult] = await Promise.allSettled([
-        preferencesPromise,
-        connectionPromise,
-      ])
-      if (currentRequest !== requestId.current) return
+      const [preferencesResult, connectionResult] = await settingsResults
+      if (!isCurrentRequest()) return
 
       if (preferencesResult.status === 'fulfilled') {
         setPreferences(asPreferences(preferencesResult.value))
@@ -254,17 +313,21 @@ function LaunchPage({
       }
       setInitialReady(
         coursesSucceeded
-        && preferencesResult.status === 'fulfilled'
-        && connectionResult.status === 'fulfilled',
+        && preferencesResult.status === 'fulfilled',
       )
       setLoading(false)
     }
+    if (loadControllerRef.current === controller) loadControllerRef.current = null
   }, [accountId])
 
   useEffect(() => {
     loadPage()
     return () => {
       requestId.current += 1
+      loadControllerRef.current?.abort()
+      startControllerRef.current?.abort()
+      loadControllerRef.current = null
+      startControllerRef.current = null
     }
   }, [loadPage])
 
@@ -286,6 +349,7 @@ function LaunchPage({
   const runningTask = activeTaskFor(accountId, activeTask || task, tasks)
   const connectionBlocked = Boolean(preferences.answer_enabled)
     && (answerError || !answerConnectionReady(answerConnection))
+  const launchControlsDisabled = !initialReady || saving
 
   const updatePreference = (field) => (event) => {
     const nextValue = event.target.type === 'checkbox' ? event.target.checked : event.target.value
@@ -350,12 +414,33 @@ function LaunchPage({
       return
     }
 
+    const requestedAccountId = accountId
+    const requestedGeneration = accountGenerationRef.current
+    const operation = ++startOperationRef.current
+    startControllerRef.current?.abort()
+    const controller = new AbortController()
+    startControllerRef.current = controller
+    const isCurrentStart = () => (
+      operation === startOperationRef.current
+      && startControllerRef.current === controller
+      && !controller.signal.aborted
+      && requestedGeneration === accountGenerationRef.current
+      && String(accountIdRef.current ?? '') === String(requestedAccountId ?? '')
+    )
     setSaving(true)
     setActionError('')
     const payload = preferencePayload(preferences)
     try {
-      await savePreferences(accountId, payload)
-      const result = await startTask(accountId, { course_ids: [...selectedIds] })
+      await savePreferences(accountId, payload, { signal: controller.signal })
+      // Account switching while the preference write is in flight must not
+      // leak this account's successful save into another account's task.
+      if (!isCurrentStart()) return
+      const result = await startTask(
+        accountId,
+        { course_ids: [...selectedIds] },
+        { signal: controller.signal },
+      )
+      if (!isCurrentStart()) return
       const taskId = taskIdFrom(result)
       if (!taskId) {
         throw new Error('启动响应缺少任务 ID')
@@ -363,9 +448,11 @@ function LaunchPage({
       onTaskCreated?.(result)
       navigate(`/tasks/${encodeURIComponent(taskId)}`)
     } catch (error) {
-      setActionError(startErrorMessage(error))
+      if (isCurrentStart() && !isAborted(error, controller.signal)) setActionError(startErrorMessage(error))
     } finally {
-      setSaving(false)
+      const wasCurrentStart = isCurrentStart()
+      if (startControllerRef.current === controller) startControllerRef.current = null
+      if (wasCurrentStart) setSaving(false)
     }
   }
 
@@ -394,20 +481,14 @@ function LaunchPage({
 
   return (
     <section className={cn('mx-auto w-full max-w-6xl px-4 py-7 md:px-8 md:py-8', className)} aria-labelledby="launch-title">
-      <div className="flex flex-wrap items-start justify-between gap-4">
+      <div>
         <div className="min-w-0">
           <p className="text-xs font-medium text-label-secondary">课程工作台</p>
-          <h1 id="launch-title" className="mt-1 truncate text-xl font-semibold tracking-tight">
+          <h1 id="launch-title" className="mt-1 truncate text-balance text-xl font-semibold">
             {activeAccount?.name || '开始学习'}
           </h1>
-          <p className="mt-1 text-sm text-label-secondary">选择课程并确认本次学习任务的参数。</p>
+          <p className="mt-1 text-pretty text-sm text-label-secondary">选择课程并确认这个账户的学习参数。</p>
         </div>
-        <Link
-          to={`/settings${accountId ? `?account=${encodeURIComponent(accountId)}` : ''}`}
-          className="touch-target touch-target-compact inline-flex min-h-9 items-center rounded-md px-2.5 text-sm text-accent-blue hover:bg-accent-blue/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-        >
-          高级设置
-        </Link>
       </div>
 
       {loadError ? (
@@ -440,9 +521,9 @@ function LaunchPage({
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <Button type="button" size="sm" variant="ghost" onClick={selectAll} disabled={!initialReady || filteredCourses.length === 0}>全选</Button>
-              <Button type="button" size="sm" variant="ghost" onClick={clearSelection} disabled={!initialReady || selectedCount === 0}>清空</Button>
-              <Button type="button" size="sm" variant="outline" onClick={() => loadPage({ refresh: true })} loading={refreshing} disabled={!initialReady}>
+              <Button type="button" size="sm" variant="ghost" onClick={selectAll} disabled={launchControlsDisabled || filteredCourses.length === 0}>全选</Button>
+              <Button type="button" size="sm" variant="ghost" onClick={clearSelection} disabled={launchControlsDisabled || selectedCount === 0}>清空</Button>
+              <Button type="button" size="sm" variant="outline" onClick={() => loadPage({ refresh: true })} loading={refreshing} disabled={launchControlsDisabled}>
                 刷新课程
               </Button>
             </div>
@@ -455,7 +536,7 @@ function LaunchPage({
               placeholder="搜索课程名称或 ID"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              disabled={!initialReady}
+              disabled={launchControlsDisabled}
             />
           </div>
 
@@ -480,7 +561,7 @@ function LaunchPage({
                       className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                       checked={selectedSet.has(course.courseId)}
                       onChange={() => toggleCourse(course.courseId)}
-                      disabled={!initialReady}
+                      disabled={launchControlsDisabled}
                     />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium text-label-primary">{course.title}</span>
@@ -495,8 +576,8 @@ function LaunchPage({
 
         <aside className="min-w-0 border-y border-separator bg-surface md:sticky md:top-5" aria-labelledby="launch-inspector-title">
           <div className="border-b border-separator px-4 py-3">
-            <h2 id="launch-inspector-title" className="font-semibold">学习参数</h2>
-            <p className="mt-0.5 text-xs text-label-secondary">这些参数只作用于当前账户。</p>
+            <h2 id="launch-inspector-title" className="font-semibold">本账户学习参数</h2>
+            <p className="mt-0.5 text-pretty text-xs text-label-secondary">保存在当前账户中，启动任务时使用。</p>
           </div>
           <div className="space-y-5 px-4 py-4">
             <Field label="播放速度" htmlFor="launch-speed" description="范围 1.0 到 2.0 倍。">
@@ -509,7 +590,7 @@ function LaunchPage({
                 step="0.1"
                 value={preferenceNumber(preferences.speed, DEFAULT_PREFERENCES.speed)}
                 onChange={updatePreference('speed')}
-                disabled={!initialReady}
+                disabled={launchControlsDisabled}
               />
             </Field>
 
@@ -523,7 +604,7 @@ function LaunchPage({
                 step="1"
                 value={preferenceNumber(preferences.jobs, DEFAULT_PREFERENCES.jobs)}
                 onChange={updatePreference('jobs')}
-                disabled={!initialReady}
+                disabled={launchControlsDisabled}
               />
             </Field>
 
@@ -532,7 +613,7 @@ function LaunchPage({
                 id="launch-notopen-action"
                 value={preferences.notopen_action}
                 onChange={updatePreference('notopen_action')}
-                disabled={!initialReady}
+                disabled={launchControlsDisabled}
                 className="touch-target touch-target-compact flex h-9 w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-sm text-label-primary outline-none focus-visible:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue/20"
               >
                 <option value="retry">稍后重试</option>
@@ -547,7 +628,7 @@ function LaunchPage({
                   className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                   checked={Boolean(preferences.answer_enabled)}
                   onChange={updatePreference('answer_enabled')}
-                  disabled={!initialReady}
+                  disabled={launchControlsDisabled}
                 />
                 <span className="min-w-0">
                   <span className="block font-medium text-label-primary">启用答题</span>
@@ -567,7 +648,7 @@ function LaunchPage({
                       step="0.05"
                       value={preferenceNumber(preferences.answer_cover_rate, DEFAULT_PREFERENCES.answer_cover_rate)}
                       onChange={updatePreference('answer_cover_rate')}
-                      disabled={!initialReady}
+                      disabled={launchControlsDisabled}
                     />
                   </Field>
                   <label className="touch-target flex min-h-11 cursor-pointer items-center gap-3 text-sm">
@@ -576,7 +657,7 @@ function LaunchPage({
                       className="size-4 accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2"
                       checked={Boolean(preferences.answer_auto_submit)}
                       onChange={updatePreference('answer_auto_submit')}
-                      disabled={!initialReady}
+                      disabled={launchControlsDisabled}
                     />
                     <span className="font-medium text-label-primary">自动提交答案</span>
                   </label>
@@ -595,7 +676,7 @@ function LaunchPage({
                 className="w-full"
                 onClick={handleStart}
                 loading={saving}
-                disabled={!initialReady || !enabled || Boolean(runningTask) || Boolean(connectionBlocked)}
+                disabled={launchControlsDisabled || !enabled || Boolean(runningTask) || Boolean(connectionBlocked)}
               >
                 开始学习
               </Button>

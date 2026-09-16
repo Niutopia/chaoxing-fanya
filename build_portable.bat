@@ -10,8 +10,10 @@ echo.
 set "SCRIPT_DIR=%~dp0"
 set "BUILD_DIR=%SCRIPT_DIR%portable_build"
 set "DIST_DIR=%SCRIPT_DIR%chaoxing_portable"
-set "PYTHON_VERSION=3.11.9"
+set "PYTHON_VERSION=3.13.7"
 set "PYTHON_EMBED_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-embed-amd64.zip"
+set "PIP_BOOTSTRAP_VERSION=26.2.1"
+set "PIP_BOOTSTRAP_URL=https://bootstrap.pypa.io/pip/zipapp/pip-%PIP_BOOTSTRAP_VERSION%.pyz"
 
 echo [1/7] 清理旧的构建目录...
 if exist "%BUILD_DIR%" rd /s /q "%BUILD_DIR%"
@@ -41,77 +43,77 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 修改 python311._pth 以启用 pip
-set "PTH_FILE=%PYTHON_DIR%\python311._pth"
-if exist "%PTH_FILE%" (
-    echo python311.zip> "%PTH_FILE%"
-    echo .>> "%PTH_FILE%"
-    echo Lib>> "%PTH_FILE%"
-    echo Lib\site-packages>> "%PTH_FILE%"
-    echo import site>> "%PTH_FILE%"
+REM 验证嵌入包确实是 Python 3.13
+set "PTH_FILE=%PYTHON_DIR%\python313._pth"
+if not exist "%PTH_FILE%" (
+    echo    ❌ 嵌入包缺少 python313._pth，停止打包
+    pause
+    exit /b 1
 )
+echo python313.zip> "%PTH_FILE%"
+echo .>> "%PTH_FILE%"
+echo Lib>> "%PTH_FILE%"
+echo Lib\site-packages>> "%PTH_FILE%"
+echo import site>> "%PTH_FILE%"
 echo    ✅ Python 解压完成
 
-echo [4/7] 安装 pip 和依赖包...
+echo [4/7] 安装项目依赖...
 set "PYTHON_EXE=%PYTHON_DIR%\python.exe"
-set "GET_PIP=%BUILD_DIR%\get-pip.py"
+set "PIP_BOOTSTRAP=%BUILD_DIR%\pip.pyz"
 
-REM 下载 get-pip.py
-powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile '%GET_PIP%'}" 2>nul
+REM Download a version-pinned pip zipapp; the official embeddable runtime has no pip.
+powershell -Command "& {[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PIP_BOOTSTRAP_URL%' -OutFile '%PIP_BOOTSTRAP%'}" 2>nul
 if errorlevel 1 (
-    echo    ❌ 下载 get-pip.py 失败
-    pause
+    echo    ❌ 固定版本 pip bootstrap 下载失败，停止打包
+    exit /b 1
+)
+if not exist "%PIP_BOOTSTRAP%" (
+    echo    ❌ 未生成固定版本 pip bootstrap，停止打包
     exit /b 1
 )
 
-REM 安装 pip
-"%PYTHON_EXE%" "%GET_PIP%" --no-warn-script-location
-if errorlevel 1 (
-    echo    ❌ 安装 pip 失败
-    pause
-    exit /b 1
-)
-
-REM 安装项目依赖
+REM requirements.txt contains the exact project dependency pins.
 echo    正在安装项目依赖，这可能需要几分钟...
-"%PYTHON_EXE%" -m pip install --no-warn-script-location -r "%SCRIPT_DIR%requirements.txt"
+"%PYTHON_EXE%" "%PIP_BOOTSTRAP%" install --disable-pip-version-check --no-warn-script-location -r "%SCRIPT_DIR%requirements.txt"
 if errorlevel 1 (
-    echo    ⚠️  部分依赖安装可能失败，继续打包...
-)
-
-REM 安装 Flask-CORS
-"%PYTHON_EXE%" -m pip install --no-warn-script-location flask-cors
-
-"%PYTHON_EXE%" -m pip install --no-warn-script-location paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-if errorlevel 1 (
-    echo    ⚠️  OCR 依赖 paddlepaddle 安装失败，便携版将无法使用本地 OCR
-) else (
-    echo    ✅ OCR 依赖 paddlepaddle 安装成功
-)
-"%PYTHON_EXE%" -m pip install --no-warn-script-location "paddlex[ocr-core]"
-if errorlevel 1 (
-    echo    ⚠️  OCR 依赖 paddlex 安装失败，便携版将无法使用本地 OCR
-) else (
-    echo    ✅ OCR 依赖 paddlex 安装成功
+    echo    ❌ 项目依赖安装失败，停止打包
+    pause
+    exit /b 1
 )
 
 echo    ✅ 依赖安装完成
+echo    便携版不包含本地 OCR（PaddleOCR、paddlepaddle、paddlex）
+echo    验证码请手动输入或配置在线 OCR 服务
 
 echo [5/7] 构建前端...
 cd /d "%SCRIPT_DIR%web"
-if exist "node_modules" (
-    echo    正在构建前端...
-    call npm run build
-    if errorlevel 1 (
-        echo    ⚠️  前端构建失败，将跳过前端
-    ) else (
-        echo    ✅ 前端构建完成
-        xcopy /E /I /Y "dist" "%DIST_DIR%\web\dist" >nul
-    )
-) else (
-    echo    ⚠️  未找到 node_modules，跳过前端构建
-    echo    请先在 web 目录运行 npm install
+where npm >nul 2>&1
+if errorlevel 1 (
+    echo    ❌ 未找到 npm，无法按 package-lock.json 构建前端
+    exit /b 1
 )
+echo    按 package-lock.json 安装前端依赖...
+call npm ci
+if errorlevel 1 (
+    echo    ❌ npm ci 失败，停止打包
+    exit /b 1
+)
+echo    正在构建前端...
+call npm run build
+if errorlevel 1 (
+    echo    ❌ 前端构建失败，停止打包
+    exit /b 1
+)
+if not exist "dist\index.html" (
+    echo    ❌ 前端构建未生成 dist\index.html
+    exit /b 1
+)
+xcopy /E /I /Y "dist" "%DIST_DIR%\web\dist" >nul
+if errorlevel 1 (
+    echo    ❌ 前端文件复制失败，停止打包
+    exit /b 1
+)
+echo    ✅ 前端构建完成
 cd /d "%SCRIPT_DIR%"
 
 echo [6/7] 复制项目文件...
@@ -124,15 +126,9 @@ copy "%SCRIPT_DIR%app.py" "%DIST_DIR%\" >nul
 copy "%SCRIPT_DIR%main.py" "%DIST_DIR%\" >nul
 copy "%SCRIPT_DIR%requirements.txt" "%DIST_DIR%\" >nul
 
-REM 复制配置文件模板
-if exist "%SCRIPT_DIR%config.ini" copy "%SCRIPT_DIR%config.ini" "%DIST_DIR%\" >nul
-if exist "%SCRIPT_DIR%web_config.json" copy "%SCRIPT_DIR%web_config.json" "%DIST_DIR%\" >nul
-
-REM 复制 PaddleOCR (如果存在且需要)
-if exist "%SCRIPT_DIR%PaddleOCR" (
-    echo    正在复制 PaddleOCR...
-    xcopy /E /I /Y "%SCRIPT_DIR%PaddleOCR" "%DIST_DIR%\PaddleOCR" >nul
-)
+REM 只复制不含凭据的配置模板，绝不复制实际配置文件
+if exist "%SCRIPT_DIR%config.ini.example" copy "%SCRIPT_DIR%config.ini.example" "%DIST_DIR%\config.ini.example" >nul
+echo    不会打包 web_config.json，Web 设置请在 Web 界面中配置
 
 echo    ✅ 文件复制完成
 
@@ -146,7 +142,7 @@ echo setlocal enabledelayedexpansion
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -180,7 +176,7 @@ echo setlocal
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -203,7 +199,7 @@ echo setlocal
 echo.
 echo set "SCRIPT_DIR=%%~dp0"
 echo set "PYTHON_EXE=%%SCRIPT_DIR%%python\python.exe"
-echo set "CHAOXING_ENABLE_OCR=1"
+echo set "CHAOXING_ENABLE_OCR=0"
 echo.
 echo pushd "%%SCRIPT_DIR%%"
 echo.
@@ -233,13 +229,14 @@ echo 3. **双击 `命令行启动.bat`** - 启动命令行模式
 echo.
 echo ## 配置说明
 echo.
-echo - 编辑 `config.ini` 配置账号密码和学习参数
-echo - 编辑 `web_config.json` 配置 Web 模式的题库等设置
+echo - 将 `config.ini.example` 复制为 `config.ini`，再编辑账号密码和学习参数
+echo - Web 模式设置请在 Web 界面中配置（不会打包 web_config.json）
 echo.
 echo ## 注意事项
 echo.
-echo - 首次运行可能需要较长时间加载 OCR 模型
+echo - 首次运行可能需要较长时间初始化程序
 echo - 请确保网络连接正常
+echo - 本便携版不包含本地 OCR（PaddleOCR、paddlepaddle、paddlex），请手动输入验证码或配置在线 OCR 服务
 echo - 如遇问题，请查看控制台输出的错误信息
 echo.
 echo ## 目录结构
@@ -250,7 +247,6 @@ echo ├── python/          # 嵌入式 Python 运行时
 echo ├── api/             # 后端 API 模块
 echo ├── web/dist/        # 前端静态文件
 echo ├── resource/        # 资源文件
-echo ├── PaddleOCR/       # OCR 模块（如果有）
 echo ├── 启动.bat         # 主启动脚本
 echo ├── Web启动.bat      # Web 模式启动
 echo └── 命令行启动.bat   # 命令行模式启动

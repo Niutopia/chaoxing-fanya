@@ -1,88 +1,57 @@
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-set CHAOXING_ENABLE_OCR=1
+
 echo ========================================
 echo   超星学习通 - Web前端启动脚本
 echo ========================================
 echo.
 
-echo [检查] 检查依赖安装状态...
-echo.
-
-REM 检查后端依赖
-echo [1/5] 检查后端依赖 (flask-cors)...
-python -c "import flask_cors" 2>nul
+REM This script follows the checked-in requirements files.  PaddleOCR is an
+REM optional local OCR path and is intentionally not installed automatically.
+echo [检查] 检查 Python 与 Node.js...
+where python >nul 2>&1
 if errorlevel 1 (
-    echo    ⚠️  flask-cors 未安装，正在安装...
-    pip install flask-cors
-    if errorlevel 1 (
-        echo    ❌ 后端依赖安装失败！
-        pause
-        exit /b 1
-    )
-    echo    ✅ 后端依赖安装成功！
-) else (
-    echo    ✅ 后端依赖已安装
+    echo    ❌ 未找到 Python，请先安装 Python 3.13 或更高版本。
+    pause
+    exit /b 1
 )
-echo.
-
-REM 检查 OCR 依赖
-echo [2/5] 检查 OCR 依赖 (paddlepaddle / paddlex)...
-python -c "import paddle" 2>nul
+where npm >nul 2>&1
 if errorlevel 1 (
-    echo    ⚠️  OCR 依赖 paddlepaddle 未安装，正在安装...
-    pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-    if errorlevel 1 (
-        echo    ❌ OCR 依赖 paddlepaddle 安装失败！
-        pause
-        exit /b 1
-    )
-    echo    ✅ OCR 依赖 paddlepaddle 安装成功！
-) else (
-    echo    ✅ OCR 依赖 paddlepaddle 已安装
+    echo    ❌ 未找到 npm，请先安装 Node.js 20.19 或更高版本。
+    pause
+    exit /b 1
 )
+echo    ✅ Python 与 Node.js 已找到
+echo.
 
-python -c "import paddlex" 2>nul
+echo [1/3] 同步后端依赖...
+python -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 (
-    echo    ⚠️  OCR 依赖 paddlex 未安装，正在安装 paddlex[ocr-core]...
-    pip install "paddlex[ocr-core]"
-    if errorlevel 1 (
-        echo    ❌ OCR 依赖 paddlex 安装失败！
-        pause
-        exit /b 1
-    )
-    echo    ✅ OCR 依赖 paddlex 安装成功！
-) else (
-    echo    ✅ OCR 依赖 paddlex 已安装
+    echo    ❌ 后端依赖安装失败！
+    pause
+    exit /b 1
 )
+echo    ✅ 后端依赖已与 requirements.txt 同步
 echo.
 
-REM 检查前端依赖
-echo [3/5] 检查前端依赖 (node_modules)...
-if not exist "web\node_modules" (
-    echo    ⚠️  前端依赖未安装，正在安装...
-    cd web
-    call npm install
-    if errorlevel 1 (
-        echo    ❌ 前端依赖安装失败！
-        cd ..
-        pause
-        exit /b 1
-    )
-    cd ..
-    echo    ✅ 前端依赖安装成功！
-) else (
-    echo    ✅ 前端依赖已安装
+echo [2/3] 同步前端依赖...
+pushd "%~dp0web"
+call npm ci
+set "NPM_EXIT=!errorlevel!"
+popd
+if not "!NPM_EXIT!"=="0" (
+    echo    ❌ 前端依赖安装失败！
+    pause
+    exit /b !NPM_EXIT!
 )
+echo    ✅ 前端依赖已与 package-lock.json 同步
 echo.
 
-echo [4/5] 启动后端服务...
-start "超星后端服务" cmd /k "python app.py"
+echo [3/3] 启动前后端服务...
+start "超星后端服务" cmd /k "cd /d ""%~dp0"" ^&^& python app.py"
 timeout /t 3 /nobreak >nul
-
-echo [5/5] 启动前端服务...
-cd web
-start "超星前端服务" cmd /k "npm run dev"
+start "超星前端服务" cmd /k "cd /d ""%~dp0web"" ^&^& npm run dev"
 
 echo.
 echo ========================================
@@ -91,8 +60,10 @@ echo   后端地址: http://localhost:5000
 echo   前端地址: http://localhost:3000
 echo ========================================
 echo.
+echo 本脚本不会自动安装 PaddleOCR；如需本地 OCR，请按 README 手动安装并设置 CHAOXING_ENABLE_OCR=1。
 echo 请等待浏览器自动打开...
 timeout /t 5 /nobreak >nul
 start http://localhost:3000
 
 pause
+endlocal

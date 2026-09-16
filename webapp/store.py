@@ -1,10 +1,12 @@
-"""Short-lived SQLite persistence for accounts and web settings."""
+"""SQLite persistence for accounts, web settings, and task-monitor history."""
 
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -12,7 +14,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from api.logger import (
+    sanitize_log_level,
+    sanitize_monitor_value,
+    sanitize_log_message,
+    validate_task_id,
+)
+
 from .crypto import SecretBox
+from .answer_connection import (
+    DEFAULT_MAX_CONCURRENCY,
+    MAX_API_KEY_LENGTH,
+    MAX_BASE_URL_LENGTH,
+    MAX_CONCURRENCY,
+    MAX_MODEL_LENGTH,
+    MAX_RETRIES,
+    MAX_TIMEOUT_SECONDS,
+)
+from .limits import (
+    MAX_ACCOUNT_NAME_LENGTH,
+    MAX_ACCOUNT_PASSWORD_LENGTH,
+    MAX_ACCOUNT_USERNAME_LENGTH,
+    MAX_COURSE_ID_LENGTH,
+    MAX_SELECTED_COURSE_IDS,
+    validate_config_shape,
+    validate_cookie_mapping,
+    validate_text,
+)
 from .models import (
     AccountAuth,
     AccountPreferences,
@@ -31,6 +59,27 @@ _RUNTIME_SETTINGS_KEY = "runtime"
 _ANSWER_SECRET_KEY = "answer_api_key"
 _ANSWER_TEST_STATUS = "_last_test_status"
 _ANSWER_TEST_FINGERPRINT = "_last_test_fingerprint"
+_PREFERENCE_SECRET_PREFIX = "fernet:v1:"
+# Keep the read side bounded even when a legacy database was populated by a
+# caller that bypassed ``save_web_task_log(capacity=...)``.  TaskManager passes
+# its configured value when the adapter supports it; this default preserves
+# the original loader signature for small integrations.
+DEFAULT_WEB_TASK_LOG_CAPACITY = 5_000
+
+
+class _TrustedWebTaskRecord(dict[str, Any]):
+    """A loader record carrying canonical metadata outside its JSON shape."""
+
+    __slots__ = ("_history_timestamp",)
+
+    def __init__(
+        self,
+        value: Mapping[str, Any],
+        *,
+        history_timestamp: float | None,
+    ) -> None:
+        super().__init__(value)
+        self._history_timestamp = history_timestamp
 
 
 _SCHEMA = """
@@ -77,6 +126,31 @@ CREATE TABLE IF NOT EXISTS secrets (
     key TEXT PRIMARY KEY,
     value_token TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS web_tasks (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    started_at REAL,
+    finished_at REAL,
+    history_at REAL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS web_tasks_started_at_idx
+    ON web_tasks(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS web_task_logs (
+    task_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    PRIMARY KEY (task_id, sequence),
+    FOREIGN KEY (task_id) REFERENCES web_tasks(id) ON DELETE CASCADE
+);
 """
 
 
@@ -97,6 +171,98 @@ def _json_load(value: str, default: Any) -> Any:
         return default
 
 
+def _finite_timestamp(value: Any) -> float | None:
+    """Coerce one persisted timestamp without admitting NaN or infinity."""
+
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _sanitize_task_mapping(value: Any) -> dict[str, Any]:
+    """Return a bounded JSON-like monitor mapping with secrets redacted."""
+
+    sanitized = sanitize_monitor_value(value)
+    return dict(sanitized) if isinstance(sanitized, Mapping) else {}
+
+
+def _sanitize_task_mapping_with_dirty(value: Any) -> tuple[dict[str, Any], bool]:
+    """Sanitize one persisted mapping and report whether it changed.
+
+    SQLite JSON decoding normally yields ordinary dictionaries, but keeping the
+    comparison guarded also makes the helper safe for unusual in-memory
+    adapters and cyclic values passed through tests.  A non-mapping or an
+    uncomparable value is conservatively considered dirty so a manager can
+    attempt a canonical write-back later.
+    """
+
+    sanitized = _sanitize_task_mapping(value)
+    if not isinstance(value, Mapping):
+        return sanitized, True
+    try:
+        return sanitized, sanitized != value
+    except BaseException:
+        return sanitized, True
+
+
+def _positive_capacity(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _validate_account_text(value: Any, max_length: int, field_name: str) -> str:
+    text = validate_text(value, max_length, field_name=field_name)
+    if not text.strip():
+        raise ValueError(f"{field_name} must not be blank")
+    return text
+
+
+def _validate_secret_text(value: Any, max_length: int, field_name: str) -> str:
+    return validate_text(value, max_length, field_name=field_name)
+
+
+def _validate_preferences(value: AccountPreferences) -> None:
+    selected = value.selected_course_ids
+    if not isinstance(selected, list):
+        raise ValueError("selected_course_ids must be a list")
+    if len(selected) > MAX_SELECTED_COURSE_IDS:
+        raise ValueError("too many selected courses")
+    if any(
+        not isinstance(course_id, str) or len(course_id) > MAX_COURSE_ID_LENGTH
+        for course_id in selected
+    ):
+        raise ValueError("invalid selected course id")
+    try:
+        speed = float(value.speed)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid speed") from None
+    if not math.isfinite(speed) or not 1.0 <= speed <= 2.0:
+        raise ValueError("invalid speed")
+    if (
+        isinstance(value.jobs, bool)
+        or not isinstance(value.jobs, int)
+        or not 1 <= value.jobs <= 10
+    ):
+        raise ValueError("invalid jobs")
+    if value.notopen_action not in {"retry", "continue"}:
+        raise ValueError("invalid notopen_action")
+    if not isinstance(value.answer_enabled, bool) or not isinstance(
+        value.answer_auto_submit, bool
+    ):
+        raise ValueError("invalid answer preference")
+    try:
+        cover_rate = float(value.answer_cover_rate)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid answer_cover_rate") from None
+    if not math.isfinite(cover_rate) or not 0.0 <= cover_rate <= 1.0:
+        raise ValueError("invalid answer_cover_rate")
+    validate_config_shape(value.notification_config, field_name="notification_config")
+    validate_config_shape(value.ocr_config, field_name="ocr_config")
+
+
 class SQLiteStore:
     """Encrypted account/settings store backed by SQLite.
 
@@ -109,7 +275,9 @@ class SQLiteStore:
         self.db_path = Path(db_path)
         self.secret_box = secret_box
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.chmod(0o700)
         self._initialize_schema()
+        self.db_path.chmod(0o600)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -126,12 +294,84 @@ class SQLiteStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Open a genuinely read-only SQLite connection for history loads."""
+
+        connection = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+        finally:
+            connection.close()
+
     def _initialize_schema(self) -> None:
         # DDL is serialized so two app instances starting against the same
         # persistent volume cannot race while creating the schema.
+        migrated_preferences = False
         with _SCHEMA_LOCK:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)
+                task_columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(web_tasks)")
+                }
+                if "finished_at" not in task_columns:
+                    # ``CREATE TABLE IF NOT EXISTS`` does not add columns to
+                    # a database created by an older release.  Keep that
+                    # schema compatible in place before any history query
+                    # references the terminal timestamp.
+                    connection.execute(
+                        "ALTER TABLE web_tasks ADD COLUMN finished_at REAL"
+                    )
+                if "history_at" not in task_columns:
+                    # ``history_at`` is an internal ordering value.  It keeps
+                    # an interrupted row's original started_at fallback
+                    # stable after the public snapshot receives a real
+                    # failure finished_at timestamp.
+                    connection.execute(
+                        "ALTER TABLE web_tasks ADD COLUMN history_at REAL"
+                    )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS web_tasks_history_at_idx "
+                    "ON web_tasks(history_at DESC)"
+                )
+                # Backfill the ordering columns from legacy JSON when they
+                # are available.  Invalid/non-finite values remain NULL and
+                # therefore use the next deterministic fallback.
+                task_rows = connection.execute(
+                    "SELECT id, started_at, finished_at, history_at, snapshot_json "
+                    "FROM web_tasks"
+                ).fetchall()
+                for row in task_rows:
+                    finished_at = _finite_timestamp(row["finished_at"])
+                    if finished_at is None:
+                        payload = _json_load(row["snapshot_json"], {})
+                        if isinstance(payload, Mapping):
+                            finished_at = _finite_timestamp(payload.get("finished_at"))
+                        if finished_at is not None:
+                            connection.execute(
+                                "UPDATE web_tasks SET finished_at = ? WHERE id = ?",
+                                (finished_at, row["id"]),
+                            )
+                    if _finite_timestamp(row["history_at"]) is not None:
+                        continue
+                    history_at = finished_at
+                    if history_at is None:
+                        history_at = _finite_timestamp(row["started_at"])
+                    if history_at is None:
+                        payload = _json_load(row["snapshot_json"], {})
+                        if isinstance(payload, Mapping):
+                            history_at = _finite_timestamp(payload.get("started_at"))
+                    if history_at is not None:
+                        connection.execute(
+                            "UPDATE web_tasks SET history_at = ? WHERE id = ?",
+                            (history_at, row["id"]),
+                        )
                 # Older persistent volumes do not have an explicit
                 # authentication mode.  Add it in place and normalize any
                 # malformed legacy values before the app serves profiles.
@@ -192,6 +432,61 @@ class SQLiteStore:
                         "last_verified_at = NULL, updated_at = ? WHERE id = ?",
                         (mode, password_token, cookies_token, _utc_now(), row["id"]),
                     )
+                migrated_preferences = self._migrate_preference_configs(connection)
+
+            if migrated_preferences:
+                # Updating a SQLite row does not guarantee that the previous
+                # plaintext disappears from free pages or the WAL.  Compact the
+                # database once after the one-time migration so an old webhook
+                # token or OCR key is not recoverable from the volume bytes.
+                with self._connection() as connection:
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    connection.execute("VACUUM")
+
+    def _encrypt_preference_config(self, value: Mapping[str, Any]) -> str:
+        validate_config_shape(value)
+        plaintext = _json_dump(dict(value))
+        return _PREFERENCE_SECRET_PREFIX + self.secret_box.encrypt(plaintext)
+
+    def _decrypt_preference_config(self, value: str) -> dict[str, Any]:
+        if not isinstance(value, str):
+            return {}
+        if value.startswith(_PREFERENCE_SECRET_PREFIX):
+            token = value[len(_PREFERENCE_SECRET_PREFIX) :]
+            decoded = _json_load(self.secret_box.decrypt(token), {})
+        else:
+            # Read compatibility for databases created before preference
+            # configs were encrypted.  Startup migrates these values in place.
+            decoded = _json_load(value, {})
+        return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+    def _migrate_preference_configs(self, connection: sqlite3.Connection) -> bool:
+        rows = connection.execute(
+            "SELECT account_id, notification_config, ocr_config "
+            "FROM account_preferences"
+        ).fetchall()
+        migrated = False
+        for row in rows:
+            notification = row["notification_config"]
+            ocr = row["ocr_config"]
+            next_notification = notification
+            next_ocr = ocr
+            if not str(notification).startswith(_PREFERENCE_SECRET_PREFIX):
+                next_notification = self._encrypt_preference_config(
+                    self._decrypt_preference_config(notification)
+                )
+            if not str(ocr).startswith(_PREFERENCE_SECRET_PREFIX):
+                next_ocr = self._encrypt_preference_config(
+                    self._decrypt_preference_config(ocr)
+                )
+            if next_notification != notification or next_ocr != ocr:
+                connection.execute(
+                    "UPDATE account_preferences SET notification_config = ?, "
+                    "ocr_config = ?, updated_at = ? WHERE account_id = ?",
+                    (next_notification, next_ocr, _utc_now(), row["account_id"]),
+                )
+                migrated = True
+        return migrated
 
     @staticmethod
     def _profile_from_row(row: sqlite3.Row) -> AccountProfile:
@@ -223,9 +518,7 @@ class SQLiteStore:
 
     @staticmethod
     def _normalize_cookies(cookies: Mapping[str, Any]) -> dict[str, str]:
-        if not isinstance(cookies, Mapping):
-            raise TypeError("cookies must be a mapping")
-        return {str(key): str(value) for key, value in cookies.items()}
+        return validate_cookie_mapping(cookies)
 
     def _encrypt_cookies(self, cookies: Mapping[str, Any] | None) -> str | None:
         if cookies is None:
@@ -247,17 +540,14 @@ class SQLiteStore:
     def _default_preferences() -> AccountPreferences:
         return AccountPreferences()
 
-    @staticmethod
-    def _preferences_from_row(row: sqlite3.Row) -> AccountPreferences:
+    def _preferences_from_row(self, row: sqlite3.Row) -> AccountPreferences:
         selected_course_ids = _json_load(row["selected_course_ids"], [])
         if not isinstance(selected_course_ids, list):
             selected_course_ids = []
-        notification_config = _json_load(row["notification_config"], {})
-        if not isinstance(notification_config, Mapping):
-            notification_config = {}
-        ocr_config = _json_load(row["ocr_config"], {})
-        if not isinstance(ocr_config, Mapping):
-            ocr_config = {}
+        notification_config = self._decrypt_preference_config(
+            row["notification_config"]
+        )
+        ocr_config = self._decrypt_preference_config(row["ocr_config"])
         return AccountPreferences(
             selected_course_ids=[str(course_id) for course_id in selected_course_ids],
             speed=float(row["speed"]),
@@ -359,6 +649,19 @@ class SQLiteStore:
         cookies: Mapping[str, Any] | None = None,
         auth_mode: Literal["password", "cookies"] | None = None,
     ) -> AccountProfile:
+        name = _validate_account_text(name, MAX_ACCOUNT_NAME_LENGTH, "name")
+        username = _validate_account_text(
+            username, MAX_ACCOUNT_USERNAME_LENGTH, "username"
+        )
+        if password is not None:
+            password = _validate_secret_text(
+                password, MAX_ACCOUNT_PASSWORD_LENGTH, "password"
+            )
+        if cookies is not None:
+            # Validate before generating an encrypted token so oversized
+            # values never reach the database or consume unnecessary crypto
+            # work.  ``_encrypt_cookies`` repeats normalization defensively.
+            self._normalize_cookies(cookies)
         status = self._validate_verification_status(verification_status)
         if auth_mode is None:
             # Legacy callers supplied cookies without a mode and expected the
@@ -439,9 +742,13 @@ class SQLiteStore:
             )
 
             if name is not None:
+                name = _validate_account_text(name, MAX_ACCOUNT_NAME_LENGTH, "name")
                 updates.append("name = ?")
                 values.append(str(name))
             if username is not None:
+                username = _validate_account_text(
+                    username, MAX_ACCOUNT_USERNAME_LENGTH, "username"
+                )
                 updates.append("username = ?")
                 values.append(str(username))
                 if str(username) != str(existing["username"]):
@@ -456,6 +763,10 @@ class SQLiteStore:
                 else ""
             )
             current_cookies = self._decrypt_cookies(existing["cookies_token"])
+            if password is not _UNSET and password is not None:
+                password = _validate_secret_text(
+                    password, MAX_ACCOUNT_PASSWORD_LENGTH, "password"
+                )
             password_supplied = (
                 password is not _UNSET
                 and password is not None
@@ -617,6 +928,7 @@ class SQLiteStore:
             preferences = AccountPreferences(**dict(preferences))
         if not isinstance(preferences, AccountPreferences):
             raise TypeError("preferences must be AccountPreferences")
+        _validate_preferences(preferences)
         account_id = str(account_id)
         now = _utc_now()
         with self._connection() as connection:
@@ -653,8 +965,8 @@ class SQLiteStore:
                     int(bool(preferences.answer_enabled)),
                     float(preferences.answer_cover_rate),
                     int(bool(preferences.answer_auto_submit)),
-                    _json_dump(dict(preferences.notification_config)),
-                    _json_dump(dict(preferences.ocr_config)),
+                    self._encrypt_preference_config(preferences.notification_config),
+                    self._encrypt_preference_config(preferences.ocr_config),
                     now,
                 ),
             )
@@ -729,6 +1041,39 @@ class SQLiteStore:
                 max_retries = int(source["max_retries"])
             if max_concurrency is None and "max_concurrency" in source:
                 max_concurrency = int(source["max_concurrency"])
+
+        # Direct store integrations must obey the same bounds as the HTTP
+        # settings route.  Otherwise a caller could bypass Flask's 1 MiB
+        # request guard and persist arbitrarily large provider settings.
+        for field_name, value, maximum in (
+            ("base_url", base_url, MAX_BASE_URL_LENGTH),
+            ("model", model, MAX_MODEL_LENGTH),
+            ("api_key", api_key, MAX_API_KEY_LENGTH),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or len(value) > maximum
+            ):
+                raise ValueError(f"{field_name} is too long")
+        if timeout_seconds is not None:
+            try:
+                timeout_value = float(timeout_seconds)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("invalid timeout_seconds") from None
+            if not math.isfinite(timeout_value) or not 0 < timeout_value <= MAX_TIMEOUT_SECONDS:
+                raise ValueError("invalid timeout_seconds")
+            timeout_seconds = timeout_value
+        if max_retries is not None and (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or not 0 <= max_retries <= MAX_RETRIES
+        ):
+            raise ValueError("invalid max_retries")
+        if max_concurrency is not None and (
+            isinstance(max_concurrency, bool)
+            or not isinstance(max_concurrency, int)
+            or not 1 <= max_concurrency <= MAX_CONCURRENCY
+        ):
+            raise ValueError("invalid max_concurrency")
 
         with self._connection() as db:
             current = self._setting_value(db, _ANSWER_SETTINGS_KEY)
@@ -919,3 +1264,355 @@ class SQLiteStore:
                 ),
             )
         return resolved
+
+    def save_web_task(
+        self,
+        snapshot: Mapping[str, Any],
+        details: Mapping[str, Any],
+        *,
+        history_timestamp: Any = _UNSET,
+    ) -> bool:
+        """Upsert one credential-free task monitor record.
+
+        Task credentials remain in the encrypted account tables.  This table
+        stores only the same public snapshot/details already returned by the
+        task API, so a restart can restore the monitor without retaining a
+        decrypted password, cookie, or answer-service key.
+        """
+
+        if not isinstance(snapshot, Mapping) or not isinstance(details, Mapping):
+            raise ValueError("snapshot and details must be mappings")
+        task_id = validate_task_id(snapshot.get("id", ""))
+        account_id = str(snapshot.get("account_id", "")).strip()
+        if not account_id:
+            raise ValueError("task id and account id are required")
+        # Re-sanitize direct store callers as well as TaskManager's normal
+        # public mapping.  The storage layer cannot assume its caller already
+        # removed a password/cookie/API key, and this sanitizer is bounded and
+        # cycle-safe for in-memory mappings before JSON serialization.
+        safe_snapshot = _sanitize_task_mapping(snapshot)
+        safe_details = _sanitize_task_mapping(details)
+        # Preserve the identifiers validated above even if an unusual account
+        # id happens to match one of the log sanitizer's word patterns.
+        safe_snapshot["id"] = str(task_id)
+        safe_snapshot["account_id"] = account_id
+        started_at = _finite_timestamp(snapshot.get("started_at"))
+        finished_at = _finite_timestamp(snapshot.get("finished_at"))
+        if history_timestamp is _UNSET:
+            history_timestamp = finished_at
+            if history_timestamp is None:
+                history_timestamp = started_at
+        else:
+            history_timestamp = _finite_timestamp(history_timestamp)
+            if history_timestamp is None:
+                history_timestamp = finished_at
+                if history_timestamp is None:
+                    history_timestamp = started_at
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO web_tasks
+                    (id, account_id, snapshot_json, details_json, started_at, finished_at, history_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    details_json = excluded.details_json,
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    history_at = excluded.history_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    account_id,
+                    _json_dump(safe_snapshot),
+                    _json_dump(safe_details),
+                    started_at,
+                    finished_at,
+                    history_timestamp,
+                    _utc_now(),
+                ),
+            )
+        return True
+
+    def save_web_task_log(
+        self,
+        task_id: str,
+        entry: Mapping[str, Any],
+        *,
+        capacity: int,
+    ) -> bool:
+        """Append one task log and retain only the bounded newest entries."""
+
+        capacity = _positive_capacity(capacity, "capacity")
+        if not isinstance(entry, Mapping):
+            raise ValueError("entry must be a mapping")
+        task_id = validate_task_id(task_id)
+        sequence = entry.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise ValueError("sequence must be a positive integer")
+        level = sanitize_log_level(entry.get("level", "info"))
+        message = sanitize_log_message(
+            entry.get("message", ""),
+            historical=True,
+        )
+        try:
+            timestamp = float(entry.get("timestamp", time.time()))
+        except (TypeError, ValueError, OverflowError):
+            timestamp = time.time()
+        if not math.isfinite(timestamp):
+            timestamp = time.time()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO web_task_logs
+                    (task_id, sequence, level, message, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, sequence) DO UPDATE SET
+                    level = excluded.level,
+                    message = excluded.message,
+                    timestamp = excluded.timestamp
+                """,
+                (
+                    str(task_id),
+                    sequence,
+                    level,
+                    message,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM web_task_logs
+                WHERE task_id = ? AND sequence NOT IN (
+                    SELECT sequence FROM web_task_logs
+                    WHERE task_id = ?
+                    ORDER BY sequence DESC
+                    LIMIT ?
+                )
+                """,
+                (str(task_id), str(task_id), capacity),
+            )
+        return True
+
+    def load_web_tasks(
+        self,
+        *,
+        limit: int,
+        log_capacity: int = DEFAULT_WEB_TASK_LOG_CAPACITY,
+    ) -> list[dict[str, Any]]:
+        """Load newest persisted monitor records with their bounded logs."""
+
+        limit = _positive_capacity(limit, "limit")
+        log_capacity = _positive_capacity(log_capacity, "log_capacity")
+        # Do not use the mutating connection context here: even setting WAL
+        # mode can acquire a write lock, and historical migration must remain
+        # an independent best-effort operation owned by TaskManager.
+        with self._read_connection() as connection:
+            # Active rows are never part of the terminal history quota.  Read
+            # every running/stopping task first, then apply ``limit`` only to
+            # terminal rows ordered by the same finished_at/start fallback
+            # used by TaskManager.
+            row_fields = (
+                "id, account_id, snapshot_json, details_json, "
+                "started_at, finished_at, history_at"
+            )
+            active_rows = connection.execute(
+                f"""
+                SELECT {row_fields}
+                FROM web_tasks
+                WHERE json_valid(snapshot_json)
+                  AND json_extract(snapshot_json, '$.state')
+                      IN ('running', 'stopping')
+                ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
+                """
+            ).fetchall()
+            terminal_rows = connection.execute(
+                f"""
+                SELECT {row_fields}
+                FROM web_tasks
+                WHERE json_valid(snapshot_json)
+                  AND json_extract(snapshot_json, '$.state')
+                      IN ('completed', 'failed', 'stopped')
+                ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            rows = [*active_rows, *terminal_rows]
+            records: list[tuple[tuple[float, str], dict[str, Any]]] = []
+            for row in rows:
+                raw_snapshot = _json_load(row["snapshot_json"], {})
+                raw_details = _json_load(row["details_json"], {})
+                snapshot, snapshot_dirty = _sanitize_task_mapping_with_dirty(
+                    raw_snapshot
+                )
+                details, details_dirty = _sanitize_task_mapping_with_dirty(
+                    raw_details
+                )
+                if not isinstance(snapshot, Mapping) or not isinstance(details, Mapping):
+                    continue
+                try:
+                    task_id = validate_task_id(row["id"])
+                    account_id = str(row["account_id"]).strip()
+                except (TypeError, ValueError):
+                    continue
+                if not account_id:
+                    continue
+                # The table columns are the canonical identifiers used by the
+                # foreign key and ordering queries.  Reassert them after
+                # sanitization so no legacy JSON can replace the row identity.
+                if snapshot.get("id") != str(task_id) or snapshot.get("account_id") != account_id:
+                    snapshot_dirty = True
+                snapshot["id"] = str(task_id)
+                snapshot["account_id"] = account_id
+                for field_name in ("started_at", "finished_at"):
+                    column_timestamp = _finite_timestamp(row[field_name])
+                    if column_timestamp is None:
+                        continue
+                    if snapshot.get(field_name) != column_timestamp:
+                        snapshot_dirty = True
+                    snapshot[field_name] = column_timestamp
+                # Redact credentials in stored errors while preserving the
+                # failure reason. The manager retries any needed writeback.
+                error = snapshot.get("error")
+                if error is not None:
+                    cleaned_error = sanitize_log_message(error, historical=True)
+                    if cleaned_error != error:
+                        snapshot_dirty = True
+                    snapshot["error"] = cleaned_error
+                log_rows = connection.execute(
+                    """
+                    SELECT sequence, level, message, timestamp
+                    FROM web_task_logs
+                    WHERE task_id = ?
+                    ORDER BY sequence DESC
+                    LIMIT ?
+                    """,
+                    (row["id"], log_capacity),
+                ).fetchall()
+                cleaned_logs: list[dict[str, Any]] = []
+                logs_dirty = False
+                for item in reversed(log_rows):
+                    cleaned_message = sanitize_log_message(
+                        item["message"],
+                        historical=True,
+                    )
+                    cleaned_level = sanitize_log_level(item["level"])
+                    if (
+                        cleaned_message != item["message"]
+                        or cleaned_level != item["level"]
+                    ):
+                        # This is metadata for the in-process manager only;
+                        # the write-back itself is deliberately not performed
+                        # by this read-only loader.
+                        logs_dirty = True
+                    cleaned_logs.append(
+                        {
+                            **dict(item),
+                            "level": cleaned_level,
+                            "message": cleaned_message,
+                        }
+                    )
+                # Loading is itself a persistence/API boundary.  Old rows
+                # are cleaned before any caller can inspect the returned
+                # payload.  TaskManager owns any best-effort migration
+                # write-back separately, so this loader stays a pure read
+                # even for read-only or locked databases.
+                order_timestamp = _finite_timestamp(row["history_at"])
+                if order_timestamp is None:
+                    order_timestamp = _finite_timestamp(row["finished_at"])
+                if order_timestamp is None:
+                    order_timestamp = _finite_timestamp(row["started_at"])
+                if order_timestamp is None:
+                    order_timestamp = 0.0
+                record = _TrustedWebTaskRecord(
+                    {
+                        "snapshot": dict(snapshot),
+                        "details": dict(details),
+                        "logs": cleaned_logs,
+                    },
+                    history_timestamp=order_timestamp,
+                )
+                if logs_dirty:
+                    record["_logs_dirty"] = True
+                if snapshot_dirty or details_dirty:
+                    record["_record_dirty"] = True
+                records.append(((order_timestamp, str(task_id)), record))
+            records.sort(key=lambda item: item[0], reverse=True)
+            return [record for _, record in records]
+
+    def prune_web_tasks(
+        self,
+        *,
+        log_capacity: int,
+        terminal_task_capacity: int,
+    ) -> bool:
+        """Trim durable monitor logs/tasks after a restart.
+
+        ``load_web_tasks`` remains a pure read so it can safely run against a
+        read-only/locked database.  TaskManager calls this independent,
+        best-effort mutation once restoration has completed.  Both deletes are
+        expressed in terms of bounded newest-first subqueries and run in one
+        transaction, so a failed write is rolled back rather than reported as
+        a successful cleanup.
+        """
+
+        log_capacity = _positive_capacity(log_capacity, "log_capacity")
+        terminal_task_capacity = _positive_capacity(
+            terminal_task_capacity, "terminal_task_capacity"
+        )
+        with self._connection() as connection:
+            task_rows = connection.execute("SELECT id FROM web_tasks").fetchall()
+            for row in task_rows:
+                task_id = str(row["id"])
+                count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM web_task_logs WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if count is None or int(count["count"]) <= log_capacity:
+                    continue
+                connection.execute(
+                    """
+                    DELETE FROM web_task_logs
+                    WHERE task_id = ? AND sequence NOT IN (
+                        SELECT sequence FROM web_task_logs
+                        WHERE task_id = ?
+                        ORDER BY sequence DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (task_id, task_id, log_capacity),
+                )
+
+            # ``json_valid`` prevents a malformed legacy JSON blob from
+            # aborting the entire cleanup.  Valid task rows use the closed
+            # state set, and ties are deterministic by id.
+            connection.execute(
+                """
+                DELETE FROM web_tasks
+                WHERE id IN (
+                    SELECT id FROM web_tasks
+                    WHERE json_valid(snapshot_json)
+                      AND json_extract(snapshot_json, '$.state')
+                          IN ('completed', 'failed', 'stopped')
+                    ORDER BY COALESCE(history_at, finished_at, started_at, 0) DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (terminal_task_capacity,),
+            )
+        return True
+
+    def delete_web_tasks(self, task_ids: list[str] | tuple[str, ...]) -> None:
+        """Delete exact task records selected by the bounded manager."""
+
+        ids = [str(task_id) for task_id in task_ids if str(task_id).strip()]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection() as connection:
+            connection.execute(
+                f"DELETE FROM web_tasks WHERE id IN ({placeholders})",
+                ids,
+            )

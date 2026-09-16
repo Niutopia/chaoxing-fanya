@@ -237,7 +237,8 @@ def test_http_exception_status_and_semantics_survive_generic_handler(tmp_path):
         abort(400, description="bad request")
 
     client = app.test_client()
-    method_not_allowed = client.post("/")
+    # Use the route declared by this test: a clean checkout has no web/dist.
+    method_not_allowed = client.post("/round2-abort")
     bad_request = client.get("/round2-abort")
 
     assert method_not_allowed.status_code == 405

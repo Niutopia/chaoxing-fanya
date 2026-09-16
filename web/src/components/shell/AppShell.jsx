@@ -45,7 +45,12 @@ function AppShell({ accounts = [], tasks = [], onAddAccount, onAccountSaved, cla
 
   return (
     <>
-      <div className={cn('app-shell flex min-h-dvh flex-col bg-canvas text-label-primary', className)}>
+      <div
+        className={cn(
+          'app-shell flex min-h-dvh flex-col bg-canvas text-label-primary md:h-dvh md:overflow-hidden',
+          className,
+        )}
+      >
         <Titlebar
           sidebarOpen={sidebarOpen}
           onMenuToggle={() => setSidebarOpen((open) => !open)}
@@ -58,7 +63,12 @@ function AppShell({ accounts = [], tasks = [], onAddAccount, onAccountSaved, cla
             onNavigate={closeSidebar}
             className={cn(!sidebarOpen && 'hidden md:flex')}
           />
-          <main id="main-content" className="min-w-0 flex-1 bg-canvas" tabIndex="-1">
+          <main
+            id="main-content"
+            aria-label="主要内容"
+            className="min-w-0 flex-1 bg-canvas md:h-full md:overflow-y-auto md:overscroll-contain"
+            tabIndex="-1"
+          >
             <Outlet />
           </main>
         </div>

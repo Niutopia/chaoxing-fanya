@@ -234,6 +234,11 @@ class ChaoxingStudyRunner:
         # custom reporters are treated as best-effort integrations here.
         try:
             method(*args, **kwargs)
+        except StudyCancelled:
+            # Cancellation is control flow, not an optional reporter failure.
+            # Let the owning JobProcessor/TaskManager stop the task instead of
+            # silently continuing after a reporter observes the event.
+            raise
         except TypeError:
             # A few legacy reporter doubles accept one mapping instead of
             # keyword fields.  Keep that compatibility without changing the
@@ -241,6 +246,8 @@ class ChaoxingStudyRunner:
             if kwargs:
                 try:
                     method(*args, dict(kwargs))
+                except StudyCancelled:
+                    raise
                 except Exception:
                     return
         except Exception:
@@ -257,8 +264,23 @@ class ChaoxingStudyRunner:
 
         callback: Callable[[Mapping[str, str]], None]
         if self.cookie_update_callback_factory is not None:
-            callback = self.cookie_update_callback_factory(str(context.account_id))
+            try:
+                callback = self.cookie_update_callback_factory(str(context.account_id))
+            except BaseException:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise
             if not callable(callback):
+                close = getattr(session, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
                 raise TypeError("cookie_update_callback_factory must return a callable")
         else:
             callback = partial(save_cookie_file, path=cookie_path)
@@ -345,6 +367,10 @@ class ChaoxingStudyRunner:
 
     @staticmethod
     def _job_result_status(result: Any) -> str:
+        if getattr(result, "name", None) == "BLOCKED":
+            return "blocked"
+        if getattr(result, "name", None) == "SKIPPED":
+            return "skipped"
         if isinstance(result, str):
             value = result.strip().lower()
             if value in {"completed", "success", "done"}:
@@ -355,6 +381,8 @@ class ChaoxingStudyRunner:
         if callable(is_failure):
             try:
                 return "failed" if is_failure() else "completed"
+            except StudyCancelled:
+                raise
             except Exception:
                 return "failed"
         if isinstance(result, Mapping):
@@ -386,6 +414,10 @@ class ChaoxingStudyRunner:
             "task_id": context.task_id,
             "cancel_event": context.cancel_event,
             "ocr_config": dict(preferences.ocr_config),
+            # JobProcessor's nested workers use this explicit value when
+            # entering task-log context.  It also covers dedicated workers
+            # whose contextvars must be captured at their thread boundary.
+            "_log_secrets": self._secret_values(context),
         }
 
         counts: dict[str, Any] = {
@@ -441,6 +473,12 @@ class ChaoxingStudyRunner:
                     for course in course_nodes
                     for chapter in course.get("chapters", [])
                 )
+                from api.work_grades import summarize_work_grades
+                answers = [job["answer_result"] for course in course_nodes
+                           for chapter in course.get("chapters", []) for job in chapter.get("jobs", [])
+                           if isinstance(job.get("answer_result"), dict)]
+                if answers:
+                    counts.update(summarize_work_grades(answers))
                 snapshot = dict(counts)
             self._report(context.reporter, "set_counts", **snapshot)
 
@@ -509,6 +547,7 @@ class ChaoxingStudyRunner:
                 "set_current",
                 course=self._course_title(course),
                 chapter=None,
+                task=None,
             )
             report_tree()
 
@@ -541,7 +580,7 @@ class ChaoxingStudyRunner:
                 raise StudyCancelled()
             key = chapter_key(course, point)
             normalized_status = str(status or "failed").strip().lower()
-            if normalized_status not in {"failed", "not_open", "running"}:
+            if normalized_status not in {"failed", "not_open", "running", "skipped", "blocked"}:
                 normalized_status = "failed"
             with tree_lock:
                 chapter = ensure_chapter_node(course, point)
@@ -561,6 +600,7 @@ class ChaoxingStudyRunner:
                 "set_current",
                 course=self._course_title(course),
                 chapter=self._chapter_title(point),
+                task=None,
             )
             report_tree()
 
@@ -625,6 +665,8 @@ class ChaoxingStudyRunner:
                     job_by_key[key] = item
                     chapter.setdefault("jobs", []).append(item)
                 item["status"] = "running"
+                item.pop("reason", None)
+                item.pop("next_action", None)
                 active_jobs[":".join(key)] = {
                     "id": item["id"],
                     "title": item["title"],
@@ -663,9 +705,18 @@ class ChaoxingStudyRunner:
                     ensure_chapter_node(course, point).setdefault("jobs", []).append(item)
                 status = self._job_result_status(result)
                 item["status"] = status
+                if isinstance(job.get("answer_result"), Mapping):
+                    item["answer_result"] = copy.deepcopy(job["answer_result"])
+                for field in ("reason", "next_action"):
+                    if status != "completed" and job.get(field):
+                        item[field] = self._safe_error(context, job[field])
+                    else:
+                        item.pop(field, None)
                 active_jobs.pop(":".join(key), None)
                 if status == "completed":
                     completed_tasks.add(key)
+                else:
+                    completed_tasks.discard(key)
             report_active_jobs()
             report_counts()
             report_tree()
@@ -768,6 +819,7 @@ class ChaoxingStudyRunner:
                 code = "study_run_error"
             raise StudyRunError(self._safe_error(context, exc), code=code) from None
 
+        engine = None
         try:
             with vision_ocr_context(preferences.ocr_config):
                 if context.cancel_event.is_set():
@@ -890,6 +942,12 @@ class ChaoxingStudyRunner:
                     # processor but do not emit a terminal callback.
                     if course_key(course) not in course_terminal:
                         course_done_callback(course)
+                incomplete_courses = len(selected_courses) - len(completed_courses)
+                if incomplete_courses:
+                    raise StudyRunError(
+                        f"有 {incomplete_courses} 门课程尚未完成，请检查失败、未开放或待手动提交的章节",
+                        code="courses_incomplete",
+                    )
         except StudyCancelled:
             raise
         except StudyRunError as exc:
@@ -902,6 +960,52 @@ class ChaoxingStudyRunner:
             if not isinstance(code, str) or not code:
                 code = "study_run_error"
             raise StudyRunError(self._safe_error(context, exc), code=code) from None
+        finally:
+            self._close_resources(engine, session)
+
+    @staticmethod
+    def _close_resources(engine: Any, session: Any) -> None:
+        """Close per-task HTTP clients and sessions after the runner unwinds.
+
+        ``AI`` creates a fresh ``httpx.Client`` for every task.  Leaving that
+        client (and the account ``requests.Session``) alive would accumulate
+        connection pools and file descriptors in a long-running Web process.
+        Only explicit close methods are called; arbitrary engine doubles are
+        otherwise left untouched.
+        """
+
+        closed: set[int] = set()
+
+        def close_once(value: Any) -> None:
+            if value is None or id(value) in closed:
+                return
+            close = getattr(value, "close", None)
+            if not callable(close):
+                return
+            closed.add(id(value))
+            try:
+                close()
+            except StudyCancelled:
+                # Preserve control flow if an injected cleanup hook itself
+                # observes cancellation; never swallow StudyCancelled in a
+                # broad cleanup handler.
+                raise
+            except Exception:
+                return
+
+        # Chaoxing owns the account session; provider clients are commonly
+        # reachable through ``engine.tiku``.  Some integrations expose their
+        # provider directly, so check the engine as well without invoking a
+        # generic engine.close() hook.
+        provider = getattr(engine, "tiku", None) if engine is not None else None
+        for candidate in (
+            getattr(provider, "_httpx_client", None),
+            getattr(provider, "_session", None),
+            getattr(provider, "client", None),
+            getattr(engine, "_httpx_client", None) if engine is not None else None,
+        ):
+            close_once(candidate)
+        close_once(session)
 
 
 __all__ = [

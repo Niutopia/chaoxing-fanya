@@ -172,3 +172,28 @@ web/.vite/
 .worktrees/
 data/
 .superpowers/
+
+# Local credentials, user data, and backups are never publication inputs.
+.env.*
+!.env.example
+*.key
+*.pem
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+answer-cache.json
+backups/
+.backups/
+*.tgz
+*.tar.gz
+*.tar
+
+# Personal operational reports; public guidance lives in operations/verification.
+/docs/answer-accuracy-and-overview.md
+/docs/functional-audit-*.md
+/docs/lifecycle-acceptance-*.md
+/docs/reliability-follow-up-*.md
+/docs/score-repair-*.md

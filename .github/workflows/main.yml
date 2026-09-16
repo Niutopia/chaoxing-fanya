@@ -2,45 +2,90 @@ name: CI
 
 on:
   push:
-
-  # Allows you to run this workflow manually from the Actions tab
+  pull_request:
+  # Allows you to run this workflow manually from the Actions tab.
   workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            architecture: 'x64'
-            name: 'win64'
+permissions:
+  contents: read
 
+jobs:
+  linux:
+    name: Linux tests and Docker build
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v3
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-          architecture: ${{matrix.architecture}}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Python requirements
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      - name: Run Python tests
+        run: python -m pytest
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend requirements
+        working-directory: web
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: web
+        run: npm test
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build Docker image
+        run: docker build --file Dockerfile --tag chaoxing-fanya:ci .
+
+  windows:
+    name: Windows portable package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
 
       - name: Install requirements
         run: |
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
-      - name: Build win bin
+      - name: Build Windows binary
         run: pyinstaller -F main.py -n 'chaoxing' --add-data "resource;resource"
 
       - name: Create release package
+        shell: pwsh
         run: |
-          mkdir release
-          copy dist\chaoxing.exe release\
-          copy config_template.ini release\
-          cd release
-          7z a -tzip chaoxing.zip *
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist\chaoxing.exe release\
+          Copy-Item config.ini.example release\
+          Push-Location release
+          7z a -tzip chaoxing.zip chaoxing.exe config.ini.example
+          Pop-Location
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: 'release/chaoxing.zip'
+          name: win64
+          path: release/chaoxing.zip

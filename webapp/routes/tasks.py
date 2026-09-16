@@ -1,9 +1,10 @@
 """Task start, monitoring, log, and cancellation endpoints.
 
-Task state intentionally lives in the process-local :class:`TaskManager`.
+Live execution remains process-local, while credential-free monitor records
+are mirrored to SQLite so an application restart does not erase task history.
 Routes resolve account credentials and the shared answer connection only for
-the short startup hand-off; all HTTP serializers below operate on the
-credential-free task value objects returned by the manager.
+the short startup hand-off; all HTTP serializers below operate on the public
+task value objects returned by the manager.
 """
 
 from __future__ import annotations
@@ -17,7 +18,10 @@ from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
 
+from api.logger import sanitize_log_message
+
 from ..answer_connection import outbound_url
+from ..limits import MAX_COURSE_ID_LENGTH, MAX_SELECTED_COURSE_IDS
 from ..models import AccountAuth, AccountPreferences, ResolvedAnswerConnection
 from ..task_manager import (
     AccountTaskConflict,
@@ -86,6 +90,7 @@ def _details_data(details: Any) -> dict[str, Any]:
         "courses": _copy_json_value(details.courses),
         "active_jobs": _copy_json_value(details.active_jobs),
         "counts": _copy_json_value(details.counts),
+        "answer_report": _copy_json_value(getattr(details, "answer_report", {})),
     }
 
 
@@ -93,7 +98,10 @@ def _log_data(entry: Any) -> dict[str, Any]:
     return {
         "sequence": entry.sequence,
         "level": entry.level,
-        "message": entry.message,
+        # Keep a final serializer boundary in case a custom manager/adapter
+        # supplies an unclean entry.  Historical content is replaced as a
+        # whole; harmless progress metadata remains visible.
+        "message": sanitize_log_message(entry.message, historical=True),
         "timestamp": entry.timestamp,
     }
 
@@ -147,6 +155,10 @@ def _valid_preferences(value: Any) -> bool:
         isinstance(course_id, str) and course_id.strip() for course_id in selected
     ):
         return False
+    if len(selected) > MAX_SELECTED_COURSE_IDS or any(
+        len(course_id) > MAX_COURSE_ID_LENGTH for course_id in selected
+    ):
+        return False
     if not _finite_number(value.speed) or not 1.0 <= float(value.speed) <= 2.0:
         return False
     if (
@@ -179,7 +191,11 @@ def _course_ids(payload: Mapping[str, Any], preferences: AccountPreferences) -> 
         raise ValueError("courses_required")
     if not value:
         raise ValueError("courses_required")
+    if len(value) > MAX_SELECTED_COURSE_IDS:
+        raise ValueError("invalid_courses")
     if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ValueError("invalid_courses")
+    if any(len(item.strip()) > MAX_COURSE_ID_LENGTH for item in value):
         raise ValueError("invalid_courses")
     # De-duplicate while retaining the user's order.  Sending the same course
     # twice must not make the runner process it twice.
@@ -472,6 +488,27 @@ def get_task_details(task_id: str):
     except TaskNotFound:
         return _error("Task not found", "task_not_found", 404)
     return jsonify(status=True, data=_details_data(details))
+
+
+@tasks.post("/tasks/<task_id>/answer-report")
+def refresh_answer_report(task_id: str):
+    import threading
+    from ..grading_service import refresh_task_grades
+    manager = _manager()
+    try:
+        snapshot = manager.get_snapshot(task_id)
+        details = manager.get_details(task_id)
+        if not details.courses:
+            return _error("本次任务没有可读取的课程详情", "missing_courses", 400)
+        started_at = manager.begin_answer_report(task_id)
+    except TaskNotFound:
+        return _error("Task not found", "task_not_found", 404)
+    except ValueError as exc:
+        return _error(str(exc), "task_active", 409)
+    if started_at is not None:
+        service = _services()["account_service"]
+        threading.Thread(target=refresh_task_grades, args=(manager, service, snapshot, details, started_at), daemon=True).start()
+    return jsonify(status=True, data=_details_data(manager.get_details(task_id))), 202
 
 
 def _after_cursor() -> int:

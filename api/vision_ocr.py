@@ -191,7 +191,7 @@ def _load_vision_ocr_config() -> Optional[Dict[str, str]]:
             endpoint = defaults["endpoint"]
 
         if not endpoint:
-            logger.warning(f"视觉 OCR 提供商 '{provider}' 需要指定 CHAOXING_VISION_OCR_ENDPOINT")
+            logger.warning("视觉 OCR 提供商缺少服务端点配置")
             _VISION_OCR_ENABLED = False
             _VISION_OCR_CONFIG = None
             return None
@@ -212,7 +212,7 @@ def _load_vision_ocr_config() -> Optional[Dict[str, str]]:
             "prompt": prompt,
         }
         _VISION_OCR_ENABLED = True
-        logger.info(f"外部 AI 视觉 OCR 已启用: provider={provider}, model={model}")
+        logger.info("外部 AI 视觉 OCR 已启用")
         return dict(_VISION_OCR_CONFIG)
 
 
@@ -273,7 +273,7 @@ def _call_openai_compatible(config: Dict[str, str], image_bytes: bytes) -> str:
             timeout=30
         )
         if resp.status_code != 200:
-            logger.debug(f"OpenAI 兼容 API 返回异常: {resp.status_code} - {resp.text[:200]}")
+            logger.debug("OpenAI 兼容视觉 OCR 返回异常")
             return ""
 
         data = resp.json()
@@ -290,7 +290,7 @@ def _call_openai_compatible(config: Dict[str, str], image_bytes: bytes) -> str:
                 return content
         return ""
     except Exception as exc:
-        logger.debug(f"OpenAI 兼容 API 调用失败: {exc}")
+        logger.debug("OpenAI 兼容视觉 OCR 调用失败（异常内容已省略）")
         return ""
 
 
@@ -334,7 +334,7 @@ def _call_claude(config: Dict[str, str], image_bytes: bytes) -> str:
             timeout=30
         )
         if resp.status_code != 200:
-            logger.debug(f"Claude API 返回异常: {resp.status_code} - {resp.text[:200]}")
+            logger.debug("Claude 视觉 OCR 返回异常")
             return ""
 
         data = resp.json()
@@ -351,7 +351,7 @@ def _call_claude(config: Dict[str, str], image_bytes: bytes) -> str:
                     return text
         return ""
     except Exception as exc:
-        logger.debug(f"Claude API 调用失败: {exc}")
+        logger.debug("Claude 视觉 OCR 调用失败（异常内容已省略）")
         return ""
 
 

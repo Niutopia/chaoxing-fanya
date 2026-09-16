@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
+from hashlib import sha256
 from pathlib import Path
 from re import sub
 from typing import Optional
@@ -20,6 +21,33 @@ from api.answer_check import *
 from api.logger import logger
 from api.decode import _ocr_image_to_text, ENABLE_LOCAL_OCR
 from api.vision_ocr import is_vision_ocr_enabled
+from api.live_process import StudyCancelled
+from api.option_parser import (
+    labeled_option_lines as _shared_labeled_option_lines,
+    option_lines as _shared_option_lines,
+    strip_option_prefix as _shared_strip_option_prefix,
+)
+
+
+# Distinguish an omitted compare value from an explicit cached value (including
+# ``None``) when removing cache entries atomically.
+_CACHE_EXPECTED_UNSET = object()
+
+
+def question_cache_key(question: dict) -> str:
+    """Bind answers to the question type, wording and ordered answer controls.
+
+    Bare-title entries from earlier versions cannot identify which option
+    order produced a cached letter, so they deliberately remain cache misses.
+    """
+    payload = {
+        "title": question.get("title", ""),
+        "type": question.get("type", ""),
+        "options": _shared_option_lines(question.get("options", "")),
+        "blanks": question.get("expectedBlankCount"),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return "question-v2:" + sha256(encoded).hexdigest()
 
 
 def _strip_json_block(md_str: str) -> str:
@@ -31,35 +59,75 @@ def _strip_json_block(md_str: str) -> str:
     return match.group(1).strip() if match else md_str.strip()
 
 
-def _ensure_answer_list(value) -> list[str]:
-    """确保返回答案列表，兼容字符串、列表等多种格式"""
+def _ensure_answer_list(value, preserve_empty: bool = False) -> list[str]:
+    """Ensure a provider value is a list, optionally retaining blank slots."""
     if value is None:
         return []
     if isinstance(value, (list, tuple, set)):
+        if preserve_empty:
+            return ["" if item is None else str(item).strip() for item in value]
         return [str(item).strip() for item in value if str(item).strip()]
+    if preserve_empty and isinstance(value, str):
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        return [part.strip() for part in normalized.split("\n")]
     text = str(value).strip()
     return [text] if text else []
 
 
 def _prepare_option_lines(options) -> list[str]:
-    if not options:
-        return []
-    if isinstance(options, str):
-        raw = options.splitlines()
-    elif isinstance(options, (list, tuple, set)):
-        raw = options
-    else:
-        raw = [str(options)]
-    cleaned = []
-    for item in raw:
-        item_str = str(item).strip()
-        if item_str:
-            cleaned.append(item_str)
-    return cleaned
+    return _shared_option_lines(options)
 
 
 def _clean_option_prefix(option: str) -> str:
-    return re.sub(r"^[A-Za-z]\.?,?、?\s*", "", option).strip()
+    """Remove an explicit option prefix without trimming ordinary words."""
+
+    return _shared_strip_option_prefix(option)
+
+
+def _labeled_option_lines(options) -> tuple[list[str], list[str]]:
+    """Preserve existing option labels or generate stable A-Z labels."""
+
+    return _shared_labeled_option_lines(options)
+
+
+def _with_choice_label_instruction(prompt: str, q_type: str, labels: list[str]) -> str:
+    if q_type not in {"single", "multiple"} or not labels:
+        return prompt
+    label_hint = "、".join(labels)
+    return f"{prompt}\n本题合法选项标签：{label_hint}。答案只能使用这些标签。"
+
+
+def _choice_repair_messages(
+    q_info: dict, previous_answer=None
+) -> list[dict]:
+    """Build a strict, bounded format-repair prompt for choice answers."""
+
+    q_type = q_info.get("type", "single")
+    options, labels = _labeled_option_lines(q_info.get("options", []))
+    if q_type == "multiple":
+        example = '{"Answer": ["A", "C"]}'
+    else:
+        example = '{"Answer": ["A"]}'
+    system_prompt = (
+        "选择题答案格式修复。仅返回JSON，禁止解释、思考过程或Markdown。"
+        f"格式：{example}。Answer 数组只能包含题目提供的合法选项标签，"
+        "不得返回选项正文、自然语言或越界标签。"
+    )
+    system_prompt = _with_choice_label_instruction(system_prompt, q_type, labels)
+    user_content = f"题目：{q_info.get('title', '')}".strip()
+    if options:
+        user_content = f"{user_content}\n选项：{chr(10).join(options)}"
+    if previous_answer is not None and str(previous_answer).strip():
+        # A malformed provider response is useful context, but an unbounded
+        # response could turn the repair request into a prompt-size attack.
+        previous_text = str(previous_answer).strip()[:2048]
+        user_content = (
+            f"{user_content}\n上一轮返回（仅用于格式纠正）：{previous_text}"
+        )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
 
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
@@ -99,8 +167,10 @@ def _apply_ocr_to_title_if_needed(q_info: dict, *, session=None) -> None:
                 text = _ocr_image_to_text(src) or ""
             else:
                 text = _ocr_image_to_text(src, session=session) or ""
-        except Exception as exc:
-            logger.debug(f"题目图片 OCR 调用异常: {exc}")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.debug("题目图片 OCR 调用异常")
 
         if text:
             return f"[公式: {text}]"
@@ -109,7 +179,7 @@ def _apply_ocr_to_title_if_needed(q_info: dict, *, session=None) -> None:
 
     new_title = _IMG_TAG_PATTERN.sub(_repl, title)
     if new_title != title:
-        logger.debug(f"题目图片 OCR 处理后标题：{new_title}")
+        logger.debug("题目图片 OCR 处理完成（标题内容已省略）")
         q_info["title"] = new_title
 
 class CacheDAO:
@@ -231,12 +301,42 @@ class CacheDAO:
         data = self._read_cache()
         return data.get(question)
 
-    def add_cache(self, question: str, answer: str) -> None:
-        # 为缓存写入加锁，防止并发写入损坏文件
+    def replace_cache(self, question: str, answer: Optional[str]) -> None:
+        """Atomically replace or remove one cached answer."""
+
         with self._lock:
             data = self._read_cache()
-            data[question] = answer
+            if answer is None:
+                data.pop(question, None)
+            else:
+                data[question] = answer
             self._write_cache(data)
+
+    def remove_cache(self, question: str, expected=_CACHE_EXPECTED_UNSET) -> bool:
+        """Remove a cached answer, optionally only if it still equals expected.
+
+        The compare-and-delete happens under the same per-file lock as the
+        read/modify/write operation.  This prevents a delayed repair from
+        deleting a canonical value written by another worker in the meantime.
+        """
+
+        with self._lock:
+            data = self._read_cache()
+            if question not in data:
+                return False
+            if (
+                expected is not _CACHE_EXPECTED_UNSET
+                and data.get(question) != expected
+            ):
+                return False
+            data.pop(question, None)
+            self._write_cache(data)
+            return True
+
+    def add_cache(self, question: str, answer: str) -> None:
+        # Keep the historical API while making additions use the same atomic
+        # read/modify/replace path as canonical-answer repairs.
+        self.replace_cache(question, answer)
 
 
 # TODO: 重构此部分代码，将此类改为抽象类，加载题库方法改为静态方法，禁止直接初始化此类
@@ -256,6 +356,7 @@ class Tiku:
         # the configured provider.  Keeping this optional preserves direct
         # CLI/test Tiku usage and its legacy OCR fallback.
         self.session = None
+        self.cancel_event: Optional[threading.Event] = None
 
     @property
     def name(self):
@@ -335,6 +436,25 @@ class Tiku:
     def config_set(self,config):
         self._conf = config
 
+    def set_cancel_event(self, cancel_event: Optional[threading.Event]) -> None:
+        """Attach task cancellation to every provider implementation."""
+
+        self.cancel_event = cancel_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise StudyCancelled()
+
+    def _wait_or_cancel(self, seconds: float) -> None:
+        self._raise_if_cancelled()
+        if seconds <= 0:
+            return
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(seconds):
+                raise StudyCancelled()
+        else:
+            time.sleep(seconds)
+
     def _get_conf(self):
         """
         从默认配置文件查询配置, 如果未能查到, 停用题库
@@ -349,11 +469,13 @@ class Tiku:
             return None
         
     def query(self,q_info:dict) -> Optional[str]:
+        self._raise_if_cancelled()
         if self.DISABLE:
             return None
 
-        # 预处理, 去除【单选题】这样与标题无关的字段
-        logger.debug(f"原始标题：{q_info['title']}")
+        # 预处理, 去除【单选题】这样与标题无关的字段。题干可能含有
+        # 作业答案/个人信息，日志只保留固定的处理阶段元数据。
+        logger.debug("开始处理题目（题干内容已省略）")
 
         # 检测并处理题目中的图片链接：使用本地 OCR 将公式图片转为文本
         if self.session is None:
@@ -361,9 +483,10 @@ class Tiku:
         else:
             _apply_ocr_to_title_if_needed(q_info, session=self.session)
 
-        q_info['title'] = sub(r'^\d+', '', q_info['title'])
+        # A leading number can be part of a mathematical expression. Keep
+        # the decoded wording intact rather than guessing a question number.
         q_info['title'] = sub(r'（\d+\.\d+分）$', '', q_info['title'])
-        logger.debug(f"处理后标题：{q_info['title']}")
+        logger.debug("题目预处理完成（题干内容已省略）")
 
         # 先过缓存。 ``init_tiku`` creates the DAO once, while this lazy
         # fallback keeps direct/legacy callers compatible when they query a
@@ -372,31 +495,37 @@ class Tiku:
         if cache_dao is None:
             cache_dao = CacheDAO()
             self._cache = cache_dao
-        answer = cache_dao.get_cache(q_info['title'])
+        cache_key = question_cache_key(q_info)
+        answer = cache_dao.get_cache(cache_key)
         if answer:
-            logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
-            return answer.strip()
+            logger.info("从缓存中获取答案（题目与答案内容已省略）")
+            return answer if q_info.get('type') == 'completion' else answer.strip()
         else:
             answer = self._query(q_info)
             if answer:
-                answer = answer.strip()
-                logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
+                if q_info.get('type') != 'completion':
+                    answer = answer.strip()
+                logger.info(
+                    "从{}获取答案成功（题目与答案内容已省略）",
+                    self.name,
+                )
 
-                # 对 AI / 硅基流动等大模型题库更宽松：只要有非空答案就直接使用并写入缓存，
-                # 不再依赖 check_answer 的严格类型判断，避免丢弃诸如“输入/输出”、“Babbage machine”这种正常答案
+                # AI/SiliconFlow results are provider-shaped and are not
+                # canonical until the base layer validates and maps them for
+                # the actual question controls.  Never persist a raw model
+                # response here; the mapped layer owns those writes.
                 from api.answer import AI, SiliconFlow  # type: ignore
                 if isinstance(self, (AI, SiliconFlow)):
-                    cache_dao.add_cache(q_info['title'], answer)
                     return answer
 
                 if check_answer(answer, q_info['type'], self):
-                    cache_dao.add_cache(q_info['title'], answer)
+                    cache_dao.add_cache(cache_key, answer)
                     return answer
                 else:
                     logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
                     return None
 
-            logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
+            logger.error("从{}获取答案失败（题目内容已省略）", self.name)
         return None
 
 
@@ -430,23 +559,40 @@ class Tiku:
         new_cls.config_set(self._conf)
         return new_cls
 
-    def judgement_select(self, answer: str) -> bool:
+    def judgement_select(self, answer: str) -> Optional[bool]:
         """
         这是一个专用的方法, 要求配置维护两个选项列表, 一份用于正确选项, 一份用于错误选项, 以应对题库对判断题答案响应的各种可能的情况
         它的作用是将获取到的答案answer与可能的选项列对比并返回对应的布尔值
         """
         if self.DISABLE:
             return False
-        # 对响应的答案作处理
-        answer = answer.strip()
+        # 对响应的答案作处理。空答案必须保持 uncovered，由调用方决定
+        # 如何保存，不应随机猜测。
+        answer = "" if answer is None else str(answer).strip()
+        if not answer:
+            logger.warning("判断题答案为空，保持未覆盖")
+            return None
+        # AI/SiliconFlow canonical cache entries are always lower-case
+        # ``true``/``false`` and must remain usable even when a caller's
+        # configured synonym lists omit those internal labels.  Other Tiku
+        # implementations must continue to honor only their configured
+        # vocabularies; an old ``true``/``false`` cache entry is not evidence
+        # that their answer can be submitted.
+        if isinstance(self, (AI, SiliconFlow)):
+            if answer.casefold() == "true":
+                return True
+            if answer.casefold() == "false":
+                return False
         if answer in self.true_list:
             return True
         elif answer in self.false_list:
             return False
         else:
-            # 无法判断, 随机选择
-            logger.error(f'无法判断答案 -> {answer} 对应的是正确还是错误, 请自行判断并加入配置文件重启脚本, 本次将会随机选择选项')
-            return random.choice([True,False])
+            # 无法判断时保持未覆盖；调用方会保存空值并跳过直接提交。
+            logger.error(
+                "无法判断答案类型，保持未覆盖（答案内容已省略）"
+            )
+            return None
 
     def get_submit_params(self):
         """
@@ -491,12 +637,12 @@ class TikuYanxi(Tiku):
                     self.load_token()
                     # 重新查询
                     return self._query(q_info)
-                logger.error(f'{self.name}查询失败:\n\t剩余查询数{res_json["data"].get("times",f"{self._times}(仅参考)")}:\n\t消息:{res_json["message"]}')
+                logger.error(f'{self.name}查询失败: HTTP 200 返回错误')
                 return None
             self._times = res_json["data"].get("times",self._times)
             return res_json['data']['answer'].strip()
         else:
-            logger.error(f'{self.name}查询失败:\n{res.text}')
+            logger.error(f'{self.name}查询失败: HTTP {res.status_code}')
         return None
 
     def load_token(self):
@@ -549,7 +695,7 @@ class TikuLike(Tiku):
         
         # 检查该token是否有余额
         if self._balance.get(token, 0) <= 0:
-            logger.error(f'{self.name}当前Token查询次数不足: ...{token[-5:]}')
+            logger.error(f'{self.name}当前Token查询次数不足')
             # 尝试选择其他有余额的token
             available_tokens = [t for t in self._tokens if self._balance.get(t, 0) > 0]
             if available_tokens:
@@ -567,10 +713,10 @@ class TikuLike(Tiku):
             try_times += 1
             if ans:  # 如果查询成功，减少余额
                 self._balance[token] -= 1
-                logger.info(f'使用Token ...{token[-5:]} 查询成功，剩余次数: {self._balance[token]}')
+                logger.info(f'Token 查询成功，剩余次数: {self._balance[token]}')
                 break
             elif try_times < self._retry_times:
-                logger.warning(f'使用Token ...{token[-5:]} 查询失败，进行第 {try_times + 1} 次重试...')
+                logger.warning(f'Token 查询失败，进行第 {try_times + 1} 次重试...')
         
         # 10次查询后更新余额
         self._count = (self._count + 1) % 10
@@ -626,11 +772,13 @@ class TikuLike(Tiku):
         except requests.exceptions.ConnectionError:
             logger.error(f'{self.name}网络连接错误: 无法连接到API服务器')
             return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f'{self.name}查询异常: \n{e}')
+        except requests.exceptions.RequestException:
+            logger.error(f'{self.name}查询网络请求失败')
             return None
-        except Exception as e:
-            logger.error(f'{self.name}查询发生未知错误: \n{e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}查询发生未知错误')
             return None
 
         # 处理HTTP响应
@@ -647,7 +795,7 @@ class TikuLike(Tiku):
         elif res.status_code == 403:
             logger.error(f'{self.name}访问被拒绝: 可能是Token权限不足')
         else:
-            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应内容: \n{res.text}')
+            logger.error(f'{self.name}查询失败: HTTP {res.status_code}')
         
         return None
     
@@ -666,20 +814,21 @@ class TikuLike(Tiku):
         except json.JSONDecodeError:
             logger.error(f'{self.name}响应解析失败: 响应不是有效的JSON格式')
             return None
-        except Exception as e:
-            logger.error(f'{self.name}响应解析异常: {e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}响应解析异常')
             return None
         
         # 记录响应消息
         msg = res_json.get('message', '')
         if msg:
-            logger.info(f'{self.name}响应消息: {msg}')
+            logger.info(f'{self.name}收到响应消息')
         
         # 检查API返回的code字段，判断请求是否成功
         code = res_json.get('code', 1)
         if code != 1:
-            error_msg = res_json.get('message', '未知错误')
-            logger.error(f'{self.name}API返回错误: {error_msg}')
+            logger.error(f'{self.name}API返回错误 (code={code})')
             return None
         
         results = res_json.get('results', {})
@@ -738,12 +887,12 @@ class TikuLike(Tiku):
             blanks = answer.get('blanks', None)
             if blanks is not None:
                 if isinstance(blanks, list) and blanks:
-                    # 过滤掉None和空字符串
-                    valid_blanks = [blank for blank in blanks if blank is not None and str(blank).strip()]
-                    if valid_blanks:
-                        return "\n".join(str(blank) for blank in valid_blanks)
-                    else:
-                        logger.error(f'{self.name}FILL_IN_BLANK类型题目没有有效的填空内容')
+                    # Blank positions are meaningful for completion answers;
+                    # retain middle and trailing empty slots for the form
+                    # mapper.  Choice answers keep their historical filtering.
+                    values = _ensure_answer_list(blanks, preserve_empty=True)
+                    if values:
+                        return "\n".join(values)
                 else:
                     logger.error(f'{self.name}FILL_IN_BLANK类型题目没有有效的填空内容')
             else:
@@ -783,8 +932,7 @@ class TikuLike(Tiku):
                 if code == 1:
                     return int(res_json.get("balance", 0))
                 else:
-                    error_msg = res_json.get('message', '未知错误')
-                    logger.error(f'{self.name}获取余额失败: {error_msg}')
+                    logger.error(f'{self.name}获取余额失败 (HTTP 200 返回错误)')
                     return 0
             else:
                 logger.error(f'{self.name}请求余额接口失败，状态码: {res.status_code}')
@@ -798,8 +946,10 @@ class TikuLike(Tiku):
         except ValueError:  # json解析错误或int转换错误
             logger.error(f'{self.name}余额响应解析失败: 响应格式不正确')
             return 0
-        except Exception as e:
-            logger.error(f'{self.name}Token余额查询过程中出现错误: {e}')
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.error(f'{self.name}Token余额查询过程中出现错误')
             return 0
 
     def update_times(self) -> None:
@@ -809,7 +959,7 @@ class TikuLike(Tiku):
         for token in self._tokens:
             balance = self.get_api_balance(token)
             self._balance[token] = balance
-            logger.info(f"当前LIKE知识库Token: ...{token[-5:]} 的剩余查询次数为: {balance} (仅供参考, 实际次数以查询结果为准)")
+            logger.info(f"LIKE知识库Token剩余查询次数为: {balance} (仅供参考)")
 
     def load_tokens(self) -> None:
         tokens_str = self._conf.get('tokens')
@@ -878,7 +1028,7 @@ class TikuAdapter(Tiku):
             # plat无论搜没搜到答案都返回0
             # 这个参数是tikuadapter用来设定自定义的平台类型
             if not len(res_json['answer']['bestAnswer']):
-                logger.error("查询失败, 返回：" + res.text)
+                logger.error("查询失败: API 返回空答案")
                 return None
             sep = "\n"
             return sep.join(res_json['answer']['bestAnswer']).strip()
@@ -913,11 +1063,12 @@ class AI(Tiku):
         self.max_active_requests: int = 3
         self._request_semaphore: Optional[threading.Semaphore] = request_semaphore
         self._injected_request_semaphore = request_semaphore
+        self.cancel_event: Optional[threading.Event] = None
         # 精简提示词：直接输出 JSON，禁止多余内容
         self._system_prompts = {
             "single": (
                 "单选题答题。直接输出JSON，禁止解释、思考过程或Markdown。\n"
-                "格式：{\"Answer\": [\"B\"]}  （B为正确选项字母，仅填A/B/C/D之一）"
+                "格式：{\"Answer\": [\"B\"]}  （填题目中提供的一个合法选项字母）"
             ),
             "multiple": (
                 "多选题答题。直接输出JSON，禁止解释、思考过程或Markdown。\n"
@@ -945,6 +1096,29 @@ class AI(Tiku):
         self._injected_request_semaphore = semaphore
         self._request_semaphore = semaphore
 
+    def set_cancel_event(self, cancel_event: Optional[threading.Event]) -> None:
+        """Attach the task cancellation signal to waits and retries."""
+
+        self.cancel_event = cancel_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise StudyCancelled()
+
+    def _wait_or_cancel(self, seconds: float) -> None:
+        self._raise_if_cancelled()
+        if seconds <= 0:
+            return
+        if self.cancel_event is not None:
+            if self.cancel_event.wait(seconds):
+                raise StudyCancelled()
+        else:
+            time.sleep(seconds)
+
+    def _acquire_request_slot(self, semaphore: threading.Semaphore) -> None:
+        while not semaphore.acquire(timeout=0.2):
+            self._raise_if_cancelled()
+
     @property
     def request_semaphore(self) -> Optional[threading.Semaphore]:
         return self._request_semaphore
@@ -968,40 +1142,73 @@ class AI(Tiku):
 
     def _respect_interval(self):
         with self._interval_lock:
+            self._raise_if_cancelled()
             if self.last_request_time:
                 interval_time = time.time() - self.last_request_time
                 if interval_time < self.min_interval_seconds:
                     sleep_time = self.min_interval_seconds - interval_time
-                    logger.debug(f"AI请求间隔过短, 等待 {sleep_time:.2f} 秒")
-                    time.sleep(sleep_time)
+                    logger.debug("答题服务请求排队，等待 {:.2f} 秒", sleep_time)
+                    self._wait_or_cancel(sleep_time)
             self.last_request_time = time.time()
 
     def _build_messages(self, q_info: dict) -> list[dict]:
-        options = [_clean_option_prefix(opt) for opt in _prepare_option_lines(q_info.get('options', []))]
         q_type = q_info.get('type', 'single')
+        options, labels = _labeled_option_lines(q_info.get('options', []))
         system_prompt = self._system_prompts.get(q_type, self._system_prompts['default'])
+        system_prompt = _with_choice_label_instruction(system_prompt, q_type, labels)
+        system_prompt += '\n核对题干的时间、否定词、代码字符和计量单位；多选题逐项判断，避免漏选。无法判断时返回空数组，不要猜测。'
         user_content = f"题目：{q_info.get('title', '')}".strip()
+        if q_info.get('course_title'):
+            user_content = f"课程：{q_info['course_title']}\n{user_content}"
+        if q_type == 'completion' and isinstance(q_info.get('expectedBlankCount'), int):
+            user_content += f"\n本题共有 {q_info['expectedBlankCount']} 个空，答案须按原顺序一一对应。"
         if options:
             user_content = f"{user_content}\n选项：{chr(10).join(options)}"
+        image_sources = list(dict.fromkeys(re.findall(r'<img\s+[^>]*src=["\'](https?://[^"\']+)["\']', user_content)))
+        # The model cannot see an image from an HTML fragment inside plain
+        # text. Attach formula/diagram images through the compatible vision
+        # schema while keeping their question/option labels in the text.
+        content = user_content
+        if image_sources:
+            content = [{'type': 'text', 'text': user_content}] + [
+                {'type': 'image_url', 'image_url': {'url': source}}
+                for source in image_sources
+            ]
         return [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": content}
         ]
 
-    def _invoke_completion(self, messages: list[dict]) -> Optional[str]:
+    def _invoke_completion(
+        self,
+        messages: list[dict],
+        *,
+        preserve_empty: bool = False,
+        max_attempts: Optional[int] = None,
+    ) -> Optional[str]:
         if not self._httpx_client:
             logger.error("AI题库 HTTP 客户端未初始化")
             return None
         last_error = None
-        for attempt in range(1, self.max_retries + 1):
+        attempt_limit = self.max_retries
+        if max_attempts is not None:
+            try:
+                # A repair is an independent, bounded request.  It must still
+                # run once when normal retries are configured as zero.
+                attempt_limit = max(0, int(max_attempts))
+            except (TypeError, ValueError):
+                attempt_limit = 0
+        for attempt in range(1, attempt_limit + 1):
+            self._raise_if_cancelled()
             error_category = "request_error"
             rate_limited = False
             try:
                 # 全局并发控制：限制同时在请求中的题目数量
                 sem = self._request_semaphore
                 if sem is not None:
-                    sem.acquire()
+                    self._acquire_request_slot(sem)
                 try:
+                    self._raise_if_cancelled()
                     self._respect_interval()
                     headers = {
                         "Authorization": f"Bearer {self.key}",
@@ -1016,6 +1223,7 @@ class AI(Tiku):
                         headers=headers,
                         json=payload,
                     )
+                    self._raise_if_cancelled()
                 finally:
                     if sem is not None:
                         sem.release()
@@ -1034,7 +1242,8 @@ class AI(Tiku):
 
                 # 去掉 <think> 和 </think> 标记本身，但保留其中的内容，以便从中提取 Answer JSON
                 text_without_tags = re.sub(r"(?is)</?think>", "", raw_content)
-                base_text = (text_without_tags or "").strip()
+                plain_text = text_without_tags or ""
+                base_text = plain_text.strip()
                 if not base_text:
                     logger.warning("AI大模型返回内容为空（仅包含 <think> 标签或空白），将视为无答案处理")
                     return None
@@ -1060,7 +1269,10 @@ class AI(Tiku):
                     # 优先按JSON解析；若失败，再尝试将单引号风格的字典转换为JSON
                     try:
                         payload = json.loads(json_candidate_stripped)
-                        answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
+                        answers = _ensure_answer_list(
+                            payload.get('Answer') or payload.get('answer'),
+                            preserve_empty=preserve_empty,
+                        )
                     except json.JSONDecodeError:
                         payload = None
                         candidate_fixed = json_candidate_stripped
@@ -1072,14 +1284,23 @@ class AI(Tiku):
                             except Exception:
                                 payload = None
                         if payload is not None:
-                            answers = _ensure_answer_list(payload.get('Answer') or payload.get('answer'))
+                            answers = _ensure_answer_list(
+                                payload.get('Answer') or payload.get('answer'),
+                                preserve_empty=preserve_empty,
+                            )
                         else:
                             logger.warning("AI大模型返回内容不是标准JSON，将按纯文本处理")
-                            answers = _ensure_answer_list(base_text)
+                            answers = _ensure_answer_list(
+                                plain_text if preserve_empty else base_text,
+                                preserve_empty=preserve_empty,
+                            )
                 else:
                     # 没有可用的 JSON 片段，直接按纯文本处理
                     if base_text:
-                        answers = _ensure_answer_list(base_text)
+                        answers = _ensure_answer_list(
+                            plain_text if preserve_empty else base_text,
+                            preserve_empty=preserve_empty,
+                        )
                     else:
                         logger.warning("AI大模型返回内容为空，将视为无答案处理")
                         return None
@@ -1087,7 +1308,10 @@ class AI(Tiku):
                 if not answers:
                     logger.warning("AI大模型返回空答案，将视为无答案处理")
                     return None
-                return "\n".join(answers).strip()
+                rendered = "\n".join(answers)
+                return rendered if preserve_empty else rendered.strip()
+            except StudyCancelled:
+                raise
             except Exception as exc:
                 if not rate_limited:
                     if isinstance(exc, httpx.TimeoutException):
@@ -1101,18 +1325,33 @@ class AI(Tiku):
                 if rate_limited:
                     cool_down = max(self.min_interval_seconds * 2, 5)
                     logger.warning(
-                        f"AI大模型请求失败 ({attempt}/{self.max_retries}) 且触发限流，将休眠 {cool_down:.2f} 秒: {safe_error}"
+                        f"AI大模型请求失败 ({attempt}/{attempt_limit}) 且触发限流，将休眠 {cool_down:.2f} 秒: {safe_error}"
                     )
-                    time.sleep(cool_down)
+                    if attempt < attempt_limit:
+                        self._wait_or_cancel(cool_down)
                 else:
-                    logger.warning(f"AI大模型请求失败 ({attempt}/{self.max_retries}): {safe_error}")
-                    time.sleep(self.retry_delay * attempt)
+                    logger.warning(f"AI大模型请求失败 ({attempt}/{attempt_limit}): {safe_error}")
+                    if attempt < attempt_limit:
+                        self._wait_or_cancel(self.retry_delay * attempt)
         logger.error(f"AI大模型连续失败，最后错误: {last_error}")
         return None
 
     def _query(self, q_info: dict):
         messages = self._build_messages(q_info)
-        return self._invoke_completion(messages)
+        return self._invoke_completion(
+            messages, preserve_empty=q_info.get("type") == "completion"
+        )
+
+    def repair_choice_answer(self, q_info: dict, previous_answer=None):
+        """Make exactly one bounded request to repair a choice format."""
+
+        self._raise_if_cancelled()
+        messages = _choice_repair_messages(q_info, previous_answer)
+        return self._invoke_completion(
+            messages,
+            preserve_empty=False,
+            max_attempts=1,
+        )
 
     def _init_tiku(self):
         self.endpoint = self._conf['endpoint']
@@ -1141,78 +1380,218 @@ class AI(Tiku):
 
 class SiliconFlow(Tiku):
     """硅基流动大模型答题实现"""
-    def __init__(self):
+    def __init__(self, request_semaphore: Optional[threading.Semaphore] = None):
         super().__init__()
         self.name = '硅基流动大模型'
         self.last_request_time = None
+        self._interval_lock = threading.Lock()
+        self._request_semaphore = request_semaphore
+        self._injected_request_semaphore = request_semaphore
 
-    def _query(self, q_info: dict):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+    def set_request_semaphore(
+        self, semaphore: Optional[threading.Semaphore]
+    ) -> None:
+        self._injected_request_semaphore = semaphore
+        self._request_semaphore = semaphore
 
+    @property
+    def request_semaphore(self) -> Optional[threading.Semaphore]:
+        return self._request_semaphore
+
+    @request_semaphore.setter
+    def request_semaphore(self, semaphore: Optional[threading.Semaphore]) -> None:
+        self.set_request_semaphore(semaphore)
+
+    def _acquire_request_slot(self, semaphore: threading.Semaphore) -> None:
+        while not semaphore.acquire(timeout=0.2):
+            self._raise_if_cancelled()
+
+    def _respect_interval(self) -> None:
+        with self._interval_lock:
+            self._raise_if_cancelled()
+            if self.last_request_time:
+                elapsed = time.time() - self.last_request_time
+                if elapsed < self.min_interval:
+                    self._wait_or_cancel(self.min_interval - elapsed)
+            self.last_request_time = time.time()
+
+    def _build_messages(self, q_info: dict) -> list[dict]:
         prompt_map = {
-            "single": "单选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"B\"]}（仅填选项字母）",
+            "single": "单选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"B\"]}（填写题目提供的一个合法选项字母）",
             "multiple": "多选题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"A\", \"C\"]}（填所有正确选项字母）",
             "completion": "填空题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}",
-            "judgement": "判断题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"正确\"]} 或 {\"Answer\": [\"错误\"]}"
+            "judgement": "判断题。直接输出JSON，禁止解释或Markdown。格式：{\"Answer\": [\"正确\"]} 或 {\"Answer\": [\"错误\"]}",
         }
-
-        system_prompt = prompt_map.get(q_info.get('type'),
-                                       "直接输出JSON答案，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}")
-
-        cleaned_options = [_clean_option_prefix(opt) for opt in _prepare_option_lines(q_info.get('options', []))]
+        q_type = q_info.get('type')
+        system_prompt = prompt_map.get(
+            q_type,
+            "直接输出JSON答案，禁止解释或Markdown。格式：{\"Answer\": [\"答案\"]}",
+        )
+        cleaned_options, labels = _labeled_option_lines(q_info.get('options', []))
+        system_prompt = _with_choice_label_instruction(system_prompt, q_type, labels)
         user_content = f"题目：{q_info.get('title', '')}".strip()
         if cleaned_options:
             user_content = f"{user_content}\n选项：{chr(10).join(cleaned_options)}"
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
 
+    def _invoke_completion(
+        self,
+        q_info: dict,
+        *,
+        max_attempts: Optional[int] = None,
+        repair: bool = False,
+    ) -> Optional[str]:
+        q_type = q_info.get('type')
+        messages = (
+            _choice_repair_messages(q_info, q_info.get("_previous_answer"))
+            if repair
+            else self._build_messages(q_info)
+        )
+        attempt_limit = self.max_retries
+        if max_attempts is not None:
+            try:
+                attempt_limit = max(0, int(max_attempts))
+            except (TypeError, ValueError):
+                attempt_limit = 0
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
             "model": self.model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
+            "messages": messages,
             "stream": False,
             "max_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.7,
-            "response_format": {"type": "text"}
+            "response_format": {"type": "text"},
         }
-
         last_error = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                if self.last_request_time:
-                    interval = time.time() - self.last_request_time
-                    if interval < self.min_interval:
-                        time.sleep(self.min_interval - interval)
+        preserve_empty = q_type == "completion"
 
+        def render_plain_content(content) -> Optional[str]:
+            """Return successful non-JSON content without consuming retries."""
+
+            text = "" if content is None else str(content)
+            if not text.strip():
+                return None
+            if repair:
+                # A repair response is passed to the strict base-layer label
+                # resolver, which rejects explanatory text.
+                return text.strip()
+            if preserve_empty:
+                parts = _ensure_answer_list(text, preserve_empty=True)
+                return "\n".join(parts) if parts else None
+            return text.strip()
+
+        def response_text(response) -> str:
+            try:
+                value = getattr(response, "text", "")
+            except Exception:
+                return ""
+            return "" if value is None else str(value)
+
+        for attempt in range(1, attempt_limit + 1):
+            self._raise_if_cancelled()
+            sem = self._request_semaphore
+            acquired = False
+            try:
+                if sem is not None:
+                    self._acquire_request_slot(sem)
+                    acquired = True
+                self._raise_if_cancelled()
+                self._respect_interval()
                 response = self._session.post(
                     self.api_endpoint,
                     headers=headers,
                     json=payload,
-                    timeout=self.timeout
+                    timeout=self.timeout,
                 )
-                self.last_request_time = time.time()
-
+                self._raise_if_cancelled()
                 if response.status_code != 200:
-                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+                    raise RuntimeError(
+                        f"硅基流动API请求失败（HTTP {response.status_code}）"
+                    )
+                try:
+                    result = response.json()
+                except (TypeError, ValueError):
+                    # A successful HTTP response can still contain a plain
+                    # language body.  It is a provider result, not a
+                    # transport failure, so do not spend max_retries on it.
+                    return render_plain_content(response_text(response))
+                try:
+                    content = result['choices'][0]['message']['content']
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    return render_plain_content(response_text(response))
 
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                parsed = json.loads(_strip_json_block(content))
-                answers = _ensure_answer_list(parsed.get('Answer') or parsed.get('answer'))
+                try:
+                    parsed = json.loads(_strip_json_block(content))
+                    answer_value = parsed.get('Answer') or parsed.get('answer')
+                except (AttributeError, TypeError, ValueError):
+                    return render_plain_content(content)
+                answers = _ensure_answer_list(
+                    answer_value,
+                    preserve_empty=preserve_empty,
+                )
                 if not answers:
-                    raise ValueError("硅基流动返回答案为空")
-                return "\n".join(answers).strip()
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
+                    # A valid response envelope with an empty/missing answer
+                    # is also a format miss, not a reason to repeat a
+                    # successful request.  The base layer will keep it
+                    # uncovered (and may issue its one bounded repair for a
+                    # choice question only when there is content to repair).
+                    return None
+                rendered = "\n".join(answers)
+                return rendered if preserve_empty else rendered.strip()
+            except StudyCancelled:
+                raise
+            except (
+                requests.RequestException,
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                json.JSONDecodeError,
+                RuntimeError,
+            ) as exc:
                 last_error = exc
-                logger.warning(f"硅基流动API调用失败 ({attempt}/{self.max_retries}): {exc}")
-                time.sleep(self.retry_delay * attempt)
+                logger.warning(
+                    "硅基流动API调用失败（第 {}/{} 次，错误类别={}）",
+                    attempt,
+                    attempt_limit,
+                    type(exc).__name__,
+                )
+                if attempt < attempt_limit:
+                    self._wait_or_cancel(self.retry_delay * attempt)
+            finally:
+                if acquired:
+                    sem.release()
 
-        logger.error(f"硅基流动API连续失败，最后错误: {last_error}")
+        logger.error("硅基流动API连续失败（错误类别已省略）")
         return None
+
+    def _query(self, q_info: dict):
+        return self._invoke_completion(q_info)
+
+    def repair_choice_answer(self, q_info: dict, previous_answer=None):
+        """Make exactly one bounded request to repair a choice format."""
+
+        self._raise_if_cancelled()
+        # Include the malformed answer in the repair prompt without changing
+        # the one-request bound or exposing it in logs.
+        repair_info = dict(q_info)
+        result = self._invoke_completion(
+            {
+                **repair_info,
+                "_previous_answer": previous_answer,
+            },
+            max_attempts=1,
+            repair=True,
+        )
+        return result
 
     def _init_tiku(self):
         # 从配置文件读取参数

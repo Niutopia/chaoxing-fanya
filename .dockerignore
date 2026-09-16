@@ -59,6 +59,8 @@ logs
 **/logs
 coverage.xml
 .coverage
+.coverage.*
+**/.coverage.*
 htmlcov
 build
 build/
@@ -98,3 +100,31 @@ portable_build/
 **/portable_build/
 build_portable/
 **/build_portable/
+
+# Local PaddleOCR is an optional, explicitly enabled code path.  The default
+# Docker Web deployment uses external OCR and does not install PaddlePaddle,
+# so the source checkout and its model/development trees are not image input.
+# Keep this list explicit: it documents the optional boundary while avoiding
+# the ~139 MB repository-only OCR payload in the Docker build context.
+PaddleOCR/
+PaddleOCR/**
+
+# Local backups and personal operational reports.
+.backups/
+**/.backups/
+backups/
+**/backups/
+answer-cache.json
+**/answer-cache.json
+*.db-*
+**/*.db-*
+*.sqlite-*
+**/*.sqlite-*
+*.sqlite3-*
+**/*.sqlite3-*
+docs/answer-accuracy-and-overview.md
+docs/functional-audit-*.md
+docs/lifecycle-acceptance-*.md
+docs/reliability-follow-up-*.md
+docs/score-repair-*.md
+docs/superpowers/

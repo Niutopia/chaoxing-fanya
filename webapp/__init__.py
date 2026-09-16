@@ -55,12 +55,14 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     app = Flask(__name__, static_folder=None)
     default_static_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
     configured_data_dir = os.environ.get("CHAOXING_DATA_DIR")
-    data_dir = Path(configured_data_dir or "data").expanduser().resolve()
+    default_data_dir = Path(__file__).resolve().parent.parent / "data"
+    data_dir = Path(configured_data_dir or default_data_dir).expanduser().resolve()
     app.config.from_mapping(
         DATA_DIR=data_dir,
         DATABASE_PATH=data_dir / "chaoxing-web.sqlite3",
         RUNNING_IN_DOCKER=os.environ.get("CHAOXING_RUNNING_IN_DOCKER", False),
         STATIC_DIR=default_static_dir,
+        MAX_CONTENT_LENGTH=1024 * 1024,
     )
     if test_config:
         app.config.update(test_config)
@@ -132,6 +134,7 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
             runner=runner,
             max_active_accounts=configured_limit,
             answer_semaphore=answer_semaphore,
+            persistence=store,
         )
 
     # The account routes only require the active-task guard protocol.  Keep an
@@ -186,6 +189,14 @@ def create_app(test_config: Mapping[str, Any] | None = None) -> Flask:
     @app.errorhandler(404)
     def not_found(_error):
         return jsonify(status=False, msg="Not Found", code="not_found"), 404
+
+    @app.errorhandler(413)
+    def request_too_large(_error):
+        return jsonify(
+            status=False,
+            msg="Request body is too large",
+            code="request_too_large",
+        ), 413
 
     @app.errorhandler(Exception)
     def internal_error(error):

@@ -13,6 +13,7 @@ import tempfile
 import threading
 import io
 from typing import List, Dict, Tuple, Any, Optional, Union
+from urllib.parse import parse_qs, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -26,6 +27,8 @@ from api.vision_ocr import (
     is_vision_ocr_enabled,
     vision_ocr,
 )
+from api.live_process import StudyCancelled
+from api.option_parser import find_option_prefix
 import requests
 
 try:
@@ -117,22 +120,23 @@ def _init_paddle_ocr(preferred_device: Optional[str] = None):
                     )
                     _PADDLE_OCR_ENGINE = engine
                     _PADDLE_OCR_DEVICE = device
-                    logger.info(f"PaddleOCR 初始化成功 ({device.upper()})，将用于题目图片 OCR")
+                    logger.info("PaddleOCR 初始化成功，将用于题目图片 OCR")
                     return _PADDLE_OCR_ENGINE
                 except Exception as exc_device:
                     last_exc = exc_device
-                    logger.warning(f"PaddleOCR {device.upper()} 初始化失败: {exc_device}")
+                    logger.warning(
+                        "PaddleOCR {} 初始化失败（异常内容已省略）",
+                        device.upper(),
+                    )
 
             if last_exc:
                 raise last_exc
         except Exception as exc:
             cause = getattr(exc, "__cause__", None)
-            if cause is not None:
-                logger.warning(
-                    f"PaddleOCR 初始化失败，将不使用本地 OCR: {exc} (底层依赖错误: {cause})"
-                )
-            else:
-                logger.warning(f"PaddleOCR 初始化失败，将不使用本地 OCR: {exc}")
+            logger.warning(
+                "PaddleOCR 初始化失败，将不使用本地 OCR（依赖异常已省略，底层原因={}）",
+                "存在" if cause is not None else "无",
+            )
             _PADDLE_OCR_ENGINE = None
             _PADDLE_OCR_DEVICE = None
 
@@ -209,8 +213,10 @@ def _preprocess_image_for_ocr(image_bytes: bytes, enhance_mode: int = 0) -> byte
         output = io.BytesIO()
         img.save(output, format='PNG')
         return output.getvalue()
-    except Exception as exc:
-        logger.debug(f"图片预处理失败: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("图片预处理失败")
         return image_bytes
 
 
@@ -220,18 +226,20 @@ def _call_http_ocr(ocr_endpoint: str, image_bytes: bytes, img_url: str) -> str:
         files = {"file": ("question.png", image_bytes, "image/png")}
         ocr_resp = requests.post(ocr_endpoint, files=files, timeout=20)
         if ocr_resp.status_code != 200:
-            logger.debug(f"HTTP OCR 服务返回异常状态码: {ocr_resp.status_code}")
+            logger.debug("HTTP OCR 服务返回异常状态码")
             return ""
         data = ocr_resp.json()
-    except Exception as exc:
-        logger.debug(f"调用 HTTP OCR 服务失败: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("调用 HTTP OCR 服务失败")
         return ""
 
     # 尝试从常见字段中读取 LaTeX/文本结果
     for key in ("latex", "text", "result", "data"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
-            logger.debug(f"HTTP OCR 识别成功: {value[:100]}... 来自 {img_url}")
+            logger.debug("HTTP OCR 识别成功")
             return value.strip()
 
     return ""
@@ -279,11 +287,13 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
 
         resp = session.get(img_url, headers=extra_headers or None, timeout=8)
         if resp.status_code != 200:
-            logger.debug(f"下载题目图片失败: {img_url} -> {resp.status_code}")
+            logger.debug("下载题目图片失败")
             return ""
         image_bytes = resp.content
-    except Exception as exc:
-        logger.debug(f"下载题目图片异常: {exc}")
+    except StudyCancelled:
+        raise
+    except Exception:
+        logger.debug("下载题目图片异常")
         return ""
 
     # 1) 若配置了外部 AI 视觉 OCR，优先使用，跳过本地 OCR
@@ -291,12 +301,14 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
         try:
             vision_result = vision_ocr(image_bytes)
             if vision_result:
-                logger.debug(f"外部 AI 视觉 OCR 识别成功: {vision_result[:100]}... 来自 {img_url}")
+                logger.debug("外部 AI 视觉 OCR 识别成功")
                 return vision_result
             else:
-                logger.debug(f"外部 AI 视觉 OCR 未识别出文本 来自 {img_url}")
-        except Exception as exc:
-            logger.debug(f"外部 AI 视觉 OCR 调用失败: {exc}")
+                logger.debug("外部 AI 视觉 OCR 未识别出文本")
+        except StudyCancelled:
+            raise
+        except Exception:
+            logger.debug("外部 AI 视觉 OCR 调用失败")
         # 外部 OCR 失败时，不回退到本地，直接尝试 HTTP OCR 或返回空
         ocr_endpoint = _http_ocr_endpoint()
         if ocr_endpoint:
@@ -370,27 +382,36 @@ def _ocr_image_to_text(img_url: str, session=None) -> str:
                             ocr_result = engine.ocr(tmp_path)
                         final_texts = _parse_ocr_result(ocr_result)
                         break
+                    except StudyCancelled:
+                        raise
                     except Exception as exc:
                         global _PADDLE_OCR_DEVICE
                         if device_attempt == 0 and _PADDLE_OCR_DEVICE == "gpu":
-                            logger.debug(f"PaddleOCR GPU 推理失败，切换到 CPU: {exc}")
+                            logger.debug(
+                                "PaddleOCR GPU 推理失败，切换到 CPU（异常内容已省略）"
+                            )
                             engine = _init_paddle_ocr(preferred_device="cpu")
                             if engine is None:
                                 break
                             continue
-                        logger.debug(f"PaddleOCR 识别失败 (模式{preprocess_mode}): {exc}")
+                        logger.debug(
+                            "PaddleOCR 识别失败（模式{}，异常内容已省略）",
+                            preprocess_mode,
+                        )
                         break
                 
                 if final_texts:
                     logger.debug(
-                        f"PaddleOCR 提取文本成功 (预处理模式{preprocess_mode}): {' '.join(final_texts)} 来自 {img_url}"
+                        "PaddleOCR 提取文本成功 (预处理模式{}, 文本行数={})",
+                        preprocess_mode,
+                        len(final_texts),
                     )
                     break
                 else:
-                    logger.debug(f"PaddleOCR 预处理模式{preprocess_mode}未识别出文本，尝试下一模式")
+                    logger.debug("PaddleOCR 预处理模式未识别出文本，尝试下一模式")
             
             if not final_texts:
-                logger.debug(f"PaddleOCR 所有预处理模式均未识别出文本 来自 {img_url}")
+                logger.debug("PaddleOCR 所有预处理模式均未识别出文本")
             
             if final_texts:
                 # 将多行结果合并为一行，交给大模型进一步理解
@@ -447,7 +468,7 @@ def decode_course_list(html_text: str) -> List[Dict[str, str]]:
             "roleid": course.attrs["roleid"],
             "clazzId": course.select_one("input.clazzId").attrs["value"],
             "courseId": course.select_one("input.courseId").attrs["value"],
-            "cpi": re.findall(r"cpi=(.*?)&", course.select_one("a").attrs["href"])[0],
+            "cpi": parse_qs(urlsplit(course.select_one("a").attrs["href"]).query)["cpi"][0],
             "title": course.select_one("span.course-name").attrs["title"],
             "desc": course.select_one("p.margint10").attrs["title"] if course.select_one("p.margint10") else "",
             "teacher": course.select_one("p.color3").attrs["title"]
@@ -529,10 +550,13 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     
     for raw_point in raw_points:
         point = raw_point.div
-        if "id" not in point.attrs:
+        if point is None:
+            continue
+        point_match = re.fullmatch(r"cur(\d{1,20})", point.get("id", ""))
+        if point_match is None:
             continue
             
-        point_id = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])[0]
+        point_id = point_match.group(1)
         point_title = point.select_one("a.clicktitle").text.replace("\n", "").strip()
         
         # 提取任务数量
@@ -560,7 +584,7 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     return point_list
 
 
-def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def extract_course_card_data(html_text: str) -> Dict[str, Any]:
     """
     解析任务点列表页面，提取任务点信息
     
@@ -574,27 +598,43 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     
     # 检查章节是否未开放
     if "章节未开放" in html_text:
-        return [], {"notOpen": True}
+        return {"notOpen": True}
 
-    # 提取mArg参数
-    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
-    if not temp:
-        return [], {}
-
-    # 解析JSON数据
-    cards_data = json.loads("{" + temp[0] + "}")
+    # Chaoxing initializes mArg = "" before assigning its actual JSON. Pages
+    # beyond the last card retain mArg = $mArg inside a try/catch instead.
+    # Walk assignments without scanning inside a decoded JSON value, so a
+    # title containing "mArg = ..." cannot be mistaken for JavaScript.
+    assignments = re.compile(r"\bmArg\s*=(?!=)\s*")
+    empty_value = re.compile(r"(?:\"\"|''|\$mArg)\s*;")
+    decoder = json.JSONDecoder()
+    cursor = 0
+    cards_data = {}
+    while assignment := assignments.search(html_text, cursor):
+        source = html_text[assignment.end():]
+        placeholder = empty_value.match(source)
+        if placeholder:
+            cursor = assignment.end() + placeholder.end()
+            continue
+        try:
+            value, length = decoder.raw_decode(source)
+        except ValueError:
+            raise ValueError("章节任务卡数据格式异常，请重试") from None
+        if not isinstance(value, dict):
+            raise ValueError("章节任务卡数据格式异常，请重试")
+        cards_data = value
+        cursor = assignment.end() + length
 
     if not cards_data:
-        return [], {}
+        return {}
 
-    # 提取任务信息
-    job_info = _extract_job_info(cards_data)
+    return cards_data
 
-    # 处理所有附件任务
-    cards = cards_data.get("attachments", [])
-    job_list = _process_attachment_cards(cards)
 
-    return job_list, job_info
+def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    cards_data = extract_course_card_data(html_text)
+    if cards_data.get("notOpen"):
+        return [], {"notOpen": True}
+    return _process_attachment_cards(cards_data.get("attachments", [])), _extract_job_info(cards_data)
 
 
 def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -642,8 +682,10 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
         if card_passed:
             continue
 
-        # 处理无job字段的特殊任务
-        if card.get("job") is None:
+        # 显式标为非必修的附件不执行；旧卡片缺少 job 时仍兼容阅读任务。
+        if not _normalize_bool(card.get("job", False)):
+            if card.get("job") is not None:
+                continue
             # 尝试识别阅读任务
             read_job = _process_read_task(card)
             if read_job:
@@ -655,7 +697,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
         if "otherInfo" in card:
             logger.trace("Fixing other info...")
             card["otherInfo"] = card["otherInfo"].split("&")[0]
-            logger.trace(f"New info: {card['otherInfo']}")
+            logger.trace("任务元数据已修复")
 
         # 多维度判断是否为直播任务
         card_type = card.get("type", "").lower()
@@ -692,9 +734,12 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             work_job = _process_work_task(card)
             if work_job:
                 job_list.append(work_job)
+        elif card_type == "read":
+            read_job = _process_read_task(card)
+            if read_job:
+                job_list.append(read_job)
         else:
-            logger.warning(f"Unknown card type: {card_type}")
-            logger.warning(card)
+            raise ValueError("遇到暂不支持的必修任务卡片，请手动检查该章节")
 
     return job_list
 
@@ -716,8 +761,10 @@ def _process_live_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "liveId": property_data.get("liveId"),
             "streamName": property_data.get("streamName")
         }
-    except Exception as e:
-        logger.error(f"解析直播任务失败: {str(e)}, 任务数据: {str(card)[:200]}")
+    except Exception:
+        # Card payloads contain job tokens and may include full question/content
+        # data.  Keep only the stable failure category.
+        logger.error("解析直播任务失败（任务卡片内容与异常已省略）")
         return None
 def _process_read_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """处理阅读类型任务"""
@@ -756,8 +803,7 @@ def _process_video_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "videoFaceCaptureEnc": card.get("videoFaceCaptureEnc", ""),
         }
     except KeyError:
-        logger.warning("出现转码失败视频，已跳过...")
-        return None
+        raise ValueError("视频任务缺少播放信息，可能尚未转码完成，请稍后重试") from None
 
 
 def _process_document_task(card: Dict[str, Any]) -> Dict[str, Any]:
@@ -810,9 +856,34 @@ def decode_questions_info(html_content: str, *, session=None) -> Dict[str, Any]:
     
     # 处理所有问题
     questions = []
-    for div_tag in soup.find("form").find_all("div", class_="singleQuesId"):
+    form_tag = soup.find("form")
+    if not form_tag:
+        form_data["questions"] = []
+        form_data["answerwqbid"] = ""
+        return form_data
+
+    for div_tag in form_tag.find_all("div", class_="singleQuesId"):
         question = _process_question(div_tag, font_decoder, session=session)
         if question:
+            if question.get("type") == "completion":
+                question_id = str(question.get("id", ""))
+                count_name = f"tiankongsize{question_id}"
+                raw_count = form_data.get(count_name)
+                try:
+                    expected_count = int(str(raw_count).strip())
+                    if expected_count < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    expected_count = None
+
+                if expected_count is None:
+                    indexed_count = _completion_indexed_field_count(
+                        question["answerField"], question_id
+                    )
+                    if indexed_count:
+                        expected_count = indexed_count
+                if expected_count is not None:
+                    question["expectedBlankCount"] = expected_count
             questions.append(question)
     
     # 更新表单数据
@@ -831,12 +902,33 @@ def _extract_form_data(soup: BeautifulSoup) -> Dict[str, Any]:
         return form_data
     
     # 提取所有非答案字段的input
-    for input_tag in form_tag.find_all("input"):
+    for input_tag in form_tag.find_all(["input", "textarea"]):
         if "name" not in input_tag.attrs or "answer" in input_tag.attrs["name"]:
             continue
-        form_data[input_tag.attrs["name"]] = input_tag.attrs.get("value", "")
+        if input_tag.name == "textarea":
+            value_attr = input_tag.attrs.get("value")
+            value = value_attr if value_attr not in (None, "") else input_tag.get_text()
+        else:
+            value = input_tag.attrs.get("value", "")
+        form_data[input_tag.attrs["name"]] = value
     
     return form_data
+
+
+def _completion_indexed_field_count(answer_field: Dict[str, Any], question_id: str) -> int:
+    """Count explicit completion targets without looking at provider answers."""
+
+    answer_key = f"answer{question_id}"
+    one_based = set()
+    zero_based = set()
+    for key in answer_field:
+        if not isinstance(key, str):
+            continue
+        if re.fullmatch(rf"{re.escape(answer_key)}\d+", key):
+            one_based.add(key)
+        elif re.fullmatch(rf"{re.escape(answer_key)}_\d+", key):
+            zero_based.add(key)
+    return max(len(one_based), len(zero_based))
 
 
 def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, Any]:
@@ -848,35 +940,70 @@ def _process_question(div_tag, font_decoder=None, *, session=None) -> Dict[str, 
     
     # 提取题目内容和选项
     title_div = div_tag.find("div", class_="Zy_TItle")
-    options_list = div_tag.find("ul").find_all("li") if div_tag.find("ul") else []
-    
+    # The first ul is the legacy source of truth.  Do not let a later
+    # alternate-format ul shadow its li options.
+    legacy_container = div_tag.find("ul")
+    options_list = legacy_container.find_all("li") if legacy_container else []
+
     # 解析题目和选项
     q_title = _extract_title(title_div, font_decoder, session=session)
-    q_options = []
-    for li in options_list:
-        q_options.append(_extract_choices(li, font_decoder))
-    # 排序选项
-    q_options.sort()
+    q_options: List[str] = []
+    if options_list:
+        # Keep the legacy ``ul > li`` path unchanged when any li exists.
+        for li in options_list:
+            q_options.append(_extract_choices(li, font_decoder))
+        if q_type in {"single", "multiple"}:
+            q_options = _validate_legacy_choices(q_options)
+        # 排序选项
+        q_options.sort()
+    else:
+        # Newer pages place each choice in a ``div.clearfix`` pair inside a
+        # dedicated Zy_ulTk.  Never treat an arbitrary layout ul as this
+        # alternate source.
+        alternate_container = div_tag.find("ul", class_="Zy_ulTk")
+        q_options = _extract_alternate_choices(
+            alternate_container, font_decoder
+        )
     q_options = '\n'.join(q_options)
     
-    # 初始化答题字段：至少包含 answer{id} 和 answertype{id}
+    # Completion pages use several mutually exclusive field layouts.  Do not
+    # manufacture an aggregate field when the DOM exposes indexed targets;
+    # the aggregate fallback is added only when no actual answer field exists.
+    answer_key = f"answer{question_id}"
     answer_field: Dict[str, Any] = {
-        f"answer{question_id}": "",
         f"answertype{question_id}": q_type_code,
     }
+    if q_type != "completion":
+        answer_field[answer_key] = ""
 
-    # 兼容填空题等可能存在的多个 answer* 字段（例如 answer{id}_0 等）：
-    # 收集当前题目 div 下所有 name 中包含 "answer" 且与本题相关的 input 字段名，
-    # 以便后续按照原始字段名回填答案。
-    for input_tag in div_tag.find_all("input"):
+    # Collect only answer fields belonging to this question.  Scanning each
+    # question div (rather than the whole form) keeps q1/q11 independent while
+    # the full-name match below rejects unrelated ``answer...`` controls.
+    for input_tag in div_tag.find_all(["input", "textarea"]):
         name = input_tag.attrs.get("name", "")
         if not name or "answer" not in name:
             continue
-        # 仅保留与当前题目 ID 相关的字段，避免污染其他题目的字段
-        if question_id and question_id not in name:
+        is_aggregate = name == answer_key
+        is_one_based = bool(
+            re.fullmatch(rf"{re.escape(answer_key)}\d+", name)
+        )
+        is_zero_based = bool(
+            re.fullmatch(rf"{re.escape(answer_key)}_\d+", name)
+        )
+        if not (is_aggregate or is_one_based or is_zero_based):
             continue
-        if name not in answer_field:
-            answer_field[name] = input_tag.attrs.get("value", "")
+        if input_tag.name == "textarea":
+            value_attr = input_tag.attrs.get("value")
+            value = value_attr if value_attr not in (None, "") else input_tag.get_text()
+        else:
+            value = input_tag.attrs.get("value", "")
+        answer_field[name] = value
+
+    if q_type == "completion" and not any(
+        key != f"answertype{question_id}"
+        for key in answer_field
+    ):
+        answer_field[answer_key] = ""
 
     return {
         "id": question_id,
@@ -900,7 +1027,7 @@ def _get_question_type(type_code: str) -> str:
     if type_code in type_map:
         return type_map[type_code]
     
-    logger.info(f"未知题型代码 -> {type_code}")
+    logger.info("未知题型代码，题型元数据已省略")
     return "unknown"
 
 
@@ -937,8 +1064,43 @@ def _extract_choices(element, font_decoder=None) -> str:
     if not element:
         return ""
         
-    # 提取aria-label属性值作为选项，解决#474
-    choice = element.get("aria-label") or element.get_text()
+    # Some platform forms interpolate code containing single quotes into a
+    # single-quoted aria-label. The browser then sees only "A " instead of
+    # "A 'ab'". Prefer the actual label/content pair when it is present.
+    label = element.select_one('.num_option, .num_option_dx')
+    body = element.select_one('a.after')
+    from_accessible_label = False
+    if label is not None and body is not None:
+        content = []
+        for node in body.descendants:
+            if isinstance(node, NavigableString):
+                content.append(str(node))
+            elif node.name == 'img' and node.get('src'):
+                content.append(f'<img src="{node["src"]}">')
+        # Randomized quizzes can display B while the option's submitted
+        # value is D. Chaoxing's addChoice/addMultipleChoice read data, so
+        # bind the complete visible wording to that value, not the caption.
+        value = label.get('data')
+        if value is None or value in {'true', 'false'}:
+            value = label.get_text(strip=True)
+        if not re.fullmatch(r'[A-Za-z]', value.strip()):
+            return ''
+        choice = f'{value.strip().upper()}. {"".join(content)}'
+    elif element.name == 'li' and element.find('img'):
+        # A graded page uses i/a pairs rather than num_option/a.after. Keep
+        # the same image identity there, so formula options can be matched
+        # to a later attempt instead of collapsing to empty C/D labels.
+        content = []
+        for node in element.descendants:
+            if isinstance(node, NavigableString):
+                content.append(str(node))
+            elif node.name == 'img' and node.get('src'):
+                content.append(f'<img src="{node["src"]}">')
+        choice = ''.join(content)
+    else:
+        # Preserve the legacy aria-label fallback for other templates.
+        from_accessible_label = bool(element.get("aria-label"))
+        choice = element.get("aria-label") or element.get_text()
     if not choice:
         return ""
 
@@ -948,7 +1110,109 @@ def _extract_choices(element, font_decoder=None) -> str:
         cleaned_content = font_decoder.decode(cleaned_content)
 
     cleaned_content = cleaned_content.strip()
-    if cleaned_content.endswith("选择"):
+    if from_accessible_label and cleaned_content.endswith("选择"):
         cleaned_content = cleaned_content[:-2].rstrip()
 
     return cleaned_content
+
+
+def _extract_alternate_choices(element, font_decoder=None) -> List[str]:
+    """Extract and validate choices from direct alternate-format blocks."""
+
+    if not element:
+        return []
+
+    choices: List[str] = []
+    seen_choices = set()
+    labels = {}
+    has_incomplete_choice = False
+    for choice_block in element.find_all(
+        "div", class_="clearfix", recursive=False
+    ):
+        choice = _extract_choice_block(choice_block, font_decoder)
+        if choice is None:
+            # Layout/decorative blocks are not choices.
+            continue
+        if not choice:
+            # A valid label paired with an empty/image-only answer is a
+            # malformed choice, not a decorative block.
+            has_incomplete_choice = True
+            continue
+
+        normalized_choice = choice
+        label = choice.partition(".")[0]
+        previous = labels.get(label)
+        if previous is not None and previous != normalized_choice:
+            # The same label maps to different text; no alternate result is
+            # safe to submit.
+            return []
+        labels[label] = normalized_choice
+        if normalized_choice in seen_choices:
+            continue
+        seen_choices.add(normalized_choice)
+        choices.append(choice)
+
+    if has_incomplete_choice and choices:
+        return []
+    return choices
+
+
+def _validate_legacy_choices(choices: List[str]) -> List[str]:
+    """Do not turn an empty/duplicate platform value into an invented label."""
+    if any(not choice for choice in choices):
+        return []
+    labels = {}
+    result = []
+    for choice in choices:
+        prefix = find_option_prefix(choice)
+        if prefix and prefix.valid:
+            label = prefix.raw_label.upper()
+            text = choice[prefix.end:].strip()
+            if label in labels:
+                if labels[label] != text:
+                    return []
+                continue
+            labels[label] = text
+        result.append(choice)
+    return result
+
+
+def _extract_choice_block(element, font_decoder=None) -> Optional[str]:
+    """Extract one direct ``clearfix`` label/text pair.
+
+    ``None`` denotes a decorative block without a direct pair.  An empty
+    string denotes a valid label whose answer text is missing, which callers
+    must treat as an incomplete choice set.
+    """
+
+    label_element = element.find(
+        "span", class_="num_option", recursive=False
+    )
+    answer_element = element.find(
+        "div", class_="answer_p", recursive=False
+    )
+    if not label_element or not answer_element:
+        return None
+
+    label_candidates = []
+    if label_element.has_attr("data"):
+        label_candidates.append(str(label_element["data"]))
+    label_candidates.append(label_element.get_text(" ", strip=True))
+    for attr in ("aria-label", "value"):
+        value = label_element.get(attr)
+        if value:
+            label_candidates.append(str(value))
+
+    label = ""
+    for candidate in label_candidates:
+        match = re.fullmatch(r"\s*([A-Za-z])\s*(?:[.．,，、:：)）])?\s*", candidate)
+        if match:
+            label = match.group(1).upper()
+            break
+    if not label:
+        return None
+
+    answer = _extract_choices(answer_element, font_decoder)
+    if not answer:
+        return ""
+    return f"{label}. {answer}"
