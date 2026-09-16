@@ -1,4 +1,4 @@
-name: apple-multi-account-web
+name: supernova
 
 services:
   # Existing installations may have a data volume created by an older image
@@ -29,7 +29,7 @@ services:
 
   web:
     build: .
-    image: chaoxing-fanya:web-local
+    image: supernova:web-local
     depends_on:
       data-init:
         condition: service_completed_successfully
@@ -63,3 +63,5 @@ services:
 
 volumes:
   chaoxing-data:
+    name: ${SUPERNOVA_DATA_VOLUME:-supernova-data}
+    external: ${SUPERNOVA_DATA_EXTERNAL:-false}

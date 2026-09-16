@@ -4,6 +4,25 @@
 
 日常使用优先阅读快速开始。本页保留完整的数据卷备份与恢复步骤，以及 CLI、OCR 和便携打包说明。备份和恢复脚本使用 Bash，请在项目根目录执行。
 
+## 从旧版升级到超新星
+
+如果已经运行旧版，先记录其 `/app/data` 对应的命名卷，再停止旧容器。切换到新版目录后，在本机 `.env` 文件设置以下两项，再执行 `docker compose up --build -d`。这样可继续读取原账户、Key、历史与缓存。全新安装无需设置，默认创建 `supernova-data`。
+
+```dotenv
+SUPERNOVA_DATA_VOLUME=原数据卷名称
+SUPERNOVA_DATA_EXTERNAL=true
+```
+
+`SUPERNOVA_DATA_EXTERNAL=true` 表示沿用已有卷，避免将旧数据卷作为新项目的资源管理。
+
+可在旧版容器仍运行时查询数据卷（将 `旧版容器名` 替换为 `docker ps` 中的实际名称）：
+
+```bash
+docker inspect 旧版容器名 --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}'
+```
+
+先按本页步骤备份，再切换容器。数据库文件名与数据格式保持兼容，无需重建账户。`.env` 只在本机保存，不应上传。
+
 ## Docker 地址与运行方式
 
 ```text
@@ -12,7 +31,7 @@ Docker publish:    127.0.0.1:5001:5000
 Container Web:     0.0.0.0:5000
 Host answer API:   http://localhost:8849/v1
 Container target:  http://host.docker.internal:8849/v1
-Persistent data:   named volume chaoxing-data at /app/data
+Persistent data:   named volume supernova-data at /app/data (overridable)
 ```
 
 以上答题地址仅为宿主机服务示例。请在全局设置（Settings）中保存自己的答题地址、模型和 API Key。容器只在发出请求时把本机回环地址转换为 `host.docker.internal`，页面和数据库保留用户输入的地址。远程 HTTPS 地址按原值使用。
@@ -65,7 +84,7 @@ fi
 # temporary Compose container uses the same named volume and is removed after
 # the checkpoint.  No database file is copied while a writer is active.
 docker compose run --rm --no-deps web python -c "import sqlite3; from pathlib import Path; p=Path('/app/data/chaoxing-web.sqlite3'); c=sqlite3.connect(p) if p.exists() else None; c and c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c and c.close()"
-backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-backup.XXXXXX")"
+backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/supernova-backup.XXXXXX")"
 docker run --rm -v "${data_volume}:/source:ro" -v "$backup_dir:/backup" alpine tar -czf /backup/chaoxing-data-backup.tgz -C /source .
 echo "Backup written to $backup_dir/chaoxing-data-backup.tgz"
 ```
@@ -82,7 +101,7 @@ if [ ! -f "$backup_file" ]; then
   echo "备份文件不存在：$backup_file" >&2
   exit 1
 fi
-if ! restore_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-restore.XXXXXX")"; then
+if ! restore_dir="$(mktemp -d "${TMPDIR:-/tmp}/supernova-restore.XXXXXX")"; then
   echo "无法创建临时恢复目录。" >&2
   exit 1
 fi
@@ -133,7 +152,7 @@ if [ -z "$data_volume" ]; then
   echo "找不到 /app/data 命名卷" >&2
   exit 1
 fi
-if ! safety_dir="$(mktemp -d "${TMPDIR:-/tmp}/chaoxing-fanya-pre-restore.XXXXXX")"; then
+if ! safety_dir="$(mktemp -d "${TMPDIR:-/tmp}/supernova-pre-restore.XXXXXX")"; then
   echo "无法创建第二份安全备份目录，原数据未替换。" >&2
   exit 1
 fi

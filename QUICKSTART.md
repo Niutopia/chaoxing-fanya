@@ -9,8 +9,8 @@
 安装并启动 Docker Desktop。Linux 用户可使用 Docker Engine 和 Compose 插件。
 
 ```bash
-git clone https://github.com/Niutopia/chaoxing-fanya.git
-cd chaoxing-fanya
+git clone https://github.com/Niutopia/supernova.git
+cd supernova
 docker compose up --build -d
 docker compose ps
 ```
@@ -50,7 +50,7 @@ docker compose up --build -d
 
 更新前先停止正在执行的学习任务。服务重启时，原运行任务会标记为中断；重新开始会读取平台进度，历史任务仍保留。
 
-账户、配置、历史和缓存位于 `apple-multi-account-web_chaoxing-data` 命名卷。**不要把 `docker compose down -v` 当作普通更新命令，它会删除数据卷。** 迁移或重装前，请按 [完整步骤](docs/operations.md) 备份。
+账户、配置、历史和缓存默认位于 `supernova-data` 命名卷；从旧版升级时可通过 `.env` 中的 `SUPERNOVA_DATA_VOLUME` 和 `SUPERNOVA_DATA_EXTERNAL=true` 继续使用原数据卷（见[升级说明](docs/operations.md#从旧版升级到超新星)）。**不要把 `docker compose down -v` 当作普通更新命令，它会删除数据卷。** 迁移或重装前，请按 [完整步骤](docs/operations.md) 备份。
 
 ## 方式二：本地开发
 

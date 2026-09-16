@@ -13,8 +13,8 @@ test('shows saved accounts and active task state', () => {
       />
     </MemoryRouter>,
   )
-  expect(screen.getByText('Niutopia答题助手')).toBeInTheDocument()
-  expect(document.querySelector('img[src="/niutopia-assistant.png"]')).toBeInTheDocument()
+  expect(screen.getByText('超新星 · 学习助手')).toBeInTheDocument()
+  expect(document.querySelector('img[src="/supernova.png"]')).toBeInTheDocument()
   expect(screen.getByText('张三')).toBeInTheDocument()
   expect(screen.getByLabelText('张三：运行中')).toBeInTheDocument()
 })

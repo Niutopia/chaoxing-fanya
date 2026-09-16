@@ -1,18 +1,33 @@
 <div align="center">
 
-# Niutopia · 学习通助手
+# 超新星 · 学习助手
 
 **在本机管理课程、运行学习任务，查看进度与真实答题表现。**
 
 面向单机、本地、单用户使用的学习通 Web 工作台。
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Niutopia/chaoxing-fanya/main.yml?label=CI)](https://github.com/Niutopia/chaoxing-fanya/actions/workflows/main.yml) [![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&logoColor=white)](pyproject.toml) [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/Niutopia/supernova/main.yml?label=CI)](https://github.com/Niutopia/supernova/actions/workflows/main.yml) [![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&logoColor=white)](pyproject.toml) [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
 
-[快速开始](QUICKSTART.md) · [使用指南](WEB_FRONTEND_GUIDE.md) · [功能说明](WEB_FEATURES.md) · [备份与恢复](docs/operations.md) · [问题反馈](https://github.com/Niutopia/chaoxing-fanya/issues)
+[快速开始](QUICKSTART.md) · [使用指南](WEB_FRONTEND_GUIDE.md) · [功能说明](WEB_FEATURES.md) · [备份与恢复](docs/operations.md) · [问题反馈](https://github.com/Niutopia/supernova/issues)
 
 </div>
 
 ---
+
+## 界面预览
+
+**课程工作台** · 选课、学习参数和启动入口集中在同一页。
+
+![超新星课程工作台：课程选择与学习参数](docs/assets/course-workbench.png)
+
+<details>
+<summary><strong>展开查看答题正确率与成绩明细</strong></summary>
+
+![超新星答题表现：正确率、待判分及测验成绩明细](docs/assets/answer-report.png)
+
+</details>
+
+<sub>以上为新版界面的演示数据截图，不含真实用户账户、Key 或成绩；示例分数不代表实际答题效果。</sub>
 
 ## 从选课到结果，都能看清楚
 
@@ -35,8 +50,8 @@
 推荐使用 Docker Desktop，或已经安装 Docker Compose 的环境：
 
 ```bash
-git clone https://github.com/Niutopia/chaoxing-fanya.git
-cd chaoxing-fanya
+git clone https://github.com/Niutopia/supernova.git
+cd supernova
 docker compose up --build -d
 ```
 
@@ -88,7 +103,7 @@ docker compose up --build -d
 后端使用 Python 3.13+ / Flask，前端使用 React / Vite / TailwindCSS。
 
 ```text
-chaoxing-fanya/
+supernova/
 ├── app.py              # Web 服务入口
 ├── main.py             # CLI 与共享学习调度
 ├── api/                # 平台交互、任务处理、题目解析与答题

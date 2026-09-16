@@ -28,7 +28,7 @@ docker compose config --quiet
 docker compose build web
 ```
 
-GitHub Actions 的 [CI](../.github/workflows/main.yml) 会执行 Linux 后端测试、前端测试与 Docker 构建，并构建 Windows CLI 包。实际运行结果以 [Actions 页面](https://github.com/Niutopia/chaoxing-fanya/actions) 为准。
+GitHub Actions 的 [CI](../.github/workflows/main.yml) 会执行 Linux 后端测试、前端测试与 Docker 构建，并构建 Windows CLI 包。实际运行结果以 [Actions 页面](https://github.com/Niutopia/supernova/actions) 为准。
 
 ## 重点覆盖的场景
 

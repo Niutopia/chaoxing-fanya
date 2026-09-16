@@ -52,7 +52,7 @@ jobs:
         run: docker compose config --quiet
 
       - name: Build Docker image
-        run: docker build --file Dockerfile --tag chaoxing-fanya:ci .
+        run: docker build --file Dockerfile --tag supernova:ci .
 
   windows:
     name: Windows portable package
